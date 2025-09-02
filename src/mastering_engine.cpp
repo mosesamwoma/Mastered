@@ -110,31 +110,14 @@ AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCu
     emitProgress("Applying EQ mastering...", 0.f);
 
     size_t bandCount = 0;
-    for (const auto& band : eqCurve.bands) {
-        if (band.gain != 0.f && band.frequency > 0.f && band.qFactor > 0.01f) {
-            applyEQBandInPlace(output.samples, band, output.sampleRate);
-            ++bandCount;
-        }
-    }
-
-    if (!eqCurve.bands.empty()) {
-        float progress = 50.f * static_cast<float>(bandCount) / static_cast<float>(eqCurve.bands.size());
-        emitProgress("Applied EQ bands...", progress);
-    }
-
-    emitProgress("Applying makeup gain...", 75.f);
-    if (makeupGain != 0.f) {
-        float gainLinear = std::pow(10.f, makeupGain / 20.f);
-        for (float& sample : output.samples) {
-            sample *= gainLinear;
-        }
-    }
 
     if (!output.channelSamples.empty()) {
+        // Stereo path: process each channel independently, skip interleaved output.samples
         for (auto& channelData : output.channelSamples) {
             for (const auto& band : eqCurve.bands) {
                 if (band.gain != 0.f && band.frequency > 0.f && band.qFactor > 0.01f) {
                     applyEQBandInPlace(channelData, band, output.sampleRate);
+                    ++bandCount;
                 }
             }
             if (makeupGain != 0.f) {
@@ -144,7 +127,28 @@ AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCu
                 }
             }
         }
+    } else {
+        // Mono path: process interleaved samples directly
+        for (const auto& band : eqCurve.bands) {
+            if (band.gain != 0.f && band.frequency > 0.f && band.qFactor > 0.01f) {
+                applyEQBandInPlace(output.samples, band, output.sampleRate);
+                ++bandCount;
+            }
+        }
+        if (makeupGain != 0.f) {
+            float gainLinear = std::pow(10.f, makeupGain / 20.f);
+            for (float& sample : output.samples) {
+                sample *= gainLinear;
+            }
+        }
     }
+
+    if (!eqCurve.bands.empty()) {
+        float progress = 50.f * static_cast<float>(bandCount) / static_cast<float>(eqCurve.bands.size());
+        emitProgress("Applied EQ bands...", progress);
+    }
+
+    emitProgress("Applying makeup gain...", 75.f);
 
     emitProgress("Checking true peak (4x oversampling)...", 85.f);
 
@@ -377,11 +381,6 @@ float MasteringEngine::getAWeighting(float frequencyHz) const {
 
     float Af = 20.f * std::log10(numerator / std::sqrt(denominator)) + 2.f;
     return std::pow(10.f, Af / 10.f);
-}
-
-float MasteringEngine::getKWeighting(float frequencyHz) const {
-    if (frequencyHz <= 0.f) return 0.f;
-    return 1.f;
 }
 
 float MasteringEngine::calculateLUFS(const AudioBuffer& buffer) const {

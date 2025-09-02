@@ -214,9 +214,6 @@ private:
     /// Used for perceptual loudness calculation
     float getAWeighting(float frequencyHz) const;
     
-    /// Apply K-weighting for LUFS calculation
-    float getKWeighting(float frequencyHz) const;
-    
     /// Calculate makeup gain to reach target loudness
     /// @param original Original audio buffer
     /// @param targetLUFS Target loudness in LUFS
