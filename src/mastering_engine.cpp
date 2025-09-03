@@ -543,3 +543,4 @@ float MasteringEngine::calculateMakeupGain(const AudioBuffer& original,
 }
 
 } // namespace mastered
+// minor cleanup
