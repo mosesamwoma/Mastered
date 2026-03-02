@@ -1,17 +1,26 @@
 cmake_minimum_required(VERSION 3.16)
-project(MasteredEngine VERSION 1.0.0 LANGUAGES CXX)
+project(MasteredEngine VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -Wall -Wextra -Wpedantic")
+
+# Debug vs Release
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 # Include directories
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
-# Find required packages
+# Find optional packages
 find_package(FFTW3F QUIET)
-if(NOT FFTW3F_FOUND)
-    message(STATUS "FFTW3 not found - will build with fallback FFT")
+if(FFTW3F_FOUND)
+    message(STATUS "✓ FFTW3 found - using optimized FFT")
+else()
+    message(STATUS "⚠ FFTW3 not found - using fallback FFT (slower)")
 endif()
 
 # Source files
@@ -23,8 +32,9 @@ set(SOURCES
     src/spectrum_matcher.cpp
 )
 
-# Create library
+# Create static library
 add_library(mastered_engine STATIC ${SOURCES})
+set_target_properties(mastered_engine PROPERTIES VERSION 1.1.0)
 
 # Link FFTW if available
 if(FFTW3F_FOUND)
@@ -32,12 +42,47 @@ if(FFTW3F_FOUND)
     target_compile_definitions(mastered_engine PRIVATE USE_FFTW=1)
 endif()
 
-# Example executable (optional)
+# Link math library
+target_link_libraries(mastered_engine PRIVATE m)
+
+# Enable strict warnings
+if(MSVC)
+    target_compile_options(mastered_engine PRIVATE /W4)
+else()
+    target_compile_options(mastered_engine PRIVATE -Wall -Wextra -Wpedantic -Werror=unused-result)
+endif()
+
+# Create CLI executable
 add_executable(mastered_cli src/main.cpp)
 target_link_libraries(mastered_cli PRIVATE mastered_engine)
+set_target_properties(mastered_cli PROPERTIES VERSION 1.1.0)
 
-# Installation
+# Installation targets
 install(TARGETS mastered_engine
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
-install(DIRECTORY include/ DESTINATION include)
+install(TARGETS mastered_cli
+        RUNTIME DESTINATION bin)
+install(DIRECTORY include/ DESTINATION include/mastered)
+
+# Optional: Tests
+option(BUILD_TESTS "Build unit tests" OFF)
+if(BUILD_TESTS)
+    enable_testing()
+    message(STATUS "Tests enabled (implement in tests/)")
+endif()
+
+# Optional: Documentation
+option(BUILD_DOCS "Build documentation" OFF)
+if(BUILD_DOCS)
+    message(STATUS "Documentation building enabled")
+endif()
+
+# Summary
+message(STATUS "")
+message(STATUS "=== Mastered Engine ${CMAKE_PROJECT_VERSION} ===")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ Standard: 17")
+message(STATUS "FFTW3: ${FFTW3F_FOUND}")
+message(STATUS "Tests: ${BUILD_TESTS}")
+message(STATUS "")
