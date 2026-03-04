@@ -18,15 +18,18 @@ namespace constants {
     constexpr float CLIPPING_HEADROOM = 0.99f;
     constexpr uint32_t DEFAULT_FFT_SIZE = 8192;
     constexpr uint32_t DEFAULT_SAMPLE_RATE = 44100;
+    constexpr float DEFAULT_CLIPPING_THRESHOLD = 0.99f;
 }
 
 struct MasteringConfig {
-    bool autoGain = true;           // Calculate makeup gain
-    bool perceptualWeighting = true; // Use A-weighting
-    uint32_t maxEQBands = 8;        // Maximum parametric bands
-    float aggressiveness = 0.8f;    // 0-1, how much to correct (0.8 = 80%)
-    bool smoothing = true;          // Smooth EQ curve
-    float targetLoudnessLUFS = -14.f; // Target loudness (LUFS)
+    bool autoGain = true;
+    bool perceptualWeighting = true;
+    uint32_t maxEQBands = 8;
+    float aggressiveness = 0.8f;
+    bool smoothing = true;
+    float targetLoudnessLUFS = -14.f;
+    float clippingHeadroom = constants::DEFAULT_CLIPPING_THRESHOLD;
+    bool verbose = false;
 };
 
 inline MasteringConfig createDefaultConfig() {
@@ -37,6 +40,8 @@ inline MasteringConfig createDefaultConfig() {
     config.aggressiveness = 0.85f;
     config.smoothing = true;
     config.targetLoudnessLUFS = -14.f;
+    config.clippingHeadroom = constants::DEFAULT_CLIPPING_THRESHOLD;
+    config.verbose = false;
     return config;
 }
 
@@ -82,14 +87,17 @@ public:
     /**
      * Export EQ curve in DAW-compatible formats
      */
-    std::string exportEQasReaEQ(const MasteringResult& result) const;  // ReaEQ format
-    std::string exportEQasEqualizerAPO(const MasteringResult& result) const; // EqualizerAPO format
+    std::string exportEQasReaEQ(const MasteringResult& result) const;
+    std::string exportEQasEqualizerAPO(const MasteringResult& result) const;
     
     /**
-     * Get configuration
+     * Get/set configuration
      */
     const MasteringConfig& getConfig() const { return config_; }
-    void setConfig(const MasteringConfig& cfg) { config_ = cfg; }
+    void setConfig(const MasteringConfig& cfg) { 
+        validateConfig(cfg);
+        config_ = cfg; 
+    }
 
 private:
     MasteringConfig config_;
@@ -99,18 +107,30 @@ private:
     
     /**
      * Calculate LUFS (Loudness Units relative to Full Scale)
+     * ITU-R BS.1770-4 simplified implementation with K-weighting
      */
     float calculateLUFS(const AudioBuffer& buffer) const;
+    
+    /**
+     * Apply A-weighting curve at given frequency (Hz)
+     * Used for perceptual loudness calculation
+     */
+    float getAWeighting(float frequencyHz) const;
+    
+    /**
+     * Apply K-weighting for LUFS calculation
+     */
+    float getKWeighting(float frequencyHz) const;
     
     float calculateMakeupGain(const AudioBuffer& original,
                              float targetLUFS) const;
     
     /**
-     * Apply a single parametric EQ band using biquad filter
+     * Apply a single parametric EQ band using biquad filter (in-place)
      */
-    std::vector<float> applyEQBand(const std::vector<float>& samples,
-                                   const EQBand& band,
-                                   uint32_t sampleRate);
+    void applyEQBandInPlace(std::vector<float>& samples,
+                            const EQBand& band,
+                            uint32_t sampleRate);
     
     bool validateAudioBuffer(const AudioBuffer& buffer, const std::string& bufferName) const {
         if (buffer.samples.empty()) {
@@ -126,6 +146,13 @@ private:
         if (buffer.samples.size() < minSamples) {
             throw std::runtime_error(bufferName + " must be at least 1 second long");
         }
+        
+        // Check for NaN or Inf
+        for (float sample : buffer.samples) {
+            if (std::isnan(sample) || std::isinf(sample)) {
+                throw std::runtime_error(bufferName + " contains invalid samples (NaN or Inf)");
+            }
+        }
         return true;
     }
     
@@ -138,6 +165,9 @@ private:
         }
         if (cfg.targetLoudnessLUFS > 0.f) {
             throw std::runtime_error("targetLoudnessLUFS must be negative (e.g., -14.0)");
+        }
+        if (cfg.clippingHeadroom <= 0.f || cfg.clippingHeadroom > 1.f) {
+            throw std::runtime_error("clippingHeadroom must be between 0 and 1");
         }
         return true;
     }
