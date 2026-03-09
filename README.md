@@ -1,4 +1,4 @@
-# Mastered v1.1.0
+# Mastered
 
 Professional audio mastering engine — analyzes a reference track and applies spectral EQ matching to your audio.
 
