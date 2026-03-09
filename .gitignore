@@ -14,6 +14,7 @@ lib/*
 *.wav
 *.mp3
 *.flac
+mastered_*.wav
 # Temporary files
 *.swp
 *.swo
@@ -35,3 +36,6 @@ CMakeFiles/
 *.json
 result.json
 result2.json
+mastering_result.json
+*_reaEQ.txt
+*_EqualizerAPO.txt
