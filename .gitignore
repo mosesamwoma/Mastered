@@ -1,7 +1,6 @@
 # Build artifacts (but keep .gitkeep)
 build/*
 !build/.gitkeep
-
 # Generated files
 *.o
 *.a
@@ -9,24 +8,20 @@ build/*
 *.dylib
 *.dll
 *.exe
-
 # Audio files
 *.wav
 *.mp3
 *.flac
-
 # Temporary files
 *.swp
 *.swo
 *~
 .DS_Store
-
 # IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
-
 # CMake
 CMakeUserPresets.json
 # Generated results
