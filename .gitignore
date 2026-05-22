@@ -1,5 +1,8 @@
-# Build artifacts
-build/
+# Build artifacts (but keep .gitkeep)
+build/*
+!build/.gitkeep
+
+# Generated files
 *.o
 *.a
 *.so
@@ -7,34 +10,26 @@ build/
 *.dll
 *.exe
 
-# CMake
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
+# Audio files
+*.wav
+*.mp3
+*.flac
 
-# IDE
+# Temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-*.sublime-workspace
 
-# OS
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Dependencies
-lib/*/
-*.depend
-
-# Test/Output files
-*.wav
+# CMake
+CMakeUserPresets.json
+# Generated results
+*.json
 result.json
-test_audio/*.wav
+result2.json
