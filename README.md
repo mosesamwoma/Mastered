@@ -2,20 +2,48 @@
 
 Offline audio mastering that analyzes professional reference tracks and automatically applies optimal EQ to your beats. Pure C++, zero dependencies.
 
-## Quick Start
+## Clone & Setup
+
+```bash
+git clone https://github.com/mosesamwoma/Mastered.git
+cd Mastered
+```
+
+## Build
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+Or use the build script:
+```bash
+./build.sh
+```
+
+## Running the Project
+
+### Option 1: Using Script (Easiest) 🚀
+
+```bash
+./master.sh your_beat.wav reference.wav
+```
+
+Outputs to `mastered_output/`
+
+### Option 2: Direct CLI (No Script)
 
 ```bash
 ./build/mastered_cli reference.wav your_beat.wav analysis.json
 ```
 
-**Output:**
-- `mastered_your_beat.wav` - Your beat with professional EQ applied
+**Inputs:**
+- `reference.wav` - Professional track in your genre (10-30 sec)
+- `your_beat.wav` - Your unmastered beat
+
+**Outputs:**
+- `mastered_your_beat.wav` - Your mastered beat 🎵
 - `analysis.json` - EQ bands & loudness metrics
-
-## What You Need
-
-1. **Reference track** (10-30 sec professional audio, your genre)
-2. **Your beat** (WAV format, any bit depth)
 
 ## How It Works
 
@@ -25,27 +53,9 @@ Offline audio mastering that analyzes professional reference tracks and automati
 4. Applies EQ via cascade biquad filters
 5. Outputs mastered WAV ready to use
 
-## Build
+## Requirements
 
-```bash
-./build.sh
-```
-
-**Requirements:** CMake 3.16+, C++17 compiler (GCC/Clang)
-
-## Features
-
-✅ Offline processing (no internet)  
-✅ 8-band parametric EQ  
-✅ LUFS loudness calculation  
-✅ Spectral correlation analysis (0.96+ accuracy)  
-✅ No dependencies  
-✅ Fast (<1 sec per track)  
-
-## Output
-
-- **WAV**: 16/24/32-bit PCM (ready for distribution)
-- **JSON**: EQ settings + ReaEQ/EqualizerAPO exports
+CMake 3.16+, C++17 compiler (GCC/Clang)
 
 ## Library Usage
 
