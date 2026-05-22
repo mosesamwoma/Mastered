@@ -41,8 +41,8 @@ public:
     /**
      * Calculate correlation between two spectra
      */
-    static float calculateSpectralCorrelation(const std::vector<float>& spec1,
-                                              const std::vector<float>& spec2);
+    float calculateSpectralCorrelation(const std::vector<float>& spec1,
+                                       const std::vector<float>& spec2);
     
     /**
      * Apply confidence weighting based on frequency bands
@@ -54,15 +54,15 @@ public:
     /**
      * Limit aggressive corrections to prevent artifacts
      */
-    static std::vector<float> limitCorrection(const std::vector<float>& correction,
-                                              float maxGain = 12.f);
+    std::vector<float> limitCorrection(const std::vector<float>& correction,
+                                       float maxGain = 12.f);
 
 private:
     /**
      * Perceptual frequency weighting for confidence
      * Returns weight (0-1) for each frequency
      */
-    static float getFrequencyWeight(float frequency);
+    float getFrequencyWeight(float frequency);
 };
 
 } // namespace mastered

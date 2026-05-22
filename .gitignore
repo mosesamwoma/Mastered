@@ -1,6 +1,9 @@
 # Build artifacts (but keep .gitkeep)
 build/*
 !build/.gitkeep
+lib/*
+!lib/.gitkeep
+
 # Generated files
 *.o
 *.a
@@ -24,6 +27,11 @@ build/*
 *.swo
 # CMake
 CMakeUserPresets.json
+Makefile
+CMakeLists.txt.user
+CMakeCache.txt
+cmake_install.cmake
+CMakeFiles/
 # Generated results
 *.json
 result.json

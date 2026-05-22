@@ -43,12 +43,12 @@ public:
     /**
      * Smooth spectrum using median filter
      */
-    static Spectrum smoothSpectrum(const Spectrum& spec, uint32_t filterSize = 5);
+    Spectrum smoothSpectrum(const Spectrum& spec, uint32_t filterSize = 5);
     
     /**
      * Get critical band grouping (auditory model)
      */
-    static std::vector<float> getCriticalBands(const Spectrum& spec);
+    std::vector<float> getCriticalBands(const Spectrum& spec);
     
     void setFFTSize(uint32_t size);
     void setSampleRate(uint32_t rate);

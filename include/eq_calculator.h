@@ -50,32 +50,32 @@ public:
     /**
      * Calculate magnitude response of a single EQ band at given frequencies
      */
-    static std::vector<float> getBandResponse(const EQBand& band,
-                                              const std::vector<float>& frequencies,
-                                              uint32_t sampleRate);
+    std::vector<float> getBandResponse(const EQBand& band,
+                                       const std::vector<float>& frequencies,
+                                       uint32_t sampleRate);
     
     /**
      * Combine multiple EQ bands into single response curve
      */
-    static std::vector<float> combineBands(const std::vector<EQBand>& bands,
-                                           const std::vector<float>& frequencies,
-                                           uint32_t sampleRate);
+    std::vector<float> combineBands(const std::vector<EQBand>& bands,
+                                    const std::vector<float>& frequencies,
+                                    uint32_t sampleRate);
     
     /**
      * Apply A-weighting (human hearing sensitivity correction)
      */
-    static std::vector<float> applyAWeighting(const std::vector<float>& spectrum,
-                                              const std::vector<float>& frequencies);
+    std::vector<float> applyAWeighting(const std::vector<float>& spectrum,
+                                       const std::vector<float>& frequencies);
     
     /**
      * Detect and suppress extreme peaks (prevent over-compensation)
      */
-    static std::vector<float> suppressExtremes(const std::vector<float>& curve, float threshold = 12.f);
+    std::vector<float> suppressExtremes(const std::vector<float>& curve, float threshold = 12.f);
     
     /**
      * Smooth curve to prevent picky/thin results
      */
-    static std::vector<float> smoothCurve(const std::vector<float>& curve, uint32_t smoothing = 5);
+    std::vector<float> smoothCurve(const std::vector<float>& curve, uint32_t smoothing = 5);
 
 private:
     /**

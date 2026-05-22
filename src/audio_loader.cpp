@@ -84,7 +84,7 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
     } else if (wavHeader.bitsPerSample == 24) {
         std::vector<uint8_t> buffer(dataSize);
         file.read(reinterpret_cast<char*>(buffer.data()), dataSize);
-        for (size_t i = 0; i < dataSize; i += 3) {
+        for (size_t i = 0; i + 2 < dataSize; i += 3) {
             int32_t sample = (static_cast<int32_t>(buffer[i + 2]) << 16) |
                            (static_cast<int32_t>(buffer[i + 1]) << 8) |
                            static_cast<int32_t>(buffer[i]);
