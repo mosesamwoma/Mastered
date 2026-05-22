@@ -252,7 +252,7 @@ config.aggressiveness = 1.0f;
 ## File Locations
 
 ```
-/home/moses-amwoma/projects/mastered/
+.
 ├── build/
 │   ├── libmastered_engine.a      (link this)
 │   └── mastered_cli              (run this)
@@ -267,7 +267,6 @@ config.aggressiveness = 1.0f;
 ## Support Files
 
 - `README.md` - Full documentation
-- `DEVELOPMENT.md` - Development guide
 - `API_REFERENCE.md` - Complete API docs
 - `generate_test_audio.py` - Create test files
 - `build.sh` - Build helper script
