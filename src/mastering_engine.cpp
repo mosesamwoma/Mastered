@@ -68,8 +68,84 @@ MasteringResult MasteringEngine::analyzeBuffers(const AudioBuffer& reference,
     return result;
 }
 
-AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCurve& eqCurve) {
-    return input;
+AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCurve& eqCurve, float makeupGain) {
+    AudioBuffer output = input;
+    
+    if (output.samples.empty()) {
+        throw std::runtime_error("Cannot apply mastering to empty buffer");
+    }
+    
+    // Apply each parametric EQ band using second-order IIR filtering
+    for (const auto& band : eqCurve.bands) {
+        output.samples = applyEQBand(output.samples, band, output.sampleRate);
+    }
+    
+    // Apply makeup gain
+    if (makeupGain != 0.f) {
+        float gainLinear = std::pow(10.f, makeupGain / 20.f);
+        for (float& sample : output.samples) {
+            sample *= gainLinear;
+        }
+    }
+    
+    // Prevent clipping
+    float maxAbs = 0.f;
+    for (float sample : output.samples) {
+        maxAbs = std::max(maxAbs, std::abs(sample));
+    }
+    
+    if (maxAbs > 1.f) {
+        float scale = 0.99f / maxAbs;
+        for (float& sample : output.samples) {
+            sample *= scale;
+        }
+    }
+    
+    return output;
+}
+
+std::vector<float> MasteringEngine::applyEQBand(const std::vector<float>& samples,
+                                                 const EQBand& band,
+                                                 uint32_t sampleRate) {
+    if (samples.empty() || band.gain == 0.f) {
+        return samples;
+    }
+    
+    // Calculate second-order filter coefficients
+    float A = std::pow(10.f, band.gain / 40.f);
+    float w0 = 2.f * M_PI * band.frequency / sampleRate;
+    float sinW0 = std::sin(w0);
+    float cosW0 = std::cos(w0);
+    float alpha = sinW0 / (2.f * band.qFactor);
+    
+    // Peaking filter coefficients
+    float b0 = 1.f + alpha * A;
+    float b1 = -2.f * cosW0;
+    float b2 = 1.f - alpha * A;
+    float a0 = 1.f + alpha / A;
+    float a1 = -2.f * cosW0;
+    float a2 = 1.f - alpha / A;
+    
+    // Normalize
+    b0 /= a0;
+    b1 /= a0;
+    b2 /= a0;
+    a1 /= a0;
+    a2 /= a0;
+    
+    // Apply biquad filter (Direct Form II)
+    std::vector<float> output(samples.size());
+    float w_n1 = 0.f, w_n2 = 0.f;
+    
+    for (size_t i = 0; i < samples.size(); ++i) {
+        float w_n = samples[i] - a1 * w_n1 - a2 * w_n2;
+        output[i] = b0 * w_n + b1 * w_n1 + b2 * w_n2;
+        
+        w_n2 = w_n1;
+        w_n1 = w_n;
+    }
+    
+    return output;
 }
 
 std::string MasteringEngine::exportEQasJSON(const MasteringResult& result) const {

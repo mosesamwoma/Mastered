@@ -52,7 +52,7 @@ public:
     /**
      * Apply mastering EQ to audio and return result
      */
-    AudioBuffer applyMastering(const AudioBuffer& input, const EQCurve& eqCurve);
+    AudioBuffer applyMastering(const AudioBuffer& input, const EQCurve& eqCurve, float makeupGain = 0.f);
     
     /**
      * Export EQ curve as JSON for frontend display/application
@@ -84,6 +84,13 @@ private:
     
     float calculateMakeupGain(const AudioBuffer& original,
                              float targetLUFS) const;
+    
+    /**
+     * Apply a single parametric EQ band using biquad filter
+     */
+    std::vector<float> applyEQBand(const std::vector<float>& samples,
+                                   const EQBand& band,
+                                   uint32_t sampleRate);
 };
 
 } // namespace mastered
