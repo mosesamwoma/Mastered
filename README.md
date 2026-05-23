@@ -1,13 +1,12 @@
-# Mastered - Professional Audio Mastering Engine
+# Mastered
 
-Offline audio mastering that analyzes professional reference tracks and automatically applies optimal EQ to your beats. Pure C++, zero dependencies.
+A C++ audio mastering engine that analyzes a professional reference track and applies spectral EQ matching to an unmastered WAV file.
 
-## Clone & Setup
+## Requirements
 
-```bash
-git clone https://github.com/mosesamwoma/Mastered.git
-cd Mastered
-```
+- CMake 3.16+
+- C++17 compiler (GCC or Clang)
+- FFTW3 (optional — falls back to built-in FFT if not found)
 
 ## Build
 
@@ -16,56 +15,62 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-Or use the build script:
+## Usage
+
 ```bash
-./build.sh
+./build/mastered_cli reference.wav your_beat.wav [output.json]
 ```
 
-## Running the Project
+| Argument | Description |
+|---|---|
+| `reference.wav` | Professional track in your target genre (10–30 sec recommended) |
+| `your_beat.wav` | Unmastered input |
+| `output.json` | Optional — EQ bands and loudness metrics (default: `mastering_result.json`) |
 
-### Option 1: Using Script (Easiest) 🚀
+Output: `mastered_<input>.wav` in the current directory.
+
+Alternatively, use the shell script:
 
 ```bash
 ./master.sh your_beat.wav reference.wav
 ```
 
-Outputs to `mastered_output/`
-
-### Option 2: Direct CLI (No Script)
-
-```bash
-./build/mastered_cli reference.wav your_beat.wav analysis.json
-```
-
-**Inputs:**
-- `reference.wav` - Professional track in your genre (10-30 sec)
-- `your_beat.wav` - Your unmastered beat
-
-**Outputs:**
-- `mastered_your_beat.wav` - Your mastered beat 🎵
-- `analysis.json` - EQ bands & loudness metrics
-
-## How It Works
-
-1. Analyzes both tracks using FFT spectral analysis
-2. Calculates frequency differences
-3. Generates 8 parametric EQ bands to match reference
-4. Applies EQ via cascade biquad filters
-5. Outputs mastered WAV ready to use
-
-## Requirements
-
-CMake 3.16+, C++17 compiler (GCC/Clang)
-
 ## Library Usage
 
 ```cpp
 #include "mastering_engine.h"
+using namespace mastered;
+
 MasteringEngine engine;
 auto result = engine.analyzeTracks("reference.wav", "beat.wav");
 AudioBuffer mastered = engine.applyMastering(beatBuffer, result.eqCurve, result.makeupGain);
+AudioLoader::saveWAV("mastered_beat.wav", mastered);
 ```
 
----
+## How It Works
 
-**Drop your beat. Get it mastered. 🎵**
+1. Loads both WAV files and computes averaged FFT spectra
+2. Calculates the frequency-domain difference between reference and input
+3. Applies A-weighting and smoothing to the difference curve
+4. Fits up to 8 parametric EQ bands (peaks and shelves) to the curve
+5. Applies each band via a second-order IIR biquad filter
+6. Calculates makeup gain to hit a target loudness of -14 LUFS
+7. Exports the mastered WAV and an optional JSON report
+
+## Output JSON
+
+```json
+{
+  "stats": {
+    "correlation": 0.91,
+    "spectralDifference": 2.4,
+    "confidence": 0.87,
+    "estimatedLUFS": -18.2,
+    "makeupGain": 4.2
+  },
+  "eqBands": [
+    { "frequency": 120, "gain": 2.1, "q": 0.7, "type": "shelf-low" }
+  ]
+}
+```
+---
