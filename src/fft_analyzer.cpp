@@ -12,8 +12,8 @@ namespace mastered {
 
 FFTAnalyzer::FFTAnalyzer(uint32_t fftSize, uint32_t sampleRate)
     : fftSize_(fftSize), sampleRate_(sampleRate) {
-    if (fftSize_ == 0 || (fftSize_ & (fftSize_ - 1)) != 0) {
-        throw std::runtime_error("FFT size must be a power of 2");
+    if (fftSize_ < 2 || (fftSize_ & (fftSize_ - 1)) != 0) {
+        throw std::runtime_error("FFT size must be a power of 2 and at least 2");
     }
     generateHannWindow();
 }
@@ -203,15 +203,15 @@ std::vector<std::complex<float>> FFTAnalyzer::computeFFT(const std::vector<float
         }
     }
     
-    // Bit-reversal permutation
+    // Bit-reversal permutation (proper implementation)
     uint32_t j = 0;
-    for (uint32_t i = 0; i < n - 1; ++i) {
+    for (uint32_t i = 0; i < n; ++i) {
         if (i < j) {
             std::swap(result[i], result[j]);
         }
         
         uint32_t k = n >> 1;
-        while (k <= j) {
+        while (k <= j && k > 0) {
             j -= k;
             k >>= 1;
         }

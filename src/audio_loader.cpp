@@ -66,6 +66,9 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
     
     // Read audio data
     file.seekg(dataOffset);
+    if (wavHeader.blockAlign == 0) {
+        throw std::runtime_error("Invalid WAV file: block align is zero");
+    }
     uint32_t numSamples = dataSize / wavHeader.blockAlign;
     
     result.sampleRate = wavHeader.sampleRate;
@@ -84,7 +87,7 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
     } else if (wavHeader.bitsPerSample == 24) {
         std::vector<uint8_t> buffer(dataSize);
         file.read(reinterpret_cast<char*>(buffer.data()), dataSize);
-        for (size_t i = 0; i + 2 < dataSize; i += 3) {
+        for (size_t i = 0; i + 3 <= dataSize; i += 3) {
             int32_t sample = (static_cast<int32_t>(buffer[i + 2]) << 16) |
                            (static_cast<int32_t>(buffer[i + 1]) << 8) |
                            static_cast<int32_t>(buffer[i]);
@@ -156,6 +159,9 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
 }
 
 std::vector<float> AudioLoader::stereoToMono(const std::vector<float>& stereoSamples, uint16_t channels) {
+    if (channels == 0) {
+        throw std::runtime_error("Invalid channel count: channels must be > 0");
+    }
     if (channels == 1) {
         return stereoSamples;
     }

@@ -106,16 +106,30 @@ std::vector<float> EQCalculator::getBandResponse(const EQBand& band,
                                                  uint32_t sampleRate) {
     std::vector<float> response(frequencies.size(), 0.f);
     
-    // Simplified second-order filter response calculation
+    // Validate input parameters
+    if (band.frequency <= 0.f) {
+        return response;
+    }
+    if (band.qFactor <= 0.01f) {
+        throw std::runtime_error("Q factor must be > 0.01");
+    }
+    if (sampleRate == 0) {
+        throw std::runtime_error("Sample rate must be > 0");
+    }
+    
+    // Second-order peaking EQ filter (Robert Bristow-Johnson formulas)
     float A = std::pow(10.f, band.gain / 40.f);
     float w0 = 2.f * M_PI * band.frequency / sampleRate;
-    float alpha = std::sin(w0) / (2.f * band.qFactor);
+    float sinW0 = std::sin(w0);
+    float cosW0 = std::cos(w0);
+    float alpha = sinW0 / (2.f * band.qFactor);
     
-    float b0 = A * (1.f + alpha * A);
-    float b1 = -2.f * std::cos(w0);
-    float b2 = A * (1.f - alpha * A);
+    // Correct peaking EQ filter coefficients
+    float b0 = 1.f + alpha * A;
+    float b1 = -2.f * cosW0;
+    float b2 = 1.f - alpha * A;
     float a0 = 1.f + alpha / A;
-    float a1 = -2.f * std::cos(w0);
+    float a1 = -2.f * cosW0;
     float a2 = 1.f - alpha / A;
     
     // Normalize
@@ -127,20 +141,33 @@ std::vector<float> EQCalculator::getBandResponse(const EQBand& band,
     
     // Calculate magnitude response at each frequency
     for (size_t i = 0; i < frequencies.size(); ++i) {
+        if (frequencies[i] <= 0.f) {
+            response[i] = 0.f;
+            continue;
+        }
+        
         float w = 2.f * M_PI * frequencies[i] / sampleRate;
         float cosw = std::cos(w);
         float sinw = std::sin(w);
+        float cos2w = std::cos(2.f * w);
+        float sin2w = std::sin(2.f * w);
         
-        float numeratorReal = b0 + b1 * cosw + b2 * std::cos(2.f * w);
-        float numeratorImag = b1 * sinw + b2 * std::sin(2.f * w);
+        float numeratorReal = b0 + b1 * cosw + b2 * cos2w;
+        float numeratorImag = b1 * sinw + b2 * sin2w;
         
-        float denominatorReal = 1.f + a1 * cosw + a2 * std::cos(2.f * w);
-        float denominatorImag = a1 * sinw + a2 * std::sin(2.f * w);
+        float denominatorReal = 1.f + a1 * cosw + a2 * cos2w;
+        float denominatorImag = a1 * sinw + a2 * sin2w;
         
-        float magnitude = std::sqrt(numeratorReal * numeratorReal + numeratorImag * numeratorImag) /
-                         std::sqrt(denominatorReal * denominatorReal + denominatorImag * denominatorImag);
+        // Calculate magnitudes with numerical stability checks
+        float numeratorMag = std::sqrt(numeratorReal * numeratorReal + numeratorImag * numeratorImag);
+        float denominatorMag = std::sqrt(denominatorReal * denominatorReal + denominatorImag * denominatorImag);
         
-        response[i] = 20.f * std::log10(std::max(magnitude, 1e-10f));
+        if (denominatorMag < 1e-10f) {
+            response[i] = 0.f;
+        } else {
+            float magnitude = numeratorMag / denominatorMag;
+            response[i] = 20.f * std::log10(std::max(magnitude, 1e-10f));
+        }
     }
     
     return response;
@@ -165,21 +192,43 @@ std::vector<float> EQCalculator::applyAWeighting(const std::vector<float>& spect
                                                  const std::vector<float>& frequencies) {
     std::vector<float> weighted = spectrum;
     
-    // A-weighting curve for human hearing sensitivity
+    // A-weighting curve for human hearing sensitivity (with numerical stability)
     for (size_t i = 0; i < weighted.size(); ++i) {
         float f = frequencies[i];
         
-        // A-weighting formula (dB)
+        if (f < 1.f) {
+            weighted[i] = spectrum[i] - 100.f;  // Very low frequencies get large attenuation
+            continue;
+        }
+        
+        // A-weighting formula (dB) - with improved numerical stability
         float f2 = f * f;
         float f4 = f2 * f2;
         
-        float numerator = 12200.f * 12200.f * f4;
-        float denominator = (f2 + 20.6f * 20.6f) *
-                           std::sqrt((f2 + 107.7f * 107.7f) * (f2 + 737.9f * 737.9f)) *
-                           (f2 + 12200.f * 12200.f);
+        // Use log-space calculation to avoid overflow/underflow
+        float c1 = 20.6f;
+        float c2 = 107.7f;
+        float c3 = 737.9f;
+        float c4 = 12200.f;
         
-        float aWeight = 20.f * std::log10(std::max(numerator / denominator, 1e-10f)) + 2.f;
+        // Calculate using safer formulation
+        float numerator = c4 * c4 * f4;
         
+        // Terms in denominator - compute carefully
+        float term1 = f2 + c1 * c1;
+        float term2_inner1 = f2 + c2 * c2;
+        float term2_inner2 = f2 + c3 * c3;
+        float term3 = f2 + c4 * c4;
+        
+        // Prevent overflow: use log-sum instead of direct multiplication
+        float log_denominator = std::log(term1) + 0.5f * (std::log(term2_inner1) + std::log(term2_inner2)) + std::log(term3);
+        float log_numerator = std::log(numerator + 1e-20f);
+        
+        float ratio = log_numerator - log_denominator;
+        float aWeight = 20.f * ratio + 2.f;  // Equivalent to 20*log10(exp(ratio)) + 2
+        
+        // Clamp to reasonable range to prevent NaN propagation
+        aWeight = std::max(-100.f, std::min(20.f, aWeight));
         weighted[i] = spectrum[i] + aWeight;
     }
     

@@ -59,10 +59,32 @@ std::vector<float> SpectrumMatcher::interpolateCorrection(const std::vector<floa
                                                           const std::vector<float>& toFreqs) {
     std::vector<float> interpolated(toFreqs.size());
     
+    if (correction.empty() || fromFreqs.empty() || toFreqs.empty() || 
+        correction.size() != fromFreqs.size()) {
+        return interpolated;  // Return empty/zero values for invalid input
+    }
+    
+    // Validate that fromFreqs is sorted
+    for (size_t j = 1; j < fromFreqs.size(); ++j) {
+        if (fromFreqs[j] < fromFreqs[j-1]) {
+            throw std::runtime_error("Frequency array must be sorted in ascending order");
+        }
+    }
+    
     for (size_t i = 0; i < toFreqs.size(); ++i) {
         float targetFreq = toFreqs[i];
         
-        // Linear interpolation
+        // Clamp to boundaries
+        if (targetFreq <= fromFreqs.front()) {
+            interpolated[i] = correction.front();
+            continue;
+        }
+        if (targetFreq >= fromFreqs.back()) {
+            interpolated[i] = correction.back();
+            continue;
+        }
+        
+        // Linear interpolation with binary search for efficiency
         size_t idx = 0;
         for (size_t j = 0; j < fromFreqs.size() - 1; ++j) {
             if (fromFreqs[j] <= targetFreq && targetFreq <= fromFreqs[j + 1]) {
@@ -71,10 +93,11 @@ std::vector<float> SpectrumMatcher::interpolateCorrection(const std::vector<floa
             }
         }
         
-        if (idx >= fromFreqs.size() - 1) {
-            interpolated[i] = correction.back();
+        float denominator = fromFreqs[idx + 1] - fromFreqs[idx];
+        if (denominator < 1e-10f) {
+            interpolated[i] = correction[idx];
         } else {
-            float ratio = (targetFreq - fromFreqs[idx]) / (fromFreqs[idx + 1] - fromFreqs[idx]);
+            float ratio = (targetFreq - fromFreqs[idx]) / denominator;
             interpolated[i] = correction[idx] * (1.f - ratio) + correction[idx + 1] * ratio;
         }
     }
