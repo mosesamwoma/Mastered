@@ -62,8 +62,16 @@ std::vector<Spectrum> FFTAnalyzer::analyzeStreaming(const std::vector<float>& sa
     uint32_t hopSize = static_cast<uint32_t>(fftSize_ * hopRatio);
     if (hopSize == 0) hopSize = 1;
     
-    for (size_t offset = 0; offset + fftSize_ <= samples.size(); offset += hopSize) {
-        std::vector<float> frame(samples.begin() + offset, samples.begin() + offset + fftSize_);
+    // Process all frames including incomplete last frame
+    for (size_t offset = 0; offset < samples.size(); offset += hopSize) {
+        size_t frameEnd = std::min(offset + fftSize_, samples.size());
+        std::vector<float> frame(samples.begin() + offset, samples.begin() + frameEnd);
+        
+        // Pad with zeros if incomplete
+        while (frame.size() < fftSize_) {
+            frame.push_back(0.f);
+        }
+        
         spectra.push_back(analyze(frame));
     }
     
@@ -174,17 +182,37 @@ void FFTAnalyzer::setSampleRate(uint32_t rate) {
     sampleRate_ = rate;
 }
 
+void FFTAnalyzer::bitReversalPermutation(std::vector<std::complex<float>>& data) {
+    uint32_t n = data.size();
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < n - 1; ++i) {
+        if (i < j) {
+            std::swap(data[i], data[j]);
+        }
+        uint32_t m = n >> 1;
+        while (m > 0 && (j & m)) {
+            j ^= m;
+            m >>= 1;
+        }
+        j |= m;
+    }
+}
+
 // Cooley-Tukey FFT implementation (fallback)
 std::vector<std::complex<float>> FFTAnalyzer::computeFFT(const std::vector<float>& samples) {
     uint32_t n = fftSize_;
     std::vector<std::complex<float>> result(n);
     
+    // STEP 1: Load samples
     for (uint32_t i = 0; i < n; ++i) {
         float sample = (i < samples.size()) ? samples[i] : 0.f;
         result[i] = std::complex<float>(sample, 0.f);
     }
     
-    // Cooley-Tukey FFT algorithm
+    // STEP 2: BIT-REVERSAL PERMUTATION (MUST BE FIRST!)
+    bitReversalPermutation(result);
+    
+    // STEP 3: Cooley-Tukey FFT algorithm
     for (uint32_t s = 1; s <= static_cast<uint32_t>(std::log2(n)); ++s) {
         uint32_t m = 1 << s;
         uint32_t m2 = m >> 1;
@@ -203,22 +231,7 @@ std::vector<std::complex<float>> FFTAnalyzer::computeFFT(const std::vector<float
         }
     }
     
-    // Bit-reversal permutation (proper implementation)
-    uint32_t j = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        if (i < j) {
-            std::swap(result[i], result[j]);
-        }
-        
-        uint32_t k = n >> 1;
-        while (k <= j && k > 0) {
-            j -= k;
-            k >>= 1;
-        }
-        j += k;
-    }
-    
-    return result;
+    return result;  // NO bit-reversal here!
 }
 
 Spectrum FFTAnalyzer::complexToSpectrum(const std::vector<std::complex<float>>& fftResult) {

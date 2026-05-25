@@ -8,7 +8,7 @@ namespace mastered {
 
 MasteringEngine::MasteringEngine(const MasteringConfig& config)
     : config_(config),
-      fftAnalyzer_(std::make_unique<FFTAnalyzer>(8192, 44100)),
+      fftAnalyzer_(std::make_unique<FFTAnalyzer>(constants::DEFAULT_FFT_SIZE, constants::DEFAULT_SAMPLE_RATE)),
       eqCalculator_(std::make_unique<EQCalculator>()),
       spectrumMatcher_(std::make_unique<SpectrumMatcher>()) {
 }

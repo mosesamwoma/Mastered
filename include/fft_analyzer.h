@@ -79,6 +79,11 @@ private:
      * Convert complex FFT output to magnitude spectrum (dB)
      */
     Spectrum complexToSpectrum(const std::vector<std::complex<float>>& fftResult);
+    
+    /**
+     * Bit-reversal permutation for FFT
+     */
+    void bitReversalPermutation(std::vector<std::complex<float>>& data);
 };
 
 } // namespace mastered

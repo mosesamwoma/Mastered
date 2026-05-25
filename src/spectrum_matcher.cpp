@@ -131,7 +131,7 @@ float SpectrumMatcher::calculateSpectralCorrelation(const std::vector<float>& sp
     
     covariance /= spec1.size();
     var1 /= spec1.size();
-    var2 /= spec1.size();
+    var2 /= spec2.size();
     
     // Calculate correlation coefficient
     float stddev1 = std::sqrt(var1);

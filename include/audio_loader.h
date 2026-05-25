@@ -12,6 +12,7 @@ struct AudioBuffer {
     uint32_t sampleRate;
     uint16_t channels;
     uint32_t numFrames;
+    uint16_t bitDepth = 16;  // Track original bit depth for lossless saving
     
     AudioBuffer() : sampleRate(0), channels(0), numFrames(0) {}
 };

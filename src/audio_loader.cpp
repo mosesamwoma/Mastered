@@ -1,5 +1,6 @@
 #include "audio_loader.h"
 #include <fstream>
+#include <iostream>
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
@@ -73,6 +74,7 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
     
     result.sampleRate = wavHeader.sampleRate;
     result.channels = wavHeader.numChannels;
+    result.bitDepth = wavHeader.bitsPerSample;
     result.numFrames = numSamples / wavHeader.numChannels;
     
     std::vector<float> rawSamples;
@@ -81,12 +83,18 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
     if (wavHeader.bitsPerSample == 16) {
         std::vector<int16_t> buffer(numSamples);
         file.read(reinterpret_cast<char*>(buffer.data()), dataSize);
+        if (!file) {
+            throw std::runtime_error("Failed to read 16-bit audio data (file truncated?)");
+        }
         for (int16_t sample : buffer) {
             rawSamples.push_back(static_cast<float>(sample) / 32768.f);
         }
     } else if (wavHeader.bitsPerSample == 24) {
         std::vector<uint8_t> buffer(dataSize);
         file.read(reinterpret_cast<char*>(buffer.data()), dataSize);
+        if (!file) {
+            throw std::runtime_error("Failed to read 24-bit audio data (file truncated?)");
+        }
         for (size_t i = 0; i + 3 <= dataSize; i += 3) {
             int32_t sample = (static_cast<int32_t>(buffer[i + 2]) << 16) |
                            (static_cast<int32_t>(buffer[i + 1]) << 8) |
@@ -97,12 +105,17 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
     } else if (wavHeader.bitsPerSample == 32) {
         std::vector<float> buffer(numSamples);
         file.read(reinterpret_cast<char*>(buffer.data()), dataSize);
+        if (!file) {
+            throw std::runtime_error("Failed to read 32-bit audio data (file truncated?)");
+        }
         rawSamples = buffer;
     } else {
         throw std::runtime_error("Unsupported bit depth: " + std::to_string(wavHeader.bitsPerSample));
     }
     
     if (wavHeader.numChannels > 1) {
+        std::cerr << "⚠ Warning: Converting " << static_cast<int>(wavHeader.numChannels) 
+                  << "-channel audio to mono (downmixing)\n";
         result.samples = stereoToMono(rawSamples, wavHeader.numChannels);
         result.numFrames = result.samples.size();
     } else {
@@ -121,8 +134,9 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
     }
     
     uint32_t numSamples = buffer.samples.size();
-    uint32_t byteRate = buffer.sampleRate * 2;
-    uint32_t dataSize = numSamples * 2;
+    uint16_t bytesPerSample = buffer.bitDepth / 8;
+    uint32_t byteRate = buffer.sampleRate * bytesPerSample;
+    uint32_t dataSize = numSamples * bytesPerSample;
     
     file.write("RIFF", 4);
     uint32_t riffSize = 36 + dataSize;
@@ -140,18 +154,37 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
     file.write(reinterpret_cast<const char*>(&buffer.sampleRate), 4);
     file.write(reinterpret_cast<const char*>(&byteRate), 4);
     
-    uint16_t blockAlign = 2;
-    uint16_t bitsPerSample = 16;
+    uint16_t blockAlign = bytesPerSample;
     file.write(reinterpret_cast<const char*>(&blockAlign), 2);
-    file.write(reinterpret_cast<const char*>(&bitsPerSample), 2);
+    file.write(reinterpret_cast<const char*>(&buffer.bitDepth), 2);
     
     file.write("data", 4);
     file.write(reinterpret_cast<const char*>(&dataSize), 4);
     
-    for (float sample : buffer.samples) {
-        float clamped = std::max(-1.f, std::min(1.f, sample));
-        int16_t pcmSample = static_cast<int16_t>(clamped * 32767.f);
-        file.write(reinterpret_cast<const char*>(&pcmSample), 2);
+    if (buffer.bitDepth == 16) {
+        for (float sample : buffer.samples) {
+            float clamped = std::max(-1.f, std::min(1.f, sample));
+            int16_t pcmSample = static_cast<int16_t>(clamped * 32767.f);
+            file.write(reinterpret_cast<const char*>(&pcmSample), 2);
+        }
+    } else if (buffer.bitDepth == 24) {
+        for (float sample : buffer.samples) {
+            float clamped = std::max(-1.f, std::min(1.f, sample));
+            int32_t pcm32 = static_cast<int32_t>(clamped * 8388607.f);
+            uint8_t byte1 = static_cast<uint8_t>(pcm32 & 0xFF);
+            uint8_t byte2 = static_cast<uint8_t>((pcm32 >> 8) & 0xFF);
+            uint8_t byte3 = static_cast<uint8_t>((pcm32 >> 16) & 0xFF);
+            file.write(reinterpret_cast<const char*>(&byte1), 1);
+            file.write(reinterpret_cast<const char*>(&byte2), 1);
+            file.write(reinterpret_cast<const char*>(&byte3), 1);
+        }
+    } else if (buffer.bitDepth == 32) {
+        for (float sample : buffer.samples) {
+            float clamped = std::max(-1.f, std::min(1.f, sample));
+            file.write(reinterpret_cast<const char*>(&clamped), 4);
+        }
+    } else {
+        throw std::runtime_error("Unsupported bit depth for saving: " + std::to_string(buffer.bitDepth));
     }
     
     file.close();
@@ -190,8 +223,11 @@ void AudioLoader::normalize(std::vector<float>& samples) {
         maxAbs = std::max(maxAbs, std::abs(sample));
     }
     
+    // Only soft-limit if peaks exceed 1.0
+    // Don't scale down quiet audio
     if (maxAbs > 1.f) {
-        float scale = 1.f / maxAbs;
+        float targetLevel = 0.9f;  // -1dB headroom
+        float scale = targetLevel / maxAbs;
         for (float& sample : samples) {
             sample *= scale;
         }
