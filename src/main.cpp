@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <fstream>
+#include <filesystem>
 #include "mastering_engine.h"
 
 using namespace mastered;
@@ -22,6 +23,16 @@ int main(int argc, char* argv[]) {
     std::string unmasteredFile = argv[2];
     std::string outputFile = (argc > 3) ? argv[3] : "mastering_result.json";
     
+    // Validate file existence
+    if (!std::filesystem::exists(referenceFile)) {
+        std::cerr << "✗ Error: Reference file not found: " << referenceFile << "\n";
+        return 1;
+    }
+    if (!std::filesystem::exists(unmasteredFile)) {
+        std::cerr << "✗ Error: Unmastered file not found: " << unmasteredFile << "\n";
+        return 1;
+    }
+    
     try {
         std::cout << "╔══════════════════════════════════════════════════════════════╗\n";
         std::cout << "║  Mastered Engine - Professional Audio Mastering              ║\n";
@@ -31,16 +42,7 @@ int main(int argc, char* argv[]) {
         std::cout << "→ Loading reference track: " << referenceFile << "\n";
         std::cout << "→ Loading unmastered track: " << unmasteredFile << "\n\n";
         
-        // Configure mastering engine
-        MasteringConfig config;
-        config.autoGain = true;
-        config.perceptualWeighting = true;
-        config.maxEQBands = 8;
-        config.aggressiveness = 0.85f;
-        config.smoothing = true;
-        config.targetLoudnessLUFS = -14.f;
-        
-        MasteringEngine engine(config);
+        MasteringEngine engine(createDefaultConfig());
         
         // Load audio
         std::cout << "→ Analyzing tracks...\n";
@@ -75,30 +77,29 @@ int main(int argc, char* argv[]) {
         std::cout << "✓ EQ applied successfully!\n";
         
         // Save mastered audio
-        size_t lastSlash = unmasteredFile.find_last_of("/\\");
-        std::string baseName = (lastSlash != std::string::npos) ? unmasteredFile.substr(lastSlash + 1) : unmasteredFile;
-        size_t dotPos = baseName.find_last_of(".");
-        std::string nameWithoutExt = (dotPos != std::string::npos) ? baseName.substr(0, dotPos) : baseName;
-        std::string masteredFile = "mastered_" + nameWithoutExt + ".wav";
+        std::string baseName = std::filesystem::path(unmasteredFile).stem().string();
+        std::string masteredFile = "mastered_" + baseName + ".wav";
         std::cout << "\n→ Saving mastered audio: " << masteredFile << "\n";
-        if (AudioLoader::saveWAV(masteredFile, masteredBuffer)) {
-            std::cout << "✓ Mastered audio saved!\n";
-        } else {
-            std::cerr << "✗ Warning: Could not save mastered audio\n";
+        if (!AudioLoader::saveWAV(masteredFile, masteredBuffer)) {
+            std::cerr << "✗ Error: Could not save mastered audio to: " << masteredFile << "\n";
+            std::cerr << "  Check: disk space, file permissions, output directory exists\n";
+            return 1;
         }
+        std::cout << "✓ Mastered audio saved!\n";
         
         // Export results as JSON
         std::cout << "→ Exporting analysis results: " << outputFile << "\n";
         std::string jsonOutput = engine.exportEQasJSON(result);
         
         std::ofstream outFile(outputFile);
-        if (outFile.is_open()) {
-            outFile << jsonOutput;
-            outFile.close();
-            std::cout << "✓ Analysis exported!\n";
-        } else {
-            std::cerr << "✗ Warning: Could not write to output file: " << outputFile << "\n";
+        if (!outFile.is_open()) {
+            std::cerr << "✗ Error: Could not write to output file: " << outputFile << "\n";
+            std::cerr << "  Check: file permissions, output directory exists\n";
+            return 1;
         }
+        outFile << jsonOutput;
+        outFile.close();
+        std::cout << "✓ Analysis exported!\n";
         
         std::cout << "\n╔══════════════════════════════════════════════════════════════╗\n";
         std::cout << "║  ✓ MASTERING COMPLETE                                         ║\n";

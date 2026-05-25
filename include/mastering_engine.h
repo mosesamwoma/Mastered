@@ -11,6 +11,15 @@
 
 namespace mastered {
 
+namespace constants {
+    constexpr float DEFAULT_Q_FACTOR = 2.0f;
+    constexpr float PEAK_DETECTION_THRESHOLD = 0.5f;
+    constexpr float MIN_GAIN_THRESHOLD = 0.3f;
+    constexpr float CLIPPING_HEADROOM = 0.99f;
+    constexpr uint32_t DEFAULT_FFT_SIZE = 8192;
+    constexpr uint32_t DEFAULT_SAMPLE_RATE = 44100;
+}
+
 struct MasteringConfig {
     bool autoGain = true;           // Calculate makeup gain
     bool perceptualWeighting = true; // Use A-weighting
@@ -19,6 +28,17 @@ struct MasteringConfig {
     bool smoothing = true;          // Smooth EQ curve
     float targetLoudnessLUFS = -14.f; // Target loudness (LUFS)
 };
+
+inline MasteringConfig createDefaultConfig() {
+    MasteringConfig config;
+    config.autoGain = true;
+    config.perceptualWeighting = true;
+    config.maxEQBands = 8;
+    config.aggressiveness = 0.85f;
+    config.smoothing = true;
+    config.targetLoudnessLUFS = -14.f;
+    return config;
+}
 
 struct MasteringResult {
     EQCurve eqCurve;
@@ -91,6 +111,36 @@ private:
     std::vector<float> applyEQBand(const std::vector<float>& samples,
                                    const EQBand& band,
                                    uint32_t sampleRate);
+    
+    bool validateAudioBuffer(const AudioBuffer& buffer, const std::string& bufferName) const {
+        if (buffer.samples.empty()) {
+            throw std::runtime_error(bufferName + " buffer is empty");
+        }
+        if (buffer.sampleRate == 0) {
+            throw std::runtime_error(bufferName + " has invalid sample rate: 0");
+        }
+        if (buffer.sampleRate < 8000 || buffer.sampleRate > 192000) {
+            throw std::runtime_error(bufferName + " sample rate out of range (8kHz-192kHz)");
+        }
+        uint32_t minSamples = buffer.sampleRate * 1;  // 1 second minimum
+        if (buffer.samples.size() < minSamples) {
+            throw std::runtime_error(bufferName + " must be at least 1 second long");
+        }
+        return true;
+    }
+    
+    bool validateConfig(const MasteringConfig& cfg) const {
+        if (cfg.maxEQBands == 0 || cfg.maxEQBands > 32) {
+            throw std::runtime_error("maxEQBands must be between 1 and 32");
+        }
+        if (cfg.aggressiveness <= 0.f || cfg.aggressiveness > 1.f) {
+            throw std::runtime_error("aggressiveness must be between 0 and 1");
+        }
+        if (cfg.targetLoudnessLUFS > 0.f) {
+            throw std::runtime_error("targetLoudnessLUFS must be negative (e.g., -14.0)");
+        }
+        return true;
+    }
 };
 
 } // namespace mastered

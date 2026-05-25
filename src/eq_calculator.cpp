@@ -1,4 +1,5 @@
 #include "eq_calculator.h"
+#include "mastering_engine.h"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -45,8 +46,8 @@ std::vector<EQBand> EQCalculator::generateParametricBands(const std::vector<floa
     }
     
     // Find peaks (boost) and dips (cut)
-    auto peaks = findPeaks(differenceCurve, 0.5f);
-    auto dips = findDips(differenceCurve, 0.5f);
+    auto peaks = findPeaks(differenceCurve, constants::PEAK_DETECTION_THRESHOLD);
+    auto dips = findDips(differenceCurve, constants::PEAK_DETECTION_THRESHOLD);
     
     // Create bands for significant peaks
     for (size_t idx : peaks) {
@@ -57,9 +58,9 @@ std::vector<EQBand> EQCalculator::generateParametricBands(const std::vector<floa
             float gain = differenceCurve[idx];
             
             // Skip very small gains
-            if (std::abs(gain) < 0.3f) continue;
+            if (std::abs(gain) < constants::MIN_GAIN_THRESHOLD) continue;
             
-            float q = 2.f;  // Default Q factor
+            float q = constants::DEFAULT_Q_FACTOR;  // Default Q factor
             
             // Adjust Q and type based on frequency
             if (freq < 200.f) {
@@ -82,9 +83,9 @@ std::vector<EQBand> EQCalculator::generateParametricBands(const std::vector<floa
             float freq = frequencies[idx];
             float gain = differenceCurve[idx];
             
-            if (std::abs(gain) < 0.3f) continue;
+            if (std::abs(gain) < constants::MIN_GAIN_THRESHOLD) continue;
             
-            float q = 2.f;
+            float q = constants::DEFAULT_Q_FACTOR;
             
             if (freq < 200.f) {
                 q = 0.7f;

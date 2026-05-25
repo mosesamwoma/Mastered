@@ -28,6 +28,19 @@ MasteringResult MasteringEngine::analyzeBuffers(const AudioBuffer& reference,
     MasteringResult result;
     
     try {
+        // Validate inputs
+        validateAudioBuffer(reference, "Reference");
+        validateAudioBuffer(unmastered, "Unmastered");
+        validateConfig(config_);
+        
+        // Check sample rate compatibility
+        if (reference.sampleRate != unmastered.sampleRate) {
+            throw std::runtime_error(
+                "Sample rate mismatch: reference=" + std::to_string(reference.sampleRate) +
+                " Hz, unmastered=" + std::to_string(unmastered.sampleRate) + " Hz"
+            );
+        }
+        
         if (reference.sampleRate == 0 || unmastered.sampleRate == 0) {
             throw std::runtime_error("Invalid sample rate in audio buffers");
         }
@@ -97,7 +110,7 @@ AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCu
     }
     
     if (maxAbs > 1.f) {
-        float scale = 0.99f / maxAbs;
+        float scale = constants::CLIPPING_HEADROOM / maxAbs;
         for (float& sample : output.samples) {
             sample *= scale;
         }
@@ -203,9 +216,10 @@ std::string MasteringEngine::exportEQasReaEQ(const MasteringResult& result) cons
     
     for (const auto& band : result.eqCurve.bands) {
         // ReaEQ format: freq=1000 gain=3.0 bw=1.0 type=peak
+        float bandwidth = band.frequency / band.qFactor;
         reaEQ << "Band: freq=" << std::fixed << std::setprecision(1) << band.frequency
               << " gain=" << band.gain
-              << " bw=" << band.qFactor
+              << " bw=" << bandwidth
               << " type=" << band.type << "\n";
     }
     
