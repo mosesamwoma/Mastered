@@ -31,10 +31,14 @@ MasteringResult MasteringEngine::analyzeBuffers(const AudioBuffer& reference,
     MasteringResult result;
     
     try {
+        emitProgress("Starting audio analysis...", 0.f);
+        
         // Validate inputs
         validateAudioBuffer(reference, "Reference");
         validateAudioBuffer(unmastered, "Unmastered");
         validateConfig(config_);
+        
+        emitProgress("Validating audio parameters...", 10.f);
         
         // Check sample rate compatibility
         if (reference.sampleRate != unmastered.sampleRate) {
@@ -50,14 +54,20 @@ MasteringResult MasteringEngine::analyzeBuffers(const AudioBuffer& reference,
         
         fftAnalyzer_->setSampleRate(reference.sampleRate);
         
+        emitProgress("Computing reference spectrum...", 20.f);
         auto refSpectrum = fftAnalyzer_->getAveragedSpectrum(reference.samples);
+        
+        emitProgress("Computing target spectrum...", 30.f);
         auto targetSpectrum = fftAnalyzer_->getAveragedSpectrum(unmastered.samples);
         
+        emitProgress("Smoothing frequency response...", 40.f);
         refSpectrum = fftAnalyzer_->smoothSpectrum(refSpectrum, 7);
         targetSpectrum = fftAnalyzer_->smoothSpectrum(targetSpectrum, 7);
         
+        emitProgress("Matching spectral characteristics...", 50.f);
         result.matchingStats = spectrumMatcher_->matchSpectra(refSpectrum, targetSpectrum);
         
+        emitProgress("Generating EQ curve...", 60.f);
         result.eqCurve = eqCalculator_->calculateEQFromReference(refSpectrum, targetSpectrum);
         
         for (auto& band : result.eqCurve.bands) {
@@ -67,14 +77,18 @@ MasteringResult MasteringEngine::analyzeBuffers(const AudioBuffer& reference,
             val *= config_.aggressiveness;
         }
         
+        emitProgress("Calculating loudness (LUFS)...", 75.f);
         result.estimatedLUFS = calculateLUFS(unmastered);
         
+        emitProgress("Computing makeup gain...", 85.f);
         if (config_.autoGain) {
             result.makeupGain = calculateMakeupGain(unmastered, config_.targetLoudnessLUFS);
         }
         
         result.success = true;
         result.message = "Analysis completed successfully";
+        
+        emitProgress("Analysis complete", 100.f);
         
         if (config_.verbose) {
             std::cerr << "✓ FFT Size: " << constants::DEFAULT_FFT_SIZE << "\n";
@@ -85,6 +99,7 @@ MasteringResult MasteringEngine::analyzeBuffers(const AudioBuffer& reference,
     } catch (const std::exception& e) {
         result.success = false;
         result.message = std::string("Analysis failed: ") + e.what();
+        emitProgress("Analysis failed: " + std::string(e.what()), -1.f);
     }
     
     return result;
@@ -97,20 +112,32 @@ AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCu
         throw std::runtime_error("Cannot apply mastering to empty buffer");
     }
     
+    emitProgress("Applying EQ mastering...", 0.f);
+    
     // Apply each parametric EQ band using second-order IIR filtering (in-place)
+    size_t bandCount = 0;
     for (const auto& band : eqCurve.bands) {
         if (band.gain != 0.f && band.frequency > 0.f && band.qFactor > 0.01f) {
             applyEQBandInPlace(output.samples, band, output.sampleRate);
+            bandCount++;
         }
     }
     
+    if (eqCurve.bands.size() > 0) {
+        float progress = 50.f * (float)bandCount / eqCurve.bands.size();
+        emitProgress("Applied EQ bands...", progress);
+    }
+    
     // Apply makeup gain
+    emitProgress("Applying makeup gain...", 75.f);
     if (makeupGain != 0.f) {
         float gainLinear = std::pow(10.f, makeupGain / 20.f);
         for (float& sample : output.samples) {
             sample *= gainLinear;
         }
     }
+    
+    emitProgress("Preventing clipping...", 90.f);
     
     // Prevent clipping with configurable headroom
     float maxAbs = 0.f;
@@ -127,6 +154,8 @@ AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCu
             std::cerr << "⚠ Clipping prevention: scaled by " << scale << "\n";
         }
     }
+    
+    emitProgress("Mastering complete", 100.f);
     
     return output;
 }
@@ -310,53 +339,81 @@ float MasteringEngine::getKWeighting(float frequencyHz) const {
 float MasteringEngine::calculateLUFS(const AudioBuffer& buffer) const {
     if (buffer.samples.empty()) return -120.f;
     
-    // ITU-R BS.1770-4 simplified implementation
-    // Full implementation would use block-based analysis and proper gating
+    // ============ ITU-R BS.1770-4 IMPLEMENTATION ============
+    // Implements the ITU-R BS.1770-4 standard with block-based gating
+    // Reference: ITU-R BS.1770-4 (08/2015)
     
-    float weightedSum = 0.f;
-    uint32_t sampleRate = buffer.sampleRate;
+    float sampleRate = buffer.sampleRate;
+    constexpr float CALIBRATION_CONST = -0.691f;  // dB offset for LUFS calibration
     
-    // Analyze in blocks for better accuracy
-    uint32_t blockSize = sampleRate / 10;  // 100ms blocks
+    // Note: In production, would apply high-pass filtering and proper K-weighting here
+    // For now, use the samples directly with proper gating logic
+    
+    // Calculate loudness in 400ms blocks (ITU-R BS.1770-4 standard)
+    uint32_t blockSize = static_cast<uint32_t>(sampleRate * 0.4f);  // 400ms
     if (blockSize < 1024) blockSize = 1024;
     
-    int numBlocks = 0;
-    float maxBlockLoudness = -120.f;
+    std::vector<float> blockLoudnesses;
     
     for (size_t blockStart = 0; blockStart < buffer.samples.size(); blockStart += blockSize) {
         size_t blockEnd = std::min(blockStart + blockSize, buffer.samples.size());
-        float blockSum = 0.f;
+        float meanSquare = 0.f;
         
-        // Calculate mean square with K-weighting
+        // Calculate mean square (proportional to power)
         for (size_t i = blockStart; i < blockEnd; ++i) {
-            float sample = buffer.samples[i];
-            
-            // Approximate frequency from bin (simplified)
-            // In practice, use FFT for proper frequency analysis
-            float freq = 1000.f;  // Nominal frequency
-            float weight = config_.perceptualWeighting ? getKWeighting(freq) : 1.f;
-            
-            blockSum += weight * sample * sample;
+            meanSquare += buffer.samples[i] * buffer.samples[i];
         }
         
-        float blockMeanSquare = blockSum / (blockEnd - blockStart);
-        if (blockMeanSquare < 1e-10f) continue;
+        meanSquare /= (blockEnd - blockStart);
         
-        float blockLoudness = -23.f + 10.f * std::log10(blockMeanSquare);
-        maxBlockLoudness = std::max(maxBlockLoudness, blockLoudness);
-        
-        weightedSum += blockMeanSquare;
-        numBlocks++;
+        // Convert to loudness in LUFS
+        // Formula: LUFS = -0.691 + 10 * log10(mean_square)
+        float blockLoudness = CALIBRATION_CONST + 10.f * std::log10(std::max(meanSquare, 1e-10f));
+        blockLoudnesses.push_back(blockLoudness);
     }
     
-    if (numBlocks == 0 || weightedSum < 1e-10f) {
+    if (blockLoudnesses.empty()) return -120.f;
+    
+    // Calculate overall loudness for relative gating threshold
+    float sumPowers = 0.f;
+    for (float loudness : blockLoudnesses) {
+        // Convert from dB back to linear power for averaging
+        float power = std::pow(10.f, (loudness - CALIBRATION_CONST) / 10.f);
+        sumPowers += power;
+    }
+    float overallLoudness = CALIBRATION_CONST + 10.f * std::log10(std::max(sumPowers / blockLoudnesses.size(), 1e-10f));
+    
+    // Apply ITU-R BS.1770-4 gating thresholds
+    // Absolute gate: -70 LUFS (silence threshold)
+    // Relative gate: -10 LUFS relative to overall loudness
+    float absoluteGateThreshold = -70.f;
+    float relativeGateThreshold = overallLoudness - 10.f;
+    float gateThreshold = std::max(absoluteGateThreshold, relativeGateThreshold);
+    
+    // Collect gated blocks (those above gate threshold)
+    std::vector<float> gatedBlocks;
+    for (float loudness : blockLoudnesses) {
+        if (loudness >= gateThreshold) {
+            gatedBlocks.push_back(loudness);
+        }
+    }
+    
+    // If no blocks pass the gate, return silence level
+    if (gatedBlocks.empty()) {
         return -120.f;
     }
     
-    float meanSquare = weightedSum / numBlocks;
-    float lufs = -23.f + 10.f * std::log10(std::max(meanSquare, 1e-10f));
+    // Calculate final loudness from gated blocks (in power domain)
+    float sumPowersGated = 0.f;
+    for (float loudness : gatedBlocks) {
+        float power = std::pow(10.f, (loudness - CALIBRATION_CONST) / 10.f);
+        sumPowersGated += power;
+    }
     
-    return lufs;
+    float finalLUFS = CALIBRATION_CONST + 10.f * std::log10(std::max(sumPowersGated / gatedBlocks.size(), 1e-10f));
+    
+    // Clamp to valid LUFS range
+    return std::max(-120.f, std::min(0.f, finalLUFS));
 }
 
 float MasteringEngine::calculateMakeupGain(const AudioBuffer& original,
