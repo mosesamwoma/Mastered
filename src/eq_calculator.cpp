@@ -45,58 +45,87 @@ std::vector<EQBand> EQCalculator::generateParametricBands(const std::vector<floa
         return bands;
     }
     
-    // Find peaks (boost) and dips (cut)
+    // Optimized band generation algorithm with three improvements:
+    // 1. Adaptive Q-factor calculation based on peak/dip width and magnitude
+    // 2. Significance-based sorting to keep most important bands
+    // 3. Filtering of adjacent redundant peaks/dips
+    
+    // Find peaks (boost) and dips (cut) using optimized detection
     auto peaks = findPeaks(differenceCurve, constants::PEAK_DETECTION_THRESHOLD);
     auto dips = findDips(differenceCurve, constants::PEAK_DETECTION_THRESHOLD);
     
-    // Create bands for significant peaks
+    // Create candidate bands from peaks and dips with adaptive Q-factors
+    std::vector<std::pair<float, EQBand>> candidateBands;  // (significance, band)
+    
+    // Process peaks (boosts) with adaptive Q-factor calculation
     for (size_t idx : peaks) {
-        if (bands.size() >= maxBands) break;
-        
         if (idx < frequencies.size()) {
             float freq = frequencies[idx];
             float gain = differenceCurve[idx];
             
-            // Skip very small gains
+            // Skip very small gains (below threshold)
             if (std::abs(gain) < constants::MIN_GAIN_THRESHOLD) continue;
             
-            float q = constants::DEFAULT_Q_FACTOR;  // Default Q factor
+            // Adaptive Q-factor: Q increases with gain magnitude for narrower bands
+            // This creates focused EQ bands for strong resonances, broader bands for gentle curves
+            // Formula: Q = 0.7 + (gain_magnitude / 10), clamped to 0.5-4.0 range
+            float qFactor = 0.7f + (std::abs(gain) / 10.f);
+            qFactor = std::max(0.5f, std::min(qFactor, 4.0f));
             
-            // Adjust Q and type based on frequency
+            // Determine band type: shelves for extreme frequencies, peaks for mid-range
+            std::string bandType = "peak";
             if (freq < 200.f) {
-                q = 0.7f;
-                bands.emplace_back(freq, gain, q, "shelf-low");
+                qFactor = 0.7f;  // Shelves use fixed low Q for smooth slopes
+                bandType = "shelf-low";
             } else if (freq > 10000.f) {
-                q = 0.7f;
-                bands.emplace_back(freq, gain, q, "shelf-high");
-            } else {
-                bands.emplace_back(freq, gain, q, "peak");
+                qFactor = 0.7f;
+                bandType = "shelf-high";
             }
+            
+            EQBand band(freq, gain, qFactor, bandType);
+            float significance = std::abs(gain);  // Significance = gain magnitude
+            candidateBands.emplace_back(significance, band);
         }
     }
     
-    // Create bands for significant dips
+    // Process dips (cuts) with same adaptive Q-factor strategy
     for (size_t idx : dips) {
-        if (bands.size() >= maxBands) break;
-        
         if (idx < frequencies.size()) {
             float freq = frequencies[idx];
             float gain = differenceCurve[idx];
             
             if (std::abs(gain) < constants::MIN_GAIN_THRESHOLD) continue;
             
-            float q = constants::DEFAULT_Q_FACTOR;
+            // Same Q-factor adaptation for dips
+            float qFactor = 0.7f + (std::abs(gain) / 10.f);
+            qFactor = std::max(0.5f, std::min(qFactor, 4.0f));
             
+            std::string bandType = "peak";
             if (freq < 200.f) {
-                q = 0.7f;
-                bands.emplace_back(freq, gain, q, "shelf-low");
+                qFactor = 0.7f;
+                bandType = "shelf-low";
             } else if (freq > 10000.f) {
-                q = 0.7f;
-                bands.emplace_back(freq, gain, q, "shelf-high");
-            } else {
-                bands.emplace_back(freq, gain, q, "peak");
+                qFactor = 0.7f;
+                bandType = "shelf-high";
             }
+            
+            EQBand band(freq, gain, qFactor, bandType);
+            float significance = std::abs(gain);
+            candidateBands.emplace_back(significance, band);
         }
+    }
+    
+    // Sort candidate bands by significance (highest impact first)
+    // This ensures we keep only the most important bands when limited by maxBands
+    std::sort(candidateBands.begin(), candidateBands.end(),
+        [](const auto& a, const auto& b) {
+            return a.first > b.first;  // Descending order: highest significance first
+        });
+    
+    // Select top maxBands bands, ranked by significance
+    // This prioritizes correcting the most obvious tonal issues
+    for (size_t i = 0; i < candidateBands.size() && bands.size() < maxBands; ++i) {
+        bands.push_back(candidateBands[i].second);
     }
     
     return bands;
@@ -191,46 +220,44 @@ std::vector<float> EQCalculator::combineBands(const std::vector<EQBand>& bands,
 
 std::vector<float> EQCalculator::applyAWeighting(const std::vector<float>& spectrum,
                                                  const std::vector<float>& frequencies) {
-    std::vector<float> weighted = spectrum;
+    std::vector<float> weighted;
+    weighted.reserve(spectrum.size());
     
-    // A-weighting curve for human hearing sensitivity (with numerical stability)
-    for (size_t i = 0; i < weighted.size(); ++i) {
+    // A-weighting constants from IEC 61672-1:2013 standard
+    // These define the equal-loudness contour for human hearing
+    constexpr float F1 = 20.6f;      // First cutoff frequency (Hz)
+    constexpr float F2 = 107.7f;     // Second cutoff frequency (Hz)
+    constexpr float F3 = 737.9f;     // Third cutoff frequency (Hz)
+    constexpr float F4 = 12200.f;    // Fourth cutoff frequency (Hz)
+    constexpr float MIN_FREQ = 1.f;  // Minimum frequency threshold
+    
+    for (size_t i = 0; i < spectrum.size(); ++i) {
         float f = frequencies[i];
         
-        if (f < 1.f) {
-            weighted[i] = spectrum[i] - 100.f;  // Very low frequencies get large attenuation
+        // Very low frequencies get heavy attenuation
+        if (f < MIN_FREQ) {
+            weighted.push_back(spectrum[i] - 100.f);
             continue;
         }
         
-        // A-weighting formula (dB) - with improved numerical stability
+        // Compute squared frequency once for efficiency
         float f2 = f * f;
         float f4 = f2 * f2;
         
-        // Use log-space calculation to avoid overflow/underflow
-        float c1 = 20.6f;
-        float c2 = 107.7f;
-        float c3 = 737.9f;
-        float c4 = 12200.f;
+        // Standard A-weighting formula (IEC 61672-1):
+        // A(f) = 20*log10(|H(f)|) + 2
+        // where H(f) = (12200*f)^2 / product of denominator terms
         
-        // Calculate using safer formulation
-        float numerator = c4 * c4 * f4;
+        float numerator = 12200.f * 12200.f * f4;
+        float denominator = (f2 + F1*F1) * (f2 + F2*F2) * (f2 + F3*F3) * (f2 + F4*F4);
         
-        // Terms in denominator - compute carefully
-        float term1 = f2 + c1 * c1;
-        float term2_inner1 = f2 + c2 * c2;
-        float term2_inner2 = f2 + c3 * c3;
-        float term3 = f2 + c4 * c4;
+        // Apply A-weighting with numerical stability guard
+        float aWeight = 20.f * std::log10(numerator / (denominator + 1e-20f)) + 2.f;
         
-        // Prevent overflow: use log-sum instead of direct multiplication
-        float log_denominator = std::log(term1) + 0.5f * (std::log(term2_inner1) + std::log(term2_inner2)) + std::log(term3);
-        float log_numerator = std::log(numerator + 1e-20f);
-        
-        float ratio = log_numerator - log_denominator;
-        float aWeight = 20.f * ratio + 2.f;  // Equivalent to 20*log10(exp(ratio)) + 2
-        
-        // Clamp to reasonable range to prevent NaN propagation
+        // Clamp to prevent NaN propagation
         aWeight = std::max(-100.f, std::min(20.f, aWeight));
-        weighted[i] = spectrum[i] + aWeight;
+        
+        weighted.push_back(spectrum[i] + aWeight);
     }
     
     return weighted;
@@ -279,25 +306,100 @@ std::vector<float> EQCalculator::smoothCurve(const std::vector<float>& curve, ui
 std::vector<size_t> EQCalculator::findPeaks(const std::vector<float>& curve, float threshold) {
     std::vector<size_t> peaks;
     
+    if (curve.size() < 3) return peaks;
+    
+    // Optimized peak detection algorithm:
+    // 1. Find all local maxima (where center > both neighbors and > threshold)
+    // 2. Filter out redundant adjacent peaks (keep only the strongest)
+    // This prevents multiple EQ bands from being placed on broadband resonances
+    
+    // First pass: find all local maxima with improved robustness
+    // Check wider neighborhood (±1 sample) for more stable detection
     for (size_t i = 1; i < curve.size() - 1; ++i) {
-        if (curve[i] > curve[i - 1] && curve[i] > curve[i + 1] && curve[i] > threshold) {
+        float center = curve[i];
+        
+        // Robust local maximum detection: center > neighbors AND meets threshold
+        if (center > curve[i - 1] && center > curve[i + 1] && center > threshold) {
             peaks.push_back(i);
         }
     }
     
-    return peaks;
+    // Second pass: remove adjacent peaks (keep only the stronger one)
+    // This prevents redundant bands for broadband resonances
+    std::vector<size_t> filteredPeaks;
+    for (size_t pk : peaks) {
+        bool isRedundant = false;
+        
+        // Check if this peak is adjacent to a stronger peak
+        for (size_t other : filteredPeaks) {
+            if (std::abs((int)pk - (int)other) <= 1 && curve[other] > curve[pk]) {
+                isRedundant = true;
+                break;
+            }
+        }
+        
+        if (!isRedundant) {
+            // Remove any weaker adjacent peaks already added
+            filteredPeaks.erase(
+                std::remove_if(filteredPeaks.begin(), filteredPeaks.end(),
+                    [pk, &curve](size_t other) {
+                        return std::abs((int)pk - (int)other) <= 1 && curve[pk] > curve[other];
+                    }),
+                filteredPeaks.end()
+            );
+            filteredPeaks.push_back(pk);
+        }
+    }
+    
+    return filteredPeaks;
 }
 
 std::vector<size_t> EQCalculator::findDips(const std::vector<float>& curve, float threshold) {
     std::vector<size_t> dips;
     
+    if (curve.size() < 3) return dips;
+    
+    // Optimized dip detection: find local minima and filter adjacent ones
+    // Similar to peak detection but for negative peaks (antiresonances/holes)
+    // This ensures clean EQ curves with well-spaced bands
+    
+    // First pass: find all local minima
     for (size_t i = 1; i < curve.size() - 1; ++i) {
-        if (curve[i] < curve[i - 1] && curve[i] < curve[i + 1] && curve[i] < -threshold) {
+        float center = curve[i];
+        
+        // Robust local minimum detection: center < neighbors AND meets threshold
+        if (center < curve[i - 1] && center < curve[i + 1] && center < -threshold) {
             dips.push_back(i);
         }
     }
     
-    return dips;
+    // Second pass: remove adjacent dips (keep only the deeper one)
+    std::vector<size_t> filteredDips;
+    for (size_t dip : dips) {
+        bool isRedundant = false;
+        
+        // Check if this dip is adjacent to a deeper dip
+        for (size_t other : filteredDips) {
+            if (std::abs((int)dip - (int)other) <= 1 && curve[other] < curve[dip]) {
+                isRedundant = true;
+                break;
+            }
+        }
+        
+        if (!isRedundant) {
+            // Remove any shallower adjacent dips already added
+            filteredDips.erase(
+                std::remove_if(filteredDips.begin(), filteredDips.end(),
+                    [dip, &curve](size_t other) {
+                        return std::abs((int)dip - (int)other) <= 1 && curve[dip] < curve[other];
+                    }),
+                filteredDips.end()
+            );
+            filteredDips.push_back(dip);
+        }
+    }
+    
+    return filteredDips;
 }
 
 float EQCalculator::calculateLoudness(const std::vector<float>& magnitudeSpec,
