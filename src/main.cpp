@@ -93,6 +93,14 @@ int main(int argc, char* argv[]) {
         
         MasteringEngine engine(config);
         
+        // Set up progress callback to show live feedback
+        engine.setProgressCallback([](const std::string& message, float percentage) {
+            if (percentage >= 0.f) {
+                std::cout << "  [" << std::fixed << std::setw(5) << std::setprecision(1) 
+                         << percentage << "%] " << message << "\n";
+            }
+        });
+        
         // Load audio
         std::cout << "→ Analyzing tracks...\n";
         auto result = engine.analyzeTracks(referenceFile, unmasteredFile);
