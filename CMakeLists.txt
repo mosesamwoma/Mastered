@@ -65,24 +65,10 @@ install(TARGETS mastered_cli
         RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include/mastered)
 
-# Optional: Tests
-option(BUILD_TESTS "Build unit tests" OFF)
-if(BUILD_TESTS)
-    enable_testing()
-    message(STATUS "Tests enabled (implement in tests/)")
-endif()
-
-# Optional: Documentation
-option(BUILD_DOCS "Build documentation" OFF)
-if(BUILD_DOCS)
-    message(STATUS "Documentation building enabled")
-endif()
-
 # Summary
 message(STATUS "")
 message(STATUS "=== Mastered Engine ${CMAKE_PROJECT_VERSION} ===")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ Standard: 17")
 message(STATUS "FFTW3: ${FFTW3F_FOUND}")
-message(STATUS "Tests: ${BUILD_TESTS}")
 message(STATUS "")
