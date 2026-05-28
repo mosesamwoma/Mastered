@@ -8,68 +8,206 @@
 
 namespace mastered {
 
+// Helper: Read little-endian value with error checking
+template<typename T>
+bool readLE(std::ifstream& file, T& value) {
+    file.read(reinterpret_cast<char*>(&value), sizeof(T));
+    return file.gcount() == sizeof(T);
+}
+
+// Helper: Get file size
+uint32_t getFileSize(const std::string& filepath) {
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file) return 0;
+    return static_cast<uint32_t>(file.tellg());
+}
+
 AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
     AudioBuffer result;
-    std::ifstream file(filepath, std::ios::binary);
     
+    // ============ PRE-VALIDATION ============
+    uint32_t fileSize = getFileSize(filepath);
+    if (fileSize == 0) {
+        throw std::runtime_error("File not found or empty: " + filepath);
+    }
+    
+    // Maximum file size: 5 minutes at 192kHz, 32-bit stereo ≈ 460 MB (limit to 500 MB for safety)
+    constexpr uint32_t MAX_FILE_SIZE = 500 * 1024 * 1024;
+    if (fileSize > MAX_FILE_SIZE) {
+        throw std::runtime_error("File too large (max 500MB for safety): " + filepath);
+    }
+    
+    // ============ OPEN FILE ============
+    std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open file: " + filepath);
     }
     
-    char riffHeader[4];
-    file.read(riffHeader, 4);
-    if (std::string(riffHeader, 4) != "RIFF") {
-        throw std::runtime_error("Not a valid WAV file: missing RIFF header");
+    // ============ VALIDATE RIFF HEADER ============
+    char riffID[4];
+    if (!readLE(file, riffID) || std::string(riffID, 4) != "RIFF") {
+        throw std::runtime_error("Invalid WAV file: missing RIFF header");
     }
     
-    uint32_t riffSize;
-    file.read(reinterpret_cast<char*>(&riffSize), 4);
-    
-    char waveHeader[4];
-    file.read(waveHeader, 4);
-    if (std::string(waveHeader, 4) != "WAVE") {
-        throw std::runtime_error("Not a valid WAV file: missing WAVE header");
+    uint32_t riffSize = 0;
+    if (!readLE(file, riffSize)) {
+        throw std::runtime_error("File truncated: cannot read RIFF size");
     }
     
-    char chunkID[4];
-    uint32_t chunkSize;
+    // Validate RIFF size matches actual file size (with 8-byte RIFF header)
+    if (riffSize + 8 != fileSize) {
+        throw std::runtime_error(
+            "RIFF size mismatch: header says " + std::to_string(riffSize + 8) + 
+            " bytes but file is " + std::to_string(fileSize) + " bytes"
+        );
+    }
+    
+    char waveID[4];
+    if (!readLE(file, waveID) || std::string(waveID, 4) != "WAVE") {
+        throw std::runtime_error("Invalid WAV file: missing WAVE header");
+    }
+    
+    // ============ PARSE CHUNKS ============
     WAVHeader wavHeader = {};
     uint32_t dataSize = 0;
     uint32_t dataOffset = 0;
+    bool foundFmt = false, foundData = false;
     
-    while (file.read(chunkID, 4)) {
-        file.read(reinterpret_cast<char*>(&chunkSize), 4);
+    while (file.tellg() < static_cast<int32_t>(fileSize)) {
+        char chunkID[4];
+        if (!readLE(file, chunkID)) {
+            throw std::runtime_error("File truncated: cannot read chunk ID");
+        }
+        
+        uint32_t chunkSize = 0;
+        if (!readLE(file, chunkSize)) {
+            throw std::runtime_error("File truncated: cannot read chunk size");
+        }
+        
+        // Prevent chunk size from causing overflow
+        if (chunkSize > MAX_FILE_SIZE) {
+            throw std::runtime_error(
+                "Invalid chunk size " + std::to_string(chunkSize) + 
+                " (exceeds maximum sensible value)"
+            );
+        }
+        
         uint32_t chunkStart = file.tellg();
         
         if (std::string(chunkID, 4) == "fmt ") {
-            file.read(reinterpret_cast<char*>(&wavHeader.audioFormat), 2);
-            file.read(reinterpret_cast<char*>(&wavHeader.numChannels), 2);
-            file.read(reinterpret_cast<char*>(&wavHeader.sampleRate), 4);
-            file.read(reinterpret_cast<char*>(&wavHeader.byteRate), 4);
-            file.read(reinterpret_cast<char*>(&wavHeader.blockAlign), 2);
-            file.read(reinterpret_cast<char*>(&wavHeader.bitsPerSample), 2);
-            
-            if (wavHeader.audioFormat != 1) {
-                throw std::runtime_error("Only PCM audio format is supported");
+            // ============ PARSE FORMAT CHUNK ============
+            if (chunkSize < 16) {
+                throw std::runtime_error("Format chunk too small: " + std::to_string(chunkSize));
             }
-        } else if (std::string(chunkID, 4) == "data") {
+            
+            if (!readLE(file, wavHeader.audioFormat)) throw std::runtime_error("File truncated in fmt chunk (audioFormat)");
+            if (!readLE(file, wavHeader.numChannels)) throw std::runtime_error("File truncated in fmt chunk (numChannels)");
+            if (!readLE(file, wavHeader.sampleRate)) throw std::runtime_error("File truncated in fmt chunk (sampleRate)");
+            if (!readLE(file, wavHeader.byteRate)) throw std::runtime_error("File truncated in fmt chunk (byteRate)");
+            if (!readLE(file, wavHeader.blockAlign)) throw std::runtime_error("File truncated in fmt chunk (blockAlign)");
+            if (!readLE(file, wavHeader.bitsPerSample)) throw std::runtime_error("File truncated in fmt chunk (bitsPerSample)");
+            
+            // Validate audio format (only PCM supported)
+            if (wavHeader.audioFormat != 1) {
+                throw std::runtime_error(
+                    "Unsupported audio format: " + std::to_string(wavHeader.audioFormat) + 
+                    " (only PCM/1 is supported)"
+                );
+            }
+            
+            // Validate channel count (1-8 supported)
+            if (wavHeader.numChannels == 0 || wavHeader.numChannels > 8) {
+                throw std::runtime_error(
+                    "Invalid channel count: " + std::to_string(wavHeader.numChannels) + 
+                    " (must be 1-8)"
+                );
+            }
+            
+            // Validate sample rate (8 kHz to 192 kHz)
+            if (wavHeader.sampleRate < 8000 || wavHeader.sampleRate > 192000) {
+                throw std::runtime_error(
+                    "Invalid sample rate: " + std::to_string(wavHeader.sampleRate) + 
+                    " Hz (must be 8000-192000)"
+                );
+            }
+            
+            // Validate bit depth (16, 24, or 32 bit)
+            if (wavHeader.bitsPerSample != 16 && wavHeader.bitsPerSample != 24 && wavHeader.bitsPerSample != 32) {
+                throw std::runtime_error(
+                    "Unsupported bit depth: " + std::to_string(wavHeader.bitsPerSample) + 
+                    " (only 16, 24, 32 bit supported)"
+                );
+            }
+            
+            // Validate block align
+            uint16_t expectedBlockAlign = wavHeader.numChannels * (wavHeader.bitsPerSample / 8);
+            if (wavHeader.blockAlign == 0 || wavHeader.blockAlign != expectedBlockAlign) {
+                throw std::runtime_error(
+                    "Invalid block align: " + std::to_string(wavHeader.blockAlign) + 
+                    " (expected " + std::to_string(expectedBlockAlign) + ")"
+                );
+            }
+            
+            // Validate byte rate
+            uint32_t expectedByteRate = wavHeader.sampleRate * wavHeader.blockAlign;
+            if (wavHeader.byteRate == 0 || wavHeader.byteRate != expectedByteRate) {
+                throw std::runtime_error(
+                    "Invalid byte rate: " + std::to_string(wavHeader.byteRate) + 
+                    " (expected " + std::to_string(expectedByteRate) + ")"
+                );
+            }
+            
+            foundFmt = true;
+        } 
+        else if (std::string(chunkID, 4) == "data") {
+            // ============ PARSE DATA CHUNK ============
+            if (!foundFmt) {
+                throw std::runtime_error("Data chunk found before format chunk");
+            }
+            
             dataSize = chunkSize;
             dataOffset = file.tellg();
-            break;
+            foundData = true;
+            
+            // Validate data size
+            if (dataSize == 0) {
+                throw std::runtime_error("Data chunk is empty");
+            }
+            
+            if (dataSize % wavHeader.blockAlign != 0) {
+                throw std::runtime_error(
+                    "Data size " + std::to_string(dataSize) + 
+                    " is not a multiple of block align " + std::to_string(wavHeader.blockAlign)
+                );
+            }
+            
+            // Check if decoded samples would exceed memory limit (1 GB for float vectors)
+            uint32_t numSamples = dataSize / wavHeader.blockAlign;
+            constexpr uint32_t MAX_SAMPLES = 1024 * 1024 * 256;  // 256M samples = 1GB of float[]
+            if (numSamples > MAX_SAMPLES) {
+                throw std::runtime_error(
+                    "Audio too long: " + std::to_string(numSamples) + 
+                    " samples exceeds limit of " + std::to_string(MAX_SAMPLES)
+                );
+            }
+            
+            break;  // Found data chunk, exit loop
         }
         
+        // Skip to next chunk
         file.seekg(chunkStart + chunkSize);
     }
     
-    if (dataSize == 0) {
-        throw std::runtime_error("No audio data found in WAV file");
+    // ============ FINAL VALIDATION ============
+    if (!foundFmt) {
+        throw std::runtime_error("No format chunk found in WAV file");
+    }
+    if (!foundData) {
+        throw std::runtime_error("No data chunk found in WAV file");
     }
     
-    // Read audio data
+    // ============ READ AUDIO DATA ============
     file.seekg(dataOffset);
-    if (wavHeader.blockAlign == 0) {
-        throw std::runtime_error("Invalid WAV file: block align is zero");
-    }
     uint32_t numSamples = dataSize / wavHeader.blockAlign;
     
     result.sampleRate = wavHeader.sampleRate;
@@ -81,38 +219,48 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
     rawSamples.reserve(numSamples);
     
     if (wavHeader.bitsPerSample == 16) {
+        // ============ 16-BIT PCM ============
         std::vector<int16_t> buffer(numSamples);
         file.read(reinterpret_cast<char*>(buffer.data()), dataSize);
-        if (!file) {
-            throw std::runtime_error("Failed to read 16-bit audio data (file truncated?)");
+        if (file.gcount() != static_cast<std::streamsize>(dataSize)) {
+            throw std::runtime_error(
+                "File truncated: expected " + std::to_string(dataSize) + 
+                " bytes but read " + std::to_string(file.gcount())
+            );
         }
         for (int16_t sample : buffer) {
             rawSamples.push_back(static_cast<float>(sample) / 32768.f);
         }
-    } else if (wavHeader.bitsPerSample == 24) {
+    } 
+    else if (wavHeader.bitsPerSample == 24) {
+        // ============ 24-BIT PCM ============
         std::vector<uint8_t> buffer(dataSize);
         file.read(reinterpret_cast<char*>(buffer.data()), dataSize);
-        if (!file) {
-            throw std::runtime_error("Failed to read 24-bit audio data (file truncated?)");
+        if (file.gcount() != static_cast<std::streamsize>(dataSize)) {
+            throw std::runtime_error("File truncated reading 24-bit data");
         }
+        
         for (size_t i = 0; i + 3 <= dataSize; i += 3) {
+            // Read little-endian 24-bit signed integer
             int32_t sample = (static_cast<int32_t>(buffer[i + 2]) << 16) |
                            (static_cast<int32_t>(buffer[i + 1]) << 8) |
                            static_cast<int32_t>(buffer[i]);
+            // Sign-extend from 24 to 32 bits
             if (sample & 0x800000) sample |= 0xFF000000;
             rawSamples.push_back(static_cast<float>(sample) / 8388608.f);
         }
-    } else if (wavHeader.bitsPerSample == 32) {
+    } 
+    else if (wavHeader.bitsPerSample == 32) {
+        // ============ 32-BIT PCM ============
         std::vector<float> buffer(numSamples);
         file.read(reinterpret_cast<char*>(buffer.data()), dataSize);
-        if (!file) {
-            throw std::runtime_error("Failed to read 32-bit audio data (file truncated?)");
+        if (file.gcount() != static_cast<std::streamsize>(dataSize)) {
+            throw std::runtime_error("File truncated reading 32-bit data");
         }
         rawSamples = buffer;
-    } else {
-        throw std::runtime_error("Unsupported bit depth: " + std::to_string(wavHeader.bitsPerSample));
     }
     
+    // ============ CONVERT TO MONO IF NEEDED ============
     if (wavHeader.numChannels > 1) {
         std::cerr << "⚠ Warning: Converting " << static_cast<int>(wavHeader.numChannels) 
                   << "-channel audio to mono (downmixing)\n";
@@ -128,67 +276,159 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
 }
 
 bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer) {
-    std::ofstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
+    try {
+        // ============ PRE-VALIDATION ============
+        if (buffer.samples.empty()) {
+            std::cerr << "Error: Cannot save WAV - buffer is empty\n";
+            return false;
+        }
+        
+        // Validate buffer parameters
+        if (buffer.sampleRate < 8000 || buffer.sampleRate > 192000) {
+            std::cerr << "Error: Invalid sample rate " << buffer.sampleRate << " Hz\n";
+            return false;
+        }
+        
+        if (buffer.bitDepth != 16 && buffer.bitDepth != 24 && buffer.bitDepth != 32) {
+            std::cerr << "Error: Unsupported bit depth " << buffer.bitDepth << "\n";
+            return false;
+        }
+        
+        // ============ CREATE FILE ============
+        std::ofstream file(filepath, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Error: Cannot create file: " << filepath << "\n";
+            return false;
+        }
+        
+        // ============ CALCULATE SIZES ============
+        uint32_t numSamples = buffer.samples.size();
+        uint16_t bytesPerSample = buffer.bitDepth / 8;
+        uint32_t dataSize = numSamples * bytesPerSample;
+        
+        // Check for overflow: file size shouldn't exceed 4GB
+        constexpr uint64_t MAX_RIFF_SIZE = 0xFFFFFFFFULL - 8;
+        if (dataSize > MAX_RIFF_SIZE - 36) {
+            std::cerr << "Error: Audio too long for WAV format (max 4GB)\n";
+            file.close();
+            return false;
+        }
+        
+        // ============ WRITE RIFF HEADER ============
+        file.write("RIFF", 4);
+        uint32_t riffSize = 36 + dataSize;
+        file.write(reinterpret_cast<const char*>(&riffSize), 4);
+        file.write("WAVE", 4);
+        
+        if (!file.good()) {
+            std::cerr << "Error: Failed to write RIFF header\n";
+            file.close();
+            return false;
+        }
+        
+        // ============ WRITE FORMAT CHUNK ============
+        file.write("fmt ", 4);
+        uint32_t fmtSize = 16;
+        file.write(reinterpret_cast<const char*>(&fmtSize), 4);
+        
+        uint16_t audioFormat = 1;      // PCM
+        uint16_t channels = 1;         // Mono
+        uint32_t byteRate = buffer.sampleRate * bytesPerSample;
+        uint16_t blockAlign = bytesPerSample;
+        
+        file.write(reinterpret_cast<const char*>(&audioFormat), 2);
+        file.write(reinterpret_cast<const char*>(&channels), 2);
+        file.write(reinterpret_cast<const char*>(&buffer.sampleRate), 4);
+        file.write(reinterpret_cast<const char*>(&byteRate), 4);
+        file.write(reinterpret_cast<const char*>(&blockAlign), 2);
+        file.write(reinterpret_cast<const char*>(&buffer.bitDepth), 2);
+        
+        if (!file.good()) {
+            std::cerr << "Error: Failed to write format chunk\n";
+            file.close();
+            return false;
+        }
+        
+        // ============ WRITE DATA CHUNK ============
+        file.write("data", 4);
+        file.write(reinterpret_cast<const char*>(&dataSize), 4);
+        
+        if (!file.good()) {
+            std::cerr << "Error: Failed to write data chunk header\n";
+            file.close();
+            return false;
+        }
+        
+        // ============ WRITE AUDIO DATA ============
+        if (buffer.bitDepth == 16) {
+            for (float sample : buffer.samples) {
+                // Clamp to prevent clipping
+                float clamped = std::max(-1.f, std::min(1.f, sample));
+                int16_t pcmSample = static_cast<int16_t>(clamped * 32767.f);
+                file.write(reinterpret_cast<const char*>(&pcmSample), 2);
+                if (!file.good()) {
+                    std::cerr << "Error: Write failed (disk full?)\n";
+                    file.close();
+                    return false;
+                }
+            }
+        } 
+        else if (buffer.bitDepth == 24) {
+            for (float sample : buffer.samples) {
+                float clamped = std::max(-1.f, std::min(1.f, sample));
+                int32_t pcm32 = static_cast<int32_t>(clamped * 8388607.f);
+                // Write little-endian 24-bit
+                uint8_t byte1 = static_cast<uint8_t>(pcm32 & 0xFF);
+                uint8_t byte2 = static_cast<uint8_t>((pcm32 >> 8) & 0xFF);
+                uint8_t byte3 = static_cast<uint8_t>((pcm32 >> 16) & 0xFF);
+                file.write(reinterpret_cast<const char*>(&byte1), 1);
+                file.write(reinterpret_cast<const char*>(&byte2), 1);
+                file.write(reinterpret_cast<const char*>(&byte3), 1);
+                if (!file.good()) {
+                    std::cerr << "Error: Write failed (disk full?)\n";
+                    file.close();
+                    return false;
+                }
+            }
+        } 
+        else if (buffer.bitDepth == 32) {
+            for (float sample : buffer.samples) {
+                float clamped = std::max(-1.f, std::min(1.f, sample));
+                file.write(reinterpret_cast<const char*>(&clamped), 4);
+                if (!file.good()) {
+                    std::cerr << "Error: Write failed (disk full?)\n";
+                    file.close();
+                    return false;
+                }
+            }
+        }
+        
+        file.close();
+        
+        // ============ VERIFY OUTPUT ============
+        if (!file.good()) {
+            std::cerr << "Error: File close failed\n";
+            return false;
+        }
+        
+        // Verify file was created with expected size
+        std::ifstream verify(filepath, std::ios::binary | std::ios::ate);
+        uint32_t createdSize = static_cast<uint32_t>(verify.tellg());
+        verify.close();
+        
+        uint32_t expectedSize = 44 + dataSize;  // RIFF(12) + fmt(24) + data(8) + samples
+        if (createdSize != expectedSize) {
+            std::cerr << "Error: File size mismatch - expected " << expectedSize 
+                      << " bytes, got " << createdSize << "\n";
+            return false;
+        }
+        
+        return true;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error saving WAV: " << e.what() << "\n";
         return false;
     }
-    
-    uint32_t numSamples = buffer.samples.size();
-    uint16_t bytesPerSample = buffer.bitDepth / 8;
-    uint32_t byteRate = buffer.sampleRate * bytesPerSample;
-    uint32_t dataSize = numSamples * bytesPerSample;
-    
-    file.write("RIFF", 4);
-    uint32_t riffSize = 36 + dataSize;
-    file.write(reinterpret_cast<const char*>(&riffSize), 4);
-    file.write("WAVE", 4);
-    
-    file.write("fmt ", 4);
-    uint32_t fmtSize = 16;
-    file.write(reinterpret_cast<const char*>(&fmtSize), 4);
-    
-    uint16_t audioFormat = 1;
-    uint16_t channels = 1;
-    file.write(reinterpret_cast<const char*>(&audioFormat), 2);
-    file.write(reinterpret_cast<const char*>(&channels), 2);
-    file.write(reinterpret_cast<const char*>(&buffer.sampleRate), 4);
-    file.write(reinterpret_cast<const char*>(&byteRate), 4);
-    
-    uint16_t blockAlign = bytesPerSample;
-    file.write(reinterpret_cast<const char*>(&blockAlign), 2);
-    file.write(reinterpret_cast<const char*>(&buffer.bitDepth), 2);
-    
-    file.write("data", 4);
-    file.write(reinterpret_cast<const char*>(&dataSize), 4);
-    
-    if (buffer.bitDepth == 16) {
-        for (float sample : buffer.samples) {
-            float clamped = std::max(-1.f, std::min(1.f, sample));
-            int16_t pcmSample = static_cast<int16_t>(clamped * 32767.f);
-            file.write(reinterpret_cast<const char*>(&pcmSample), 2);
-        }
-    } else if (buffer.bitDepth == 24) {
-        for (float sample : buffer.samples) {
-            float clamped = std::max(-1.f, std::min(1.f, sample));
-            int32_t pcm32 = static_cast<int32_t>(clamped * 8388607.f);
-            uint8_t byte1 = static_cast<uint8_t>(pcm32 & 0xFF);
-            uint8_t byte2 = static_cast<uint8_t>((pcm32 >> 8) & 0xFF);
-            uint8_t byte3 = static_cast<uint8_t>((pcm32 >> 16) & 0xFF);
-            file.write(reinterpret_cast<const char*>(&byte1), 1);
-            file.write(reinterpret_cast<const char*>(&byte2), 1);
-            file.write(reinterpret_cast<const char*>(&byte3), 1);
-        }
-    } else if (buffer.bitDepth == 32) {
-        for (float sample : buffer.samples) {
-            float clamped = std::max(-1.f, std::min(1.f, sample));
-            file.write(reinterpret_cast<const char*>(&clamped), 4);
-        }
-    } else {
-        throw std::runtime_error("Unsupported bit depth for saving: " + std::to_string(buffer.bitDepth));
-    }
-    
-    file.close();
-    return true;
 }
 
 std::vector<float> AudioLoader::stereoToMono(const std::vector<float>& stereoSamples, uint16_t channels) {
