@@ -63,6 +63,15 @@ private:
     // Hann window coefficients
     std::vector<float> hannWindow_;
     
+    // FFTW3 support (optional)
+    #ifdef USE_FFTW
+    struct FFTWPlan {
+        void* plan = nullptr;
+        void* input = nullptr;
+        void* output = nullptr;
+    } fftwPlan_;
+    #endif
+    
     void generateHannWindow();
     
     /**
