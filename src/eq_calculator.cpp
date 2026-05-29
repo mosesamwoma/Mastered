@@ -263,15 +263,13 @@ std::vector<float> EQCalculator::applyAWeighting(const std::vector<float>& spect
     return weighted;
 }
 
-std::vector<float> EQCalculator::suppressExtremes(const std::vector<float>& curve, float threshold) {
+std::vector<float> EQCalculator::suppressExtremes(const std::vector<float>& curve, float maxGainDb) {
+    // Hard cap to prevent over-compensation
+    // Caller passing 12.f expects a 12 dB cap, not 9.6 dB
     std::vector<float> suppressed = curve;
     
-    for (float& sample : suppressed) {
-        if (sample > threshold) {
-            sample = threshold * 0.8f;  // Gentle cap
-        } else if (sample < -threshold) {
-            sample = -threshold * 0.8f;
-        }
+    for (float& s : suppressed) {
+        s = std::max(-maxGainDb, std::min(maxGainDb, s));
     }
     
     return suppressed;

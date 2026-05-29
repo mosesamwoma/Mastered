@@ -84,20 +84,27 @@ std::vector<float> SpectrumMatcher::interpolateCorrection(const std::vector<floa
             continue;
         }
         
-        // Linear interpolation with binary search for efficiency
-        size_t idx = 0;
-        for (size_t j = 0; j < fromFreqs.size() - 1; ++j) {
-            if (fromFreqs[j] <= targetFreq && targetFreq <= fromFreqs[j + 1]) {
-                idx = j;
-                break;
-            }
+        // Binary search for efficiency (O(log n) instead of O(n))
+        auto it = std::lower_bound(fromFreqs.begin(), fromFreqs.end(), targetFreq);
+        
+        // Handle boundary cases
+        if (it == fromFreqs.end()) {
+            interpolated[i] = correction.back();
+            continue;
+        }
+        if (it == fromFreqs.begin()) {
+            interpolated[i] = correction.front();
+            continue;
         }
         
-        float denominator = fromFreqs[idx + 1] - fromFreqs[idx];
-        if (denominator < 1e-10f) {
+        // Linear interpolation between two points
+        size_t idx = std::distance(fromFreqs.begin(), it) - 1;
+        float denom = fromFreqs[idx + 1] - fromFreqs[idx];
+        
+        if (denom < 1e-10f) {
             interpolated[i] = correction[idx];
         } else {
-            float ratio = (targetFreq - fromFreqs[idx]) / denominator;
+            float ratio = (targetFreq - fromFreqs[idx]) / denom;
             interpolated[i] = correction[idx] * (1.f - ratio) + correction[idx + 1] * ratio;
         }
     }

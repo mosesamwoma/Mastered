@@ -15,9 +15,10 @@ void printUsage(const char* programName) {
     std::cout << "  --aggressive N     Set aggressiveness (0-1, default 0.85)\n";
     std::cout << "  --headroom N       Set clipping headroom (0-1, default 0.99)\n";
     std::cout << "  --target N         Set target loudness in LUFS (default -14)\n";
+    std::cout << "  --bitdepth N       Set output bit depth (16, 24, or 32, default 16)\n";
     std::cout << "  --help             Show this help message\n";
     std::cout << "\nExample:\n";
-    std::cout << "  " << programName << " reference.wav beat.wav result.json --verbose --aggressive 0.8\n";
+    std::cout << "  " << programName << " reference.wav beat.wav result.json --verbose --aggressive 0.8 --bitdepth 24\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -31,6 +32,7 @@ int main(int argc, char* argv[]) {
     std::string outputFile = (argc > 3 && argv[3][0] != '-') ? argv[3] : "mastering_result.json";
     
     MasteringConfig config = createDefaultConfig();
+    uint16_t outputBitDepth = 0;   // 0 = preserve source bit depth
     
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -60,6 +62,13 @@ int main(int argc, char* argv[]) {
             config.targetLoudnessLUFS = std::stof(argv[++i]);
             if (config.targetLoudnessLUFS > 0.f) {
                 std::cerr << "✗ Error: target LUFS must be negative\n";
+                return 1;
+            }
+        }
+        else if (arg == "--bitdepth" && i + 1 < argc) {
+            outputBitDepth = std::stoi(argv[++i]);
+            if (outputBitDepth != 16 && outputBitDepth != 24 && outputBitDepth != 32) {
+                std::cerr << "✗ Error: bitdepth must be 16, 24, or 32\n";
                 return 1;
             }
         }
@@ -139,14 +148,18 @@ int main(int argc, char* argv[]) {
         
         // Apply mastering
         std::cout << "\n→ Applying mastering EQ to audio...\n";
-        AudioBuffer unmasteredBuffer = AudioLoader::loadWAV(unmasteredFile);
+        AudioBuffer& unmasteredBuffer = result.inputBuffer;  // Reuse retained buffer
+        if (outputBitDepth != 0)
+            unmasteredBuffer.bitDepth = outputBitDepth;  // Override bit depth if specified
         AudioBuffer masteredBuffer = engine.applyMastering(unmasteredBuffer, result.eqCurve, result.makeupGain);
         std::cout << "✓ EQ applied successfully!\n";
         
         // Save mastered audio
         std::string baseName = std::filesystem::path(unmasteredFile).stem().string();
         std::string masteredFile = "mastered_" + baseName + ".wav";
-        std::cout << "\n→ Saving mastered audio: " << masteredFile << "\n";
+        std::cout << "\n→ Saving mastered audio: " << masteredFile;
+        if (outputBitDepth != 0) std::cout << " (" << masteredBuffer.bitDepth << "-bit)";
+        std::cout << "\n";
         if (!AudioLoader::saveWAV(masteredFile, masteredBuffer)) {
             std::cerr << "✗ Error: Could not save mastered audio to: " << masteredFile << "\n";
             std::cerr << "  Check: disk space, file permissions, output directory exists\n";

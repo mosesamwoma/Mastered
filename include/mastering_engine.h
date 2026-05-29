@@ -84,6 +84,8 @@ struct MasteringResult {
     bool success;
     /// Error or status message describing the result
     std::string message;
+    /// Retained input buffer for caller reuse — avoids double load in main()
+    AudioBuffer inputBuffer;
     
     MasteringResult() : estimatedLUFS(0.f), makeupGain(0.f), success(false) {}
 };

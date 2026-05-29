@@ -8,7 +8,8 @@
 namespace mastered {
 
 struct AudioBuffer {
-    std::vector<float> samples;
+    std::vector<float> samples;              // Flat samples (mono or interleaved stereo)
+    std::vector<std::vector<float>> channelSamples;  // Per-channel samples for stereo
     uint32_t sampleRate;
     uint16_t channels;
     uint32_t numFrames;

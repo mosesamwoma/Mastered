@@ -54,11 +54,11 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
         throw std::runtime_error("File truncated: cannot read RIFF size");
     }
     
-    // Validate RIFF size matches actual file size (with 8-byte RIFF header)
-    if (riffSize + 8 != fileSize) {
+    // Validate RIFF size does not exceed actual file size (allow trailing chunks/padding)
+    if (riffSize + 8 > fileSize) {
         throw std::runtime_error(
-            "RIFF size mismatch: header says " + std::to_string(riffSize + 8) + 
-            " bytes but file is " + std::to_string(fileSize) + " bytes"
+            "Corrupt WAV: RIFF header claims " + std::to_string(riffSize + 8) +
+            " bytes but file is only " + std::to_string(fileSize) + " bytes"
         );
     }
     
@@ -260,14 +260,27 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
         rawSamples = buffer;
     }
     
-    // ============ CONVERT TO MONO IF NEEDED ============
+    // ============ POPULATE CHANNEL SAMPLES FOR STEREO/MONO ============
+    result.samples = rawSamples;  // Keep interleaved samples for compatibility
+    
     if (wavHeader.numChannels > 1) {
-        std::cerr << "⚠ Warning: Converting " << static_cast<int>(wavHeader.numChannels) 
-                  << "-channel audio to mono (downmixing)\n";
-        result.samples = stereoToMono(rawSamples, wavHeader.numChannels);
-        result.numFrames = result.samples.size();
+        // Deinterleave stereo samples into separate channels for processing
+        result.channelSamples.resize(wavHeader.numChannels);
+        for (uint16_t ch = 0; ch < wavHeader.numChannels; ++ch) {
+            result.channelSamples[ch].reserve(result.numFrames);
+            for (size_t frame = 0; frame < result.numFrames; ++frame) {
+                result.channelSamples[ch].push_back(rawSamples[frame * wavHeader.numChannels + ch]);
+            }
+        }
+        // For analysis: compute mid-channel (L+R)/2 if stereo
+        result.samples.resize(result.numFrames);
+        for (size_t i = 0; i < result.numFrames; ++i) {
+            result.samples[i] = (result.channelSamples[0][i] + result.channelSamples[1][i]) / 2.f;
+        }
     } else {
-        result.samples = rawSamples;
+        // Mono: wrap single channel
+        result.channelSamples.resize(1);
+        result.channelSamples[0] = rawSamples;
     }
     
     normalize(result.samples);
@@ -302,10 +315,14 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
         }
         
         // ============ CALCULATE SIZES ============
-        uint32_t numSamples = buffer.samples.size();
+        // Determine channel count and frame count from buffer
+        uint16_t numChannels = buffer.channels > 0 ? buffer.channels : 1;
+        uint32_t numFrames = buffer.numFrames > 0 ? buffer.numFrames : (buffer.samples.size() / numChannels);
+        uint32_t numSamples = numFrames * numChannels;
         uint16_t bytesPerSample = buffer.bitDepth / 8;
+        uint16_t blockAlign = numChannels * bytesPerSample;
         uint32_t dataSize = numSamples * bytesPerSample;
-        
+
         // Check for overflow: file size shouldn't exceed 4GB
         constexpr uint64_t MAX_RIFF_SIZE = 0xFFFFFFFFULL - 8;
         if (dataSize > MAX_RIFF_SIZE - 36) {
@@ -332,12 +349,10 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
         file.write(reinterpret_cast<const char*>(&fmtSize), 4);
         
         uint16_t audioFormat = 1;      // PCM
-        uint16_t channels = 1;         // Mono
-        uint32_t byteRate = buffer.sampleRate * bytesPerSample;
-        uint16_t blockAlign = bytesPerSample;
-        
+        uint32_t byteRate = buffer.sampleRate * blockAlign;
+
         file.write(reinterpret_cast<const char*>(&audioFormat), 2);
-        file.write(reinterpret_cast<const char*>(&channels), 2);
+        file.write(reinterpret_cast<const char*>(&numChannels), 2);
         file.write(reinterpret_cast<const char*>(&buffer.sampleRate), 4);
         file.write(reinterpret_cast<const char*>(&byteRate), 4);
         file.write(reinterpret_cast<const char*>(&blockAlign), 2);
@@ -360,45 +375,77 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
         }
         
         // ============ WRITE AUDIO DATA ============
-        if (buffer.bitDepth == 16) {
-            for (float sample : buffer.samples) {
-                // Clamp to prevent clipping
-                float clamped = std::max(-1.f, std::min(1.f, sample));
-                int16_t pcmSample = static_cast<int16_t>(clamped * 32767.f);
-                file.write(reinterpret_cast<const char*>(&pcmSample), 2);
-                if (!file.good()) {
-                    std::cerr << "Error: Write failed (disk full?)\n";
-                    file.close();
-                    return false;
+        bool useChannelSamples = !buffer.channelSamples.empty();
+
+        if (useChannelSamples) {
+            // Write interleaved multi-channel data from channelSamples
+            for (uint32_t frame = 0; frame < numFrames; ++frame) {
+                for (uint16_t ch = 0; ch < numChannels; ++ch) {
+                    if (ch >= buffer.channelSamples.size() || frame >= buffer.channelSamples[ch].size()) {
+                        std::cerr << "Error: Channel or frame index out of bounds\n";
+                        file.close();
+                        return false;
+                    }
+
+                    float sample = buffer.channelSamples[ch][frame];
+                    float clamped = std::max(-1.f, std::min(1.f, sample));
+
+                    if (buffer.bitDepth == 16) {
+                        int16_t pcmSample = static_cast<int16_t>(clamped * 32767.f);
+                        file.write(reinterpret_cast<const char*>(&pcmSample), 2);
+                    } else if (buffer.bitDepth == 24) {
+                        int32_t pcm32 = static_cast<int32_t>(clamped * 8388607.f);
+                        uint8_t byte1 = static_cast<uint8_t>(pcm32 & 0xFF);
+                        uint8_t byte2 = static_cast<uint8_t>((pcm32 >> 8) & 0xFF);
+                        uint8_t byte3 = static_cast<uint8_t>((pcm32 >> 16) & 0xFF);
+                        file.write(reinterpret_cast<const char*>(&byte1), 1);
+                        file.write(reinterpret_cast<const char*>(&byte2), 1);
+                        file.write(reinterpret_cast<const char*>(&byte3), 1);
+                    } else if (buffer.bitDepth == 32) {
+                        file.write(reinterpret_cast<const char*>(&clamped), 4);
+                    }
+
+                    if (!file.good()) {
+                        std::cerr << "Error: Write failed at frame " << frame << " channel " << ch << " (disk full?)\n";
+                        file.close();
+                        return false;
+                    }
                 }
             }
-        } 
-        else if (buffer.bitDepth == 24) {
-            for (float sample : buffer.samples) {
-                float clamped = std::max(-1.f, std::min(1.f, sample));
-                int32_t pcm32 = static_cast<int32_t>(clamped * 8388607.f);
-                // Write little-endian 24-bit
-                uint8_t byte1 = static_cast<uint8_t>(pcm32 & 0xFF);
-                uint8_t byte2 = static_cast<uint8_t>((pcm32 >> 8) & 0xFF);
-                uint8_t byte3 = static_cast<uint8_t>((pcm32 >> 16) & 0xFF);
-                file.write(reinterpret_cast<const char*>(&byte1), 1);
-                file.write(reinterpret_cast<const char*>(&byte2), 1);
-                file.write(reinterpret_cast<const char*>(&byte3), 1);
-                if (!file.good()) {
-                    std::cerr << "Error: Write failed (disk full?)\n";
-                    file.close();
-                    return false;
-                }
-            }
-        } 
-        else if (buffer.bitDepth == 32) {
-            for (float sample : buffer.samples) {
-                float clamped = std::max(-1.f, std::min(1.f, sample));
-                file.write(reinterpret_cast<const char*>(&clamped), 4);
-                if (!file.good()) {
-                    std::cerr << "Error: Write failed (disk full?)\n";
-                    file.close();
-                    return false;
+        } else {
+            // Write interleaved flat samples
+            for (uint32_t frame = 0; frame < numFrames; ++frame) {
+                for (uint16_t ch = 0; ch < numChannels; ++ch) {
+                    size_t sampleIdx = frame * numChannels + ch;
+                    if (sampleIdx >= buffer.samples.size()) {
+                        std::cerr << "Error: Sample index out of bounds at frame " << frame << " channel " << ch << "\n";
+                        file.close();
+                        return false;
+                    }
+
+                    float sample = buffer.samples[sampleIdx];
+                    float clamped = std::max(-1.f, std::min(1.f, sample));
+
+                    if (buffer.bitDepth == 16) {
+                        int16_t pcmSample = static_cast<int16_t>(clamped * 32767.f);
+                        file.write(reinterpret_cast<const char*>(&pcmSample), 2);
+                    } else if (buffer.bitDepth == 24) {
+                        int32_t pcm32 = static_cast<int32_t>(clamped * 8388607.f);
+                        uint8_t byte1 = static_cast<uint8_t>(pcm32 & 0xFF);
+                        uint8_t byte2 = static_cast<uint8_t>((pcm32 >> 8) & 0xFF);
+                        uint8_t byte3 = static_cast<uint8_t>((pcm32 >> 16) & 0xFF);
+                        file.write(reinterpret_cast<const char*>(&byte1), 1);
+                        file.write(reinterpret_cast<const char*>(&byte2), 1);
+                        file.write(reinterpret_cast<const char*>(&byte3), 1);
+                    } else if (buffer.bitDepth == 32) {
+                        file.write(reinterpret_cast<const char*>(&clamped), 4);
+                    }
+
+                    if (!file.good()) {
+                        std::cerr << "Error: Write failed at frame " << frame << " channel " << ch << " (disk full?)\n";
+                        file.close();
+                        return false;
+                    }
                 }
             }
         }
