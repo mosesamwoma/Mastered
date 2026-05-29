@@ -111,7 +111,7 @@ def generate_unmastered_track(duration=5, sample_rate=44100):
     return samples
 
 def main():
-    output_dir = Path('/home/moses-amwoma/projects/mastered/test_audio')
+    output_dir = Path(__file__).resolve().parent / 'test_audio'
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("Generating test WAV files...")
