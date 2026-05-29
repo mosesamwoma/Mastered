@@ -283,7 +283,27 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
         result.channelSamples[0] = rawSamples;
     }
     
-    normalize(result.samples);
+    float maxAbs = 0.f;
+    for (float sample : result.samples) {
+        maxAbs = std::max(maxAbs, std::abs(sample));
+    }
+    for (const auto& channel : result.channelSamples) {
+        for (float sample : channel) {
+            maxAbs = std::max(maxAbs, std::abs(sample));
+        }
+    }
+
+    if (maxAbs > 1.f) {
+        float scale = 0.9f / maxAbs;
+        for (float& sample : result.samples) {
+            sample *= scale;
+        }
+        for (auto& channel : result.channelSamples) {
+            for (float& sample : channel) {
+                sample *= scale;
+            }
+        }
+    }
     
     return result;
 }
@@ -376,6 +396,15 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
         
         // ============ WRITE AUDIO DATA ============
         bool useChannelSamples = !buffer.channelSamples.empty();
+            if (useChannelSamples) {
+                for (size_t ch = 0; ch < buffer.channelSamples.size(); ++ch) {
+                    if (buffer.channelSamples[ch].size() != numFrames) {
+                        std::cerr << "Error: channelSamples frame count mismatch\n";
+                        file.close();
+                        return false;
+                    }
+                }
+            }
 
         if (useChannelSamples) {
             // Write interleaved multi-channel data from channelSamples
