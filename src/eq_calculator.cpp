@@ -222,44 +222,39 @@ std::vector<float> EQCalculator::applyAWeighting(const std::vector<float>& spect
                                                  const std::vector<float>& frequencies) {
     std::vector<float> weighted;
     weighted.reserve(spectrum.size());
-    
-    // A-weighting constants from IEC 61672-1:2013 standard
-    // These define the equal-loudness contour for human hearing
-    constexpr float F1 = 20.6f;      // First cutoff frequency (Hz)
-    constexpr float F2 = 107.7f;     // Second cutoff frequency (Hz)
-    constexpr float F3 = 737.9f;     // Third cutoff frequency (Hz)
-    constexpr float F4 = 12200.f;    // Fourth cutoff frequency (Hz)
-    constexpr float MIN_FREQ = 1.f;  // Minimum frequency threshold
-    
-    for (size_t i = 0; i < spectrum.size(); ++i) {
-        float f = frequencies[i];
-        
-        // Very low frequencies get heavy attenuation
-        if (f < MIN_FREQ) {
-            weighted.push_back(spectrum[i] - 100.f);
-            continue;
+
+    // A-weighting used as a normalised perceptual multiplier (not additive dB offset).
+    // Normalised to 1.0 at 1 kHz so mid-range corrections pass through unchanged.
+    // Low-frequency and extreme high-frequency corrections are de-emphasised.
+    constexpr float F1 = 20.6f;
+    constexpr float F2 = 107.7f;
+    constexpr float F3 = 737.9f;
+    constexpr float F4 = 12200.f;
+
+    auto aWeightRaw = [&](float f) -> float {
+        if (f <= 0.f) {
+            return 0.f;
         }
-        
-        // Compute squared frequency once for efficiency
-        float f2 = f * f;
-        float f4 = f2 * f2;
-        
-        // Standard A-weighting formula (IEC 61672-1):
-        // A(f) = 20*log10(|H(f)|) + 2
-        // where H(f) = (12200*f)^2 / product of denominator terms
-        
-        float numerator = 12200.f * 12200.f * f4;
-        float denominator = (f2 + F1*F1) * (f2 + F2*F2) * (f2 + F3*F3) * (f2 + F4*F4);
-        
-        // Apply A-weighting with numerical stability guard
-        float aWeight = 20.f * std::log10(numerator / (denominator + 1e-20f)) + 2.f;
-        
-        // Clamp to prevent NaN propagation
-        aWeight = std::max(-100.f, std::min(20.f, aWeight));
-        
-        weighted.push_back(spectrum[i] + aWeight);
+        const float f2 = f * f;
+        const float f4 = f2 * f2;
+        const float num = (12200.f * 12200.f) * f4;
+        const float den = (f2 + F1 * F1) * (f2 + F2 * F2) * (f2 + F3 * F3) * (f2 + F4 * F4);
+        return (den > 1e-30f) ? (num / den) : 0.f;
+    };
+
+    // Normalise so weight = 1.0 at 1 kHz
+    float ref = aWeightRaw(1000.f);
+    if (ref <= 0.f) {
+        ref = 1.f;
     }
-    
+
+    for (size_t i = 0; i < spectrum.size(); ++i) {
+        float weight = aWeightRaw(frequencies[i]) / ref;
+        // Clamp: allow up to 3x boost for high-freq corrections, floor at 0.05
+        weight = std::max(0.05f, std::min(weight, 3.0f));
+        weighted.push_back(spectrum[i] * weight);
+    }
+
     return weighted;
 }
 
