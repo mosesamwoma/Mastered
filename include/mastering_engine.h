@@ -44,7 +44,7 @@ struct MasteringConfig {
     /// Maximum number of parametric EQ bands to generate (1-32, default: 8)
     uint32_t maxEQBands = 8;
     /// Aggressiveness factor for EQ generation (0-1, higher = more aggressive matching)
-    float aggressiveness = 0.8f;
+    float aggressiveness = 0.85f;
     /// Enable spectral smoothing for cleaner EQ curves (default: true)
     bool smoothing = true;
     /// Target loudness in LUFS (Loudness Units relative to Full Scale), typically -14 to -18
