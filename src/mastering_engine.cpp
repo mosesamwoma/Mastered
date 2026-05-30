@@ -47,10 +47,6 @@ MasteringResult MasteringEngine::analyzeBuffers(const AudioBuffer& reference,
             );
         }
 
-        if (reference.sampleRate == 0 || unmastered.sampleRate == 0) {
-            throw std::runtime_error("Invalid sample rate in audio buffers");
-        }
-
         fftAnalyzer_->setSampleRate(reference.sampleRate);
 
         emitProgress("Computing reference spectrum...", 20.f);
@@ -389,42 +385,57 @@ float MasteringEngine::calculateLUFS(const AudioBuffer& buffer) const {
         return y;
     };
 
-    std::vector<float> filtered = buffer.samples;
+    auto kWeight = [&](const std::vector<float>& input) -> std::vector<float> {
+        std::vector<float> filtered = input;
 
-    {
-        const double fc = 1681.974450955533;
-        const double Q = 0.7071752369554196;
-        const double gainDb = 4.0;
-        const double A = std::pow(10.0, gainDb / 40.0);
-        const double K = std::tan(M_PI * fc / fs);
-        const double K2 = K * K;
-        const double Vh = A;
-        const double Vb = 1.0;
+        {
+            const double fc = 1681.974450955533;
+            const double Q = 0.7071752369554196;
+            const double gainDb = 4.0;
+            const double A = std::pow(10.0, gainDb / 20.0);
+            const double K = std::tan(M_PI * fc / fs);
+            const double K2 = K * K;
+            const double Vh = A;
+            const double Vb = 1.0;
 
-        const double b0 = Vh + Vb * K / Q + K2;
-        const double b1 = 2.0 * (K2 - Vh);
-        const double b2 = Vh - Vb * K / Q + K2;
-        const double a0 = 1.0 + K / Q + K2;
-        const double a1 = 2.0 * (K2 - 1.0);
-        const double a2 = 1.0 - K / Q + K2;
+            const double b0 = Vh + Vb * K / Q + K2;
+            const double b1 = 2.0 * (K2 - Vh);
+            const double b2 = Vh - Vb * K / Q + K2;
+            const double a0 = 1.0 + K / Q + K2;
+            const double a1 = 2.0 * (K2 - 1.0);
+            const double a2 = 1.0 - K / Q + K2;
 
-        filtered = calcBiquad(b0, b1, b2, a0, a1, a2, filtered);
-    }
+            filtered = calcBiquad(b0, b1, b2, a0, a1, a2, filtered);
+        }
 
-    {
-        const double fc = 38.1354708681762;
-        const double Q = 0.50032959205650;
-        const double K = std::tan(M_PI * fc / fs);
-        const double K2 = K * K;
+        {
+            const double fc = 38.1354708681762;
+            const double Q = 0.50032959205650;
+            const double K = std::tan(M_PI * fc / fs);
+            const double K2 = K * K;
 
-        const double b0 = 1.0;
-        const double b1 = -2.0;
-        const double b2 = 1.0;
-        const double a0 = 1.0 + K / Q + K2;
-        const double a1 = 2.0 * (K2 - 1.0);
-        const double a2 = 1.0 - K / Q + K2;
+            const double b0 = 1.0;
+            const double b1 = -2.0;
+            const double b2 = 1.0;
+            const double a0 = 1.0 + K / Q + K2;
+            const double a1 = 2.0 * (K2 - 1.0);
+            const double a2 = 1.0 - K / Q + K2;
 
-        filtered = calcBiquad(b0, b1, b2, a0, a1, a2, filtered);
+            filtered = calcBiquad(b0, b1, b2, a0, a1, a2, filtered);
+        }
+
+        return filtered;
+    };
+
+    const bool hasStereoChannels = !buffer.channelSamples.empty() && buffer.channelSamples.size() >= 2;
+    std::vector<std::vector<float>> filteredChannels;
+    std::vector<float> filtered = kWeight(buffer.samples);
+
+    if (hasStereoChannels) {
+        filteredChannels.reserve(buffer.channelSamples.size());
+        for (const auto& channel : buffer.channelSamples) {
+            filteredChannels.push_back(kWeight(channel));
+        }
     }
 
     uint32_t blockSize = static_cast<uint32_t>(fs * 0.4);
@@ -433,14 +444,42 @@ float MasteringEngine::calculateLUFS(const AudioBuffer& buffer) const {
     if (hopSize < 256) hopSize = 256;
 
     std::vector<float> blockLoudnesses;
-    for (size_t start = 0; start + blockSize <= filtered.size(); start += hopSize) {
-        float meanSquare = 0.f;
-        for (size_t i = 0; i < blockSize; ++i) {
-            const float s = filtered[start + i];
-            meanSquare += s * s;
+    if (hasStereoChannels && !filteredChannels.empty()) {
+        for (size_t start = 0; start + blockSize <= filteredChannels.front().size(); start += hopSize) {
+            float channelPowerSum = 0.f;
+            size_t validChannels = 0;
+            for (const auto& channel : filteredChannels) {
+                if (start + blockSize > channel.size()) {
+                    continue;
+                }
+
+                float meanSquare = 0.f;
+                for (size_t i = 0; i < blockSize; ++i) {
+                    const float s = channel[start + i];
+                    meanSquare += s * s;
+                }
+                meanSquare /= static_cast<float>(blockSize);
+                channelPowerSum += meanSquare;
+                ++validChannels;
+            }
+
+            if (validChannels == 0) {
+                continue;
+            }
+
+            float meanSquare = channelPowerSum / static_cast<float>(validChannels);
+            blockLoudnesses.push_back(CALIBRATION_CONST + 10.f * std::log10(std::max(meanSquare, 1e-10f)));
         }
-        meanSquare /= static_cast<float>(blockSize);
-        blockLoudnesses.push_back(CALIBRATION_CONST + 10.f * std::log10(std::max(meanSquare, 1e-10f)));
+    } else {
+        for (size_t start = 0; start + blockSize <= filtered.size(); start += hopSize) {
+            float meanSquare = 0.f;
+            for (size_t i = 0; i < blockSize; ++i) {
+                const float s = filtered[start + i];
+                meanSquare += s * s;
+            }
+            meanSquare /= static_cast<float>(blockSize);
+            blockLoudnesses.push_back(CALIBRATION_CONST + 10.f * std::log10(std::max(meanSquare, 1e-10f)));
+        }
     }
 
     if (blockLoudnesses.empty()) return -120.f;
