@@ -239,7 +239,7 @@ std::vector<float> EQCalculator::applyAWeighting(const std::vector<float>& spect
         const float f4 = f2 * f2;
         const float num = (12200.f * 12200.f) * f4;
         const float den = (f2 + F1 * F1) * (f2 + F2 * F2) * (f2 + F3 * F3) * (f2 + F4 * F4);
-        return (den > 1e-30f) ? (num / den) : 0.f;
+        return (den > 1e-30f) ? (num / std::sqrt(den)) : 0.f;
     };
 
     // Normalise so weight = 1.0 at 1 kHz
