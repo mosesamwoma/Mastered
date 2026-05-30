@@ -129,35 +129,45 @@ Spectrum FFTAnalyzer::getAveragedSpectrum(const std::vector<float>& samples, uin
     return averaged;
 }
 
-Spectrum FFTAnalyzer::smoothSpectrum(const Spectrum& spec, uint32_t filterSize) {
+Spectrum FFTAnalyzer::smoothSpectrum(const Spectrum& spec, uint32_t /*filterSize_unused*/) {
+    // 1/3-octave log-scale smoothing — standard for professional mastering EQ.
+    // Each bin is averaged over a frequency window of ±1/6 octave around it,
+    // so the window widens with frequency (narrow in bass, wide in treble).
+    // This prevents EQ bands from chasing individual harmonics or FFT noise.
     Spectrum smoothed = spec;
-    
-    if (filterSize < 2 || filterSize > spec.magnitude.size()) {
+
+    if (spec.magnitude.empty() || spec.frequencies.size() != spec.magnitude.size()) {
         return smoothed;
     }
-    
+
     std::vector<float> smooth(spec.magnitude.size());
-    uint32_t halfFilter = filterSize / 2;
-    
+    constexpr float octaveFraction = 1.f / 6.f;
+
     for (size_t i = 0; i < spec.magnitude.size(); ++i) {
+        const float centerFreq = spec.frequencies[i];
+        if (centerFreq <= 0.f) {
+            smooth[i] = spec.magnitude[i];
+            continue;
+        }
+
+        const float factor = std::pow(2.f, octaveFraction);
+        const float fLow = centerFreq / factor;
+        const float fHigh = centerFreq * factor;
+
         float sum = 0.f;
         uint32_t count = 0;
-        
-        for (int32_t j = static_cast<int32_t>(i) - static_cast<int32_t>(halfFilter);
-             j <= static_cast<int32_t>(i) + static_cast<int32_t>(halfFilter); ++j) {
-            if (j >= 0 && j < static_cast<int32_t>(spec.magnitude.size())) {
+
+        for (size_t j = 0; j < spec.magnitude.size(); ++j) {
+            const float freq = spec.frequencies[j];
+            if (freq >= fLow && freq <= fHigh) {
                 sum += spec.magnitude[j];
-                count++;
+                ++count;
             }
         }
-        
-        if (count > 0) {
-            smooth[i] = sum / count;
-        } else {
-            smooth[i] = spec.magnitude[i];
-        }
+
+        smooth[i] = (count > 0) ? (sum / static_cast<float>(count)) : spec.magnitude[i];
     }
-    
+
     smoothed.magnitude = smooth;
     return smoothed;
 }
