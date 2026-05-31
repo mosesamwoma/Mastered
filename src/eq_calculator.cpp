@@ -123,9 +123,25 @@ std::vector<EQBand> EQCalculator::generateParametricBands(const std::vector<floa
         });
     
     // Select top maxBands bands, ranked by significance
-    // This prioritizes correcting the most obvious tonal issues
+    // Enforce minimum 1/3-octave spacing to avoid stacking many bands on one resonance
+    const float minSpacingRatio = std::cbrt(2.0f);  // one third of an octave
     for (size_t i = 0; i < candidateBands.size() && bands.size() < maxBands; ++i) {
-        bands.push_back(candidateBands[i].second);
+        const EQBand& candidate = candidateBands[i].second;
+        bool tooClose = false;
+
+        for (const auto& existing : bands) {
+            float ratio = (candidate.frequency > existing.frequency)
+                              ? candidate.frequency / existing.frequency
+                              : existing.frequency / candidate.frequency;
+            if (ratio < minSpacingRatio) {
+                tooClose = true;
+                break;
+            }
+        }
+
+        if (!tooClose) {
+            bands.push_back(candidate);
+        }
     }
     
     return bands;
@@ -250,8 +266,8 @@ std::vector<float> EQCalculator::applyAWeighting(const std::vector<float>& spect
 
     for (size_t i = 0; i < spectrum.size(); ++i) {
         float weight = aWeightRaw(frequencies[i]) / ref;
-        // Clamp: allow up to 3x boost for high-freq corrections, floor at 0.05
-        weight = std::max(0.05f, std::min(weight, 3.0f));
+        // Clamp: allow up to 3x boost for high-freq corrections, floor at 0.12
+        weight = std::max(0.12f, std::min(weight, 3.0f));
         weighted.push_back(spectrum[i] * weight);
     }
 
