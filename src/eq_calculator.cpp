@@ -322,13 +322,22 @@ std::vector<size_t> EQCalculator::findPeaks(const std::vector<float>& curve, flo
     // 2. Filter out redundant adjacent peaks (keep only the strongest)
     // This prevents multiple EQ bands from being placed on broadband resonances
     
-    // First pass: find all local maxima with improved robustness
-    // Check wider neighborhood (±1 sample) for more stable detection
-    for (size_t i = 1; i < curve.size() - 1; ++i) {
+    // First pass: find all local maxima.
+    // Use a ±3 bin neighbourhood to handle Hann-windowed spectral leakage plateaus
+    // where adjacent bins have nearly equal values and a strict ±1 check would fail.
+    for (size_t i = 3; i < curve.size() - 3; ++i) {
         float center = curve[i];
-        
-        // Robust local maximum detection: center > neighbors AND meets threshold
-        if (center > curve[i - 1] && center > curve[i + 1] && center > threshold) {
+
+        if (center <= threshold) continue;
+
+        bool isLocalMax = true;
+        for (int d = -3; d <= 3; ++d) {
+            if (curve[static_cast<size_t>(static_cast<int>(i) + d)] >= center) {
+                isLocalMax = false;
+                break;
+            }
+        }
+        if (isLocalMax) {
             peaks.push_back(i);
         }
     }
@@ -372,12 +381,22 @@ std::vector<size_t> EQCalculator::findDips(const std::vector<float>& curve, floa
     // Similar to peak detection but for negative peaks (antiresonances/holes)
     // This ensures clean EQ curves with well-spaced bands
     
-    // First pass: find all local minima
-    for (size_t i = 1; i < curve.size() - 1; ++i) {
+    // First pass: find all local minima.
+    // Use a ±3 bin neighbourhood to handle Hann-windowed spectral leakage plateaus
+    // where adjacent bins have nearly equal values and a strict ±1 check would fail.
+    for (size_t i = 3; i < curve.size() - 3; ++i) {
         float center = curve[i];
-        
-        // Robust local minimum detection: center < neighbors AND meets threshold
-        if (center < curve[i - 1] && center < curve[i + 1] && center < -threshold) {
+
+        if (center >= -threshold) continue;
+
+        bool isLocalMin = true;
+        for (int d = -3; d <= 3; ++d) {
+            if (curve[static_cast<size_t>(static_cast<int>(i) + d)] <= center) {
+                isLocalMin = false;
+                break;
+            }
+        }
+        if (isLocalMin) {
             dips.push_back(i);
         }
     }
