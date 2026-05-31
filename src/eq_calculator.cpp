@@ -23,9 +23,9 @@ EQCurve EQCalculator::calculateEQFromReference(const Spectrum& referenceSpectrum
     auto suppressed = suppressExtremes(weighted, 12.f);
     auto smoothed = smoothCurve(suppressed, 7);
     
-    curve.curveResponse = smoothed;
+    curve.curveResponse = smoothed;   // smoothed curve kept for display purposes
     curve.frequencies = referenceSpectrum.frequencies;
-    curve.bands = generateParametricBands(smoothed, referenceSpectrum.frequencies, 8);
+    curve.bands = generateParametricBands(suppressed, referenceSpectrum.frequencies, 8);
     
     float totalDifference = 0.f;
     for (float diff : smoothed) {
