@@ -115,6 +115,34 @@ std::vector<EQBand> EQCalculator::generateParametricBands(const std::vector<floa
         }
     }
     
+    // ── Bass region check (20–120 Hz) ────────────────────────────────────────
+    // Hann-windowed spectral leakage at 60 Hz creates a flat plateau across
+    // ~5 FFT bins. findDips cannot find a strict local minimum in a plateau,
+    // so we use an octave-band mean instead. Added directly to bands so it
+    // gets a guaranteed slot regardless of significance ranking.
+    {
+        constexpr float BASS_LOW_HZ    = 20.f;
+        constexpr float BASS_HIGH_HZ   = 120.f;
+        constexpr float BASS_CENTRE_HZ = 60.f;
+        constexpr float BASS_THRESHOLD = 0.4f;
+
+        float bassSum   = 0.f;
+        int   bassCount = 0;
+        for (size_t i = 0; i < frequencies.size(); ++i) {
+            if (frequencies[i] >= BASS_LOW_HZ && frequencies[i] <= BASS_HIGH_HZ) {
+                bassSum += differenceCurve[i];
+                bassCount++;
+            }
+        }
+        if (bassCount > 0) {
+            float bassMean = bassSum / static_cast<float>(bassCount);
+            if (std::abs(bassMean) >= BASS_THRESHOLD) {
+                // Guaranteed slot: added directly, not via candidateBands ranking
+                bands.emplace_back(BASS_CENTRE_HZ, bassMean, 0.7f, "shelf-low");
+            }
+        }
+    }
+
     // Sort candidate bands by significance (highest impact first)
     // This ensures we keep only the most important bands when limited by maxBands
     std::sort(candidateBands.begin(), candidateBands.end(),
@@ -332,6 +360,7 @@ std::vector<size_t> EQCalculator::findPeaks(const std::vector<float>& curve, flo
 
         bool isLocalMax = true;
         for (int d = -3; d <= 3; ++d) {
+            if (d == 0) continue;  // Skip center comparison (always true)
             if (curve[static_cast<size_t>(static_cast<int>(i) + d)] >= center) {
                 isLocalMax = false;
                 break;
@@ -391,6 +420,7 @@ std::vector<size_t> EQCalculator::findDips(const std::vector<float>& curve, floa
 
         bool isLocalMin = true;
         for (int d = -3; d <= 3; ++d) {
+            if (d == 0) continue;  // Skip center comparison (always true)
             if (curve[static_cast<size_t>(static_cast<int>(i) + d)] <= center) {
                 isLocalMin = false;
                 break;

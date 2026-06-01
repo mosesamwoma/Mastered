@@ -225,18 +225,43 @@ void MasteringEngine::applyEQBandInPlace(std::vector<float>& samples,
         return;
     }
 
-    float A = std::pow(10.f, band.gain / 40.f);
-    float w0 = 2.f * M_PI * band.frequency / sampleRate;
+    // RBJ Audio EQ Cookbook — choose correct filter type based on band.type.
+    // Shelf filters use different coefficient formulas to peaking EQ.
+    float A   = std::pow(10.f, band.gain / 40.f);
+    float w0  = 2.f * M_PI * band.frequency / static_cast<float>(sampleRate);
     float sinW0 = std::sin(w0);
     float cosW0 = std::cos(w0);
-    float alpha = sinW0 / (2.f * band.qFactor);
 
-    float b0 = 1.f + alpha * A;
-    float b1 = -2.f * cosW0;
-    float b2 = 1.f - alpha * A;
-    float a0 = 1.f + alpha / A;
-    float a1 = -2.f * cosW0;
-    float a2 = 1.f - alpha / A;
+    float b0, b1, b2, a0, a1, a2;
+
+    if (band.type == "shelf-low") {
+        // RBJ low-shelf (provides smooth gain below the corner frequency)
+        float beta = std::sqrt(A) / band.qFactor;
+        b0 =    A * ((A + 1.f) - (A - 1.f) * cosW0 + beta * sinW0);
+        b1 =  2.f * A * ((A - 1.f) - (A + 1.f) * cosW0);
+        b2 =    A * ((A + 1.f) - (A - 1.f) * cosW0 - beta * sinW0);
+        a0 =        (A + 1.f) + (A - 1.f) * cosW0 + beta * sinW0;
+        a1 = -2.f * ((A - 1.f) + (A + 1.f) * cosW0);
+        a2 =        (A + 1.f) + (A - 1.f) * cosW0 - beta * sinW0;
+    } else if (band.type == "shelf-high") {
+        // RBJ high-shelf (provides smooth gain above the corner frequency)
+        float beta = std::sqrt(A) / band.qFactor;
+        b0 =    A * ((A + 1.f) + (A - 1.f) * cosW0 + beta * sinW0);
+        b1 = -2.f * A * ((A - 1.f) + (A + 1.f) * cosW0);
+        b2 =    A * ((A + 1.f) + (A - 1.f) * cosW0 - beta * sinW0);
+        a0 =        (A + 1.f) - (A - 1.f) * cosW0 + beta * sinW0;
+        a1 =  2.f * ((A - 1.f) - (A + 1.f) * cosW0);
+        a2 =        (A + 1.f) - (A - 1.f) * cosW0 - beta * sinW0;
+    } else {
+        // RBJ peaking EQ (all other types)
+        float alpha = sinW0 / (2.f * band.qFactor);
+        b0 = 1.f + alpha * A;
+        b1 = -2.f * cosW0;
+        b2 = 1.f - alpha * A;
+        a0 = 1.f + alpha / A;
+        a1 = -2.f * cosW0;
+        a2 = 1.f - alpha / A;
+    }
 
     b0 /= a0;
     b1 /= a0;
