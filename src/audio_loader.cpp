@@ -283,28 +283,6 @@ AudioBuffer AudioLoader::loadWAV(const std::string& filepath) {
         result.channelSamples[0] = rawSamples;
     }
     
-    float maxAbs = 0.f;
-    for (float sample : result.samples) {
-        maxAbs = std::max(maxAbs, std::abs(sample));
-    }
-    for (const auto& channel : result.channelSamples) {
-        for (float sample : channel) {
-            maxAbs = std::max(maxAbs, std::abs(sample));
-        }
-    }
-
-    if (maxAbs > 1.f) {
-        float scale = 0.9f / maxAbs;
-        for (float& sample : result.samples) {
-            sample *= scale;
-        }
-        for (auto& channel : result.channelSamples) {
-            for (float& sample : channel) {
-                sample *= scale;
-            }
-        }
-    }
-    
     return result;
 }
 
@@ -337,7 +315,15 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
         // ============ CALCULATE SIZES ============
         // Determine channel count and frame count from buffer
         uint16_t numChannels = buffer.channels > 0 ? buffer.channels : 1;
-        uint32_t numFrames = buffer.numFrames > 0 ? buffer.numFrames : (buffer.samples.size() / numChannels);
+        uint32_t numFrames = buffer.numFrames;
+        if (numFrames == 0) {
+            // Fallback: derive from channelSamples if available, else flat samples
+            if (!buffer.channelSamples.empty()) {
+                numFrames = static_cast<uint32_t>(buffer.channelSamples[0].size());
+            } else {
+                numFrames = static_cast<uint32_t>(buffer.samples.size() / numChannels);
+            }
+        }
         uint32_t numSamples = numFrames * numChannels;
         uint16_t bytesPerSample = buffer.bitDepth / 8;
         uint16_t blockAlign = numChannels * bytesPerSample;
@@ -479,13 +465,12 @@ bool AudioLoader::saveWAV(const std::string& filepath, const AudioBuffer& buffer
             }
         }
         
-        file.close();
-        
-        // ============ VERIFY OUTPUT ============
         if (!file.good()) {
-            std::cerr << "Error: File close failed\n";
+            std::cerr << "Error: Write error before close (disk full?)\n";
+            file.close();
             return false;
         }
+        file.close();
         
         // Verify file was created with expected size
         std::ifstream verify(filepath, std::ios::binary | std::ios::ate);
