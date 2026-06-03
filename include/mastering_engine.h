@@ -210,10 +210,6 @@ private:
     /// ITU-R BS.1770-4 simplified implementation with K-weighting
     float calculateLUFS(const AudioBuffer& buffer) const;
     
-    /// Apply A-weighting curve at given frequency (Hz)
-    /// Used for perceptual loudness calculation
-    float getAWeighting(float frequencyHz) const;
-    
     /// Calculate makeup gain to reach target loudness
     /// @param original Original audio buffer
     /// @param targetLUFS Target loudness in LUFS

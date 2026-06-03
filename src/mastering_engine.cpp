@@ -351,36 +351,15 @@ std::string MasteringEngine::exportEQasEqualizerAPO(const MasteringResult& resul
     apoEQ << std::fixed << std::setprecision(2);
 
     for (const auto& band : result.eqCurve.bands) {
-        apoEQ << "Filter: ON PK Fc=" << std::setprecision(1) << band.frequency
+        std::string apoType = "PK";
+        if (band.type == "shelf-low")  apoType = "LS";
+        if (band.type == "shelf-high") apoType = "HS";
+        apoEQ << "Filter: ON " << apoType << " Fc=" << std::setprecision(1) << band.frequency
               << " Gain=" << std::setprecision(2) << band.gain
               << " Q=" << band.qFactor << "\n";
     }
 
     return apoEQ.str();
-}
-
-float MasteringEngine::getAWeighting(float frequencyHz) const {
-    if (frequencyHz <= 0.f) return 0.f;
-
-    float f = frequencyHz;
-    float f2 = f * f;
-    float f4 = f2 * f2;
-
-    float numerator = 12194.217f * f4;
-    float f1_2 = 20.598997f * 20.598997f;
-    float f2_2 = 107.65265f * 107.65265f;
-    float f3_2 = 737.86223f * 737.86223f;
-    float f4_2 = 12194.217f * 12194.217f;
-
-    float denominator = (f2 + f1_2) *
-                        (f2 + f2_2) *
-                        (f2 + f3_2) *
-                        (f2 + f4_2);
-
-    if (denominator < 1e-10f) return 0.f;
-
-    float Af = 20.f * std::log10(numerator / std::sqrt(denominator)) + 2.f;
-    return std::pow(10.f, Af / 10.f);
 }
 
 float MasteringEngine::calculateLUFS(const AudioBuffer& buffer) const {
