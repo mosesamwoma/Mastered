@@ -21,7 +21,12 @@ EQCurve EQCalculator::calculateEQFromReference(const Spectrum& referenceSpectrum
     
     auto weighted = applyAWeighting(differenceCurve, referenceSpectrum.frequencies);
     auto suppressed = suppressExtremes(weighted, 12.f);
-    auto smoothed = smoothCurve(suppressed, 7);
+    // Pass actual frequency resolution so smoothCurve uses the correct Hz/bin
+    // value regardless of FFT size or sample rate.
+    float freqRes = referenceSpectrum.frequencies.size() > 1
+        ? referenceSpectrum.frequencies[1] - referenceSpectrum.frequencies[0]
+        : (44100.f / 8192.f);
+    auto smoothed = smoothCurve(suppressed, 7, freqRes);
     
     curve.curveResponse = smoothed;   // smoothed curve kept for display purposes
     curve.frequencies = referenceSpectrum.frequencies;
@@ -314,21 +319,19 @@ std::vector<float> EQCalculator::suppressExtremes(const std::vector<float>& curv
     return suppressed;
 }
 
-std::vector<float> EQCalculator::smoothCurve(const std::vector<float>& curve, uint32_t smoothing) {
+std::vector<float> EQCalculator::smoothCurve(const std::vector<float>& curve,
+                                              uint32_t smoothing,
+                                              float freqResolution) {
     if (curve.empty()) {
         return curve;
     }
 
-    // Build a matching frequency axis from bin index.
-    // smoothCurve receives a raw difference curve whose indices map 1:1 to
-    // FFT magnitude bins (0 … N/2), so we reconstruct approximate Hz values
-    // using a nominal 44100 Hz / 8192 FFT-size resolution (5.38 Hz/bin).
     // Log-scale smoothing: each bin is averaged over a ±1/6-octave window
     // around its centre frequency — identical to FFTAnalyzer::smoothSpectrum.
-    // This gives consistent smoothing at all frequencies instead of the
-    // previous flat moving-average which over-smoothed bass and under-smoothed treble.
-    constexpr float FREQ_RESOLUTION = 44100.f / 8192.f;  // ~5.38 Hz per bin
-    constexpr float OCTAVE_FRACTION = 1.f / 6.f;          // ±1/6 octave window
+    // freqResolution is passed in so this works correctly for any FFT size
+    // or sample rate, not just the default 44100/8192 = 5.38 Hz/bin.
+    const float FREQ_RESOLUTION = (freqResolution > 0.f) ? freqResolution : (44100.f / 8192.f);
+    constexpr float OCTAVE_FRACTION = 1.f / 6.f;
     const float factor = std::pow(2.f, OCTAVE_FRACTION);
 
     std::vector<float> smooth(curve.size());

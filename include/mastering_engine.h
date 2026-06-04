@@ -166,10 +166,11 @@ public:
     /// @note JSON includes both individual bands and overall frequency response curve
     std::string exportEQasJSON(const MasteringResult& result) const;
     
-    /// Export EQ curve in Reaper ReaEQ plugin format (Reaper DAW)
+    /// Export EQ curve as a human-readable band summary for Reaper / ReaEQ
     /// @param result MasteringResult containing EQ curve to export
-    /// @return ReaEQ format string (can be copied into Reaper ReaEQ plugin)
-    /// @note Enables direct application of generated mastering EQ in Reaper
+    /// @return Text summary of EQ bands (frequency, gain, Q, type)
+    /// @note This is a readable reference — not a binary VST preset.
+    ///       To apply in Reaper: manually enter each band into the ReaEQ plugin.
     std::string exportEQasReaEQ(const MasteringResult& result) const;
     
     /// Export EQ curve in EqualizerAPO format (Windows audio tool)

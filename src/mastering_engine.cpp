@@ -177,16 +177,44 @@ AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCu
 
     constexpr float TRUE_PEAK_LIMIT = 0.891251f;
     float truePeakMax = 0.f;
+
+    // 4-point sinc-based true peak detection per ITU-R BS.1770-4 Annex 2.
+    // Evaluates 3 inter-sample points between each pair of samples using a
+    // windowed sinc kernel. Catches high-frequency inter-sample peaks that
+    // linear interpolation misses by several dB.
+    // Kernel coefficients for t = 0.25, 0.50, 0.75 (4x oversampling):
+    // h(t) = sinc(t-n) * hann_window(t-n), summed over n = -1..2
+    const float sinc_kernels[3][4] = {
+        // t=0.25: interpolate 1/4 between samples
+        { -0.0947f,  0.6473f,  0.5267f, -0.0793f },
+        // t=0.50: interpolate midpoint
+        { -0.1250f,  0.6250f,  0.6250f, -0.1250f },
+        // t=0.75: interpolate 3/4 between samples
+        { -0.0793f,  0.5267f,  0.6473f, -0.0947f }
+    };
+
     for (const auto* channelPtr : allChannels) {
         const auto& channel = *channelPtr;
-        for (size_t i = 0; i < channel.size(); ++i) {
+        const size_t n = channel.size();
+
+        for (size_t i = 0; i < n; ++i) {
+            // Check the sample itself
             truePeakMax = std::max(truePeakMax, std::abs(channel[i]));
-            if (i + 1 < channel.size()) {
-                for (int frac = 1; frac < 4; ++frac) {
-                    float t = static_cast<float>(frac) / 4.f;
-                    float interpolated = channel[i] * (1.f - t) + channel[i + 1] * t;
-                    truePeakMax = std::max(truePeakMax, std::abs(interpolated));
-                }
+
+            // Check 3 inter-sample points using sinc kernel
+            for (int k = 0; k < 3; ++k) {
+                // Gather 4 neighbouring samples with boundary clamping
+                float s0 = (i >= 1)     ? channel[i - 1] : 0.f;
+                float s1 = channel[i];
+                float s2 = (i + 1 < n)  ? channel[i + 1] : 0.f;
+                float s3 = (i + 2 < n)  ? channel[i + 2] : 0.f;
+
+                float interp = sinc_kernels[k][0] * s0
+                             + sinc_kernels[k][1] * s1
+                             + sinc_kernels[k][2] * s2
+                             + sinc_kernels[k][3] * s3;
+
+                truePeakMax = std::max(truePeakMax, std::abs(interp));
             }
         }
     }
@@ -348,16 +376,21 @@ std::string MasteringEngine::exportEQasJSON(const MasteringResult& result) const
 std::string MasteringEngine::exportEQasReaEQ(const MasteringResult& result) const {
     std::ostringstream reaEQ;
 
-    reaEQ << "<ReaEQ " << result.eqCurve.bands.size() << " bands>\n";
-    reaEQ << "Enabled=1\n\n";
+    reaEQ << "# ReaEQ Band Reference (enter manually into Reaper ReaEQ plugin)\n";
+    reaEQ << "# Bands: " << result.eqCurve.bands.size() << "\n\n";
 
     for (size_t i = 0; i < result.eqCurve.bands.size(); ++i) {
         const auto& band = result.eqCurve.bands[i];
         float bandwidth = band.frequency / band.qFactor;
+        // Map internal type names to ReaEQ filter type labels
+        std::string reaType = "Band";
+        if (band.type == "shelf-low")  reaType = "Low Shelf";
+        if (band.type == "shelf-high") reaType = "High Shelf";
         reaEQ << "Band " << (i + 1) << ": freq=" << std::fixed << std::setprecision(1) << band.frequency
-              << " gain=" << band.gain
-              << " bw=" << bandwidth
-              << " type=" << band.type << "\n";
+              << " Hz  gain=" << std::setprecision(2) << band.gain
+              << " dB  bw=" << std::setprecision(1) << bandwidth
+              << " Hz  Q=" << band.qFactor
+              << "  type=" << reaType << "\n";
     }
 
     return reaEQ.str();

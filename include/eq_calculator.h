@@ -75,7 +75,9 @@ public:
     /**
      * Smooth curve to prevent picky/thin results
      */
-    std::vector<float> smoothCurve(const std::vector<float>& curve, uint32_t smoothing = 5);
+    std::vector<float> smoothCurve(const std::vector<float>& curve,
+                                   uint32_t smoothing = 5,
+                                   float freqResolution = 44100.f / 8192.f);
 
 private:
     /**
