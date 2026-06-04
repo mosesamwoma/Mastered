@@ -315,28 +315,49 @@ std::vector<float> EQCalculator::suppressExtremes(const std::vector<float>& curv
 }
 
 std::vector<float> EQCalculator::smoothCurve(const std::vector<float>& curve, uint32_t smoothing) {
-    if (curve.size() < smoothing) {
+    if (curve.empty()) {
         return curve;
     }
-    
+
+    // Build a matching frequency axis from bin index.
+    // smoothCurve receives a raw difference curve whose indices map 1:1 to
+    // FFT magnitude bins (0 … N/2), so we reconstruct approximate Hz values
+    // using a nominal 44100 Hz / 8192 FFT-size resolution (5.38 Hz/bin).
+    // Log-scale smoothing: each bin is averaged over a ±1/6-octave window
+    // around its centre frequency — identical to FFTAnalyzer::smoothSpectrum.
+    // This gives consistent smoothing at all frequencies instead of the
+    // previous flat moving-average which over-smoothed bass and under-smoothed treble.
+    constexpr float FREQ_RESOLUTION = 44100.f / 8192.f;  // ~5.38 Hz per bin
+    constexpr float OCTAVE_FRACTION = 1.f / 6.f;          // ±1/6 octave window
+    const float factor = std::pow(2.f, OCTAVE_FRACTION);
+
     std::vector<float> smooth(curve.size());
-    uint32_t half = smoothing / 2;
-    
+
     for (size_t i = 0; i < curve.size(); ++i) {
-        float sum = 0.f;
+        const float centerFreq = static_cast<float>(i) * FREQ_RESOLUTION;
+
+        if (centerFreq <= 0.f) {
+            smooth[i] = curve[i];
+            continue;
+        }
+
+        const float fLow  = centerFreq / factor;
+        const float fHigh = centerFreq * factor;
+
+        float sum   = 0.f;
         uint32_t count = 0;
-        
-        for (int32_t j = static_cast<int32_t>(i) - static_cast<int32_t>(half);
-             j <= static_cast<int32_t>(i) + static_cast<int32_t>(half); ++j) {
-            if (j >= 0 && j < static_cast<int32_t>(curve.size())) {
+
+        for (size_t j = 0; j < curve.size(); ++j) {
+            const float freq = static_cast<float>(j) * FREQ_RESOLUTION;
+            if (freq >= fLow && freq <= fHigh) {
                 sum += curve[j];
-                count++;
+                ++count;
             }
         }
-        
-        smooth[i] = sum / count;
+
+        smooth[i] = (count > 0) ? (sum / static_cast<float>(count)) : curve[i];
     }
-    
+
     return smooth;
 }
 

@@ -150,6 +150,23 @@ AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCu
 
     emitProgress("Applying makeup gain...", 75.f);
 
+    // Sync output.samples from channelSamples after processing.
+    // For stereo: rebuild interleaved mix as (L+R)/2 so output.samples
+    // reflects the processed audio (used by callers that read samples directly).
+    // For mono: channelSamples[0] IS the processed audio — copy it back.
+    if (!output.channelSamples.empty()) {
+        if (output.channelSamples.size() >= 2) {
+            // Stereo: update mid-channel downmix
+            output.samples.resize(output.numFrames);
+            for (size_t i = 0; i < output.numFrames; ++i) {
+                output.samples[i] = (output.channelSamples[0][i] + output.channelSamples[1][i]) / 2.f;
+            }
+        } else {
+            // Mono: sync processed channel back to samples
+            output.samples = output.channelSamples[0];
+        }
+    }
+
     emitProgress("Checking true peak (4x oversampling)...", 85.f);
 
     std::vector<std::vector<float>*> allChannels;
