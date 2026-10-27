@@ -11,7 +11,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-**Requirements:** CMake 3.16+, C++17, FFTW3 (optional — `sudo apt install libfftw3-dev`)
+**Requirements:** CMake 3.16+, C++17, FFTW3 (optional — `sudo dnf install libfftw3-dev`)
 
 ---
 
