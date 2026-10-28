@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Mastered</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="site-header">
+  <h1>Mastered</h1>
+  <p>Match your track to a reference song. Upload both, press the button, download the result.</p>
+</header>
+<main>
+  <p id="server-status" class="notice" role="status">Connecting to the server…</p>
+
+  <form id="job-form" novalidate>
+    <div class="grid two">
+      <div class="field">
+        <label for="reference">Reference song</label>
+        <input id="reference" name="reference" type="file" accept=".wav,audio/wav,audio/x-wav">
+        <small>A finished track whose sound you like (WAV).</small>
+      </div>
+      <div class="field">
+        <label for="track">Your track</label>
+        <input id="track" name="track" type="file" accept=".wav,audio/wav,audio/x-wav">
+        <small>The mix you want to master (WAV).</small>
+      </div>
+    </div>
+
+    <div class="grid two">
+      <div class="field">
+        <label for="target">Loudness target (LUFS)</label>
+        <input id="target" name="target_lufs" type="number" min="-60" max="-1" step="any" value="-14" list="target-presets">
+        <datalist id="target-presets">
+          <option value="-16"></option>
+          <option value="-14"></option>
+          <option value="-11"></option>
+          <option value="-9"></option>
+        </datalist>
+        <small>-14 suits most streaming services.</small>
+      </div>
+      <div class="field">
+        <label for="aggressiveness">EQ strength: <output id="aggressiveness-value">85%</output></label>
+        <input id="aggressiveness" name="aggressiveness" type="range" min="0" max="100" step="5" value="85">
+        <small>How closely the tone follows the reference.</small>
+      </div>
+    </div>
+
+    <details>
+      <summary>More options</summary>
+      <div class="grid two">
+        <div class="field">
+          <label for="ceiling">Peak ceiling (dBTP)</label>
+          <input id="ceiling" name="ceiling_db" type="number" min="-12" max="0" step="any" value="-1">
+        </div>
+        <div class="field">
+          <label for="bands">Maximum EQ bands</label>
+          <input id="bands" name="bands" type="number" min="0" max="32" step="1" value="8">
+        </div>
+        <div class="field">
+          <label for="bit-depth">Output format</label>
+          <select id="bit-depth" name="bit_depth">
+            <option value="0">Same as your track</option>
+            <option value="16">16-bit</option>
+            <option value="24">24-bit</option>
+            <option value="32">32-bit float</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="precision">Loudness precision</label>
+          <select id="precision" name="precision">
+            <option value="fast">Fast (about 0.25 LU)</option>
+            <option value="normal" selected>Normal (about 0.1 LU)</option>
+            <option value="high">High (about 0.05 LU, slower)</option>
+          </select>
+        </div>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="mid-side" checked> Mid/side EQ</label>
+        <label><input type="checkbox" id="match-width" checked> Match stereo width</label>
+        <label><input type="checkbox" id="dynamics"> Match dynamics (multiband compression)</label>
+        <label><input type="checkbox" id="soft-clip"> Soft clipper before the limiter</label>
+        <label><input type="checkbox" id="dither" checked> Dither (16 and 24-bit)</label>
+        <label><input type="checkbox" id="noise-shaping"> Noise shaping</label>
+      </div>
+    </details>
+
+    <p id="form-message" class="form-error" role="alert" hidden></p>
+    <button id="submit" type="submit" class="primary" disabled>Master my track</button>
+  </form>
+
+  <section id="progress-panel" class="panel" hidden aria-live="polite">
+    <h2 id="progress-title">Working</h2>
+    <progress id="progress-bar" max="100" value="0"></progress>
+    <p id="progress-message"></p>
+    <p class="hint">Mastering runs on a small free server, so longer songs can take a few minutes. You can leave this page open.</p>
+    <button id="cancel" type="button">Cancel</button>
+  </section>
+
+  <section id="error-panel" class="panel error" hidden role="alert">
+    <h2>Something went wrong</h2>
+    <p id="error-message"></p>
+    <button id="retry" type="button">Back to the form</button>
+  </section>
+
+  <section id="result-panel" class="panel" hidden>
+    <h2>Your master is ready</h2>
+    <p><a id="download" class="button primary" href="#" download>Download WAV</a></p>
+    <ul id="warnings" class="warnings" hidden></ul>
+
+    <h3>Measurements</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th scope="col">Track</th><th scope="col">Loudness</th><th scope="col">True peak</th><th scope="col">Range</th><th scope="col">Stereo correlation</th></tr>
+        </thead>
+        <tbody id="measurements"></tbody>
+      </table>
+    </div>
+    <p id="gain-summary" class="hint"></p>
+
+    <div id="charts"></div>
+
+    <button id="again" type="button">Master another track</button>
+  </section>
+</main>
+<footer class="site-footer">
+  <p>Files are deleted from the server shortly after processing. <span id="limits"></span></p>
+</footer>
+</body>
+</html>
