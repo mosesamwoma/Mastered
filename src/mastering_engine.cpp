@@ -71,8 +71,9 @@ void validateConfig(const MasteringConfig& c) {
 
 FileScan scanFile(const std::string& path, size_t fftSize) {
     WavReader reader(path);
-    if (reader.frames() < std::max<uint64_t>(reader.sampleRate(), fftSize)) {
-        throw MasteredError(path + ": audio must be at least one second long");
+    const uint64_t required = std::max<uint64_t>(reader.sampleRate(), fftSize);
+    if (reader.frames() < required) {
+        throw MasteredError(path + ": audio is too short, at least " + std::to_string(required) + " frames are required");
     }
     FileScan scan;
     scan.sampleRate = reader.sampleRate();
@@ -159,11 +160,11 @@ std::vector<double> buildTarget(const AverageSpectrum& input, const std::vector<
     return target;
 }
 
-Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter* writer) {
+Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter* writer, bool measureTruePeak) {
     WavReader reader(input);
     const size_t channels = reader.channels();
     ProcessingChain chain(plan, reader.sampleRate(), channels);
-    Meter meter(reader.sampleRate(), channels);
+    Meter meter(reader.sampleRate(), channels, measureTruePeak);
     size_t skip = chain.latency();
     AudioBlock block;
 
@@ -478,7 +479,7 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         ChainPlan pre = base;
         pre.limiterEnabled = false;
         pre.gainDb = 0.0;
-        const Measurements preMeasure = runPass(input, pre, nullptr);
+        const Measurements preMeasure = runPass(input, pre, nullptr, false);
         if (preMeasure.integratedLufs <= -100.0) {
             throw MasteredError("Audio is too quiet to normalise to a loudness target");
         }
@@ -491,7 +492,7 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
             emit("Matching loudness (pass " + std::to_string(i) + ")", 38.0 + 52.0 * static_cast<double>(i) / static_cast<double>(config_.maxLoudnessIterations));
             ChainPlan trial = base;
             trial.gainDb = gain;
-            const Measurements m = runPass(input, trial, nullptr);
+            const Measurements m = runPass(input, trial, nullptr, false);
             iterations = i;
             const double error = config_.targetLufs - m.integratedLufs;
             if (std::fabs(error) < std::fabs(bestError)) {
@@ -527,7 +528,7 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
     ChainPlan finalPlan = base;
     finalPlan.gainDb = gain;
     WavWriter writer(output, analysis.sampleRate, analysis.channels, depth, config_.dither, config_.noiseShaping);
-    result.output = runPass(input, finalPlan, &writer);
+    result.output = runPass(input, finalPlan, &writer, true);
     writer.finalize();
 
     result.analysis.plan = finalPlan;

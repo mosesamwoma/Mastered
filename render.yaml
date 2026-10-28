@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: mastered
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: MAX_FILE_MB
+        value: "60"
+      - key: MAX_DURATION_SEC
+        value: "420"
+      - key: MAX_PENDING_JOBS
+        value: "2"
+      - key: JOB_TTL_MINUTES
+        value: "20"
+      - key: JOB_TIMEOUT_SEC
+        value: "1800"

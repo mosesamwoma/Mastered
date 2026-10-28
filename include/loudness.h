@@ -12,6 +12,7 @@ namespace mastered {
 
 struct OversamplingKernel {
     std::array<std::array<double, kTruePeakTaps>, 4> phases;
+    double bound = 1.0;
 };
 
 const OversamplingKernel& oversamplingKernel();
@@ -58,6 +59,7 @@ public:
 private:
     size_t channels_;
     std::vector<std::vector<double>> history_;
+    std::vector<size_t> hot_;
     std::vector<double> work_;
     double peak_ = 0.0;
 };
@@ -73,13 +75,14 @@ struct Measurements {
 
 class Meter {
 public:
-    Meter(double sampleRate, size_t channels);
+    Meter(double sampleRate, size_t channels, bool measureTruePeak = true);
 
     void process(const AudioBlock& block, size_t frames);
     Measurements finish();
 
 private:
     size_t channels_;
+    bool measureTruePeak_;
     LoudnessMeter loudness_;
     TruePeakMeter truePeak_;
     double leftEnergy_ = 0.0;

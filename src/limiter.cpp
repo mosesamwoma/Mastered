@@ -21,10 +21,9 @@ TruePeakLimiter::TruePeakLimiter(double sampleRate, size_t channels, double ceil
     latency_ = lookahead_ + kTruePeakDelay;
     ceiling_ = std::pow(10.0, (ceilingDb - kLimiterMarginDb) / 20.0);
     releaseCoefficient_ = std::exp(-1.0 / (releaseMs * 0.001 * sampleRate));
-    windows_.assign(channels, std::array<double, kTruePeakTaps>());
-    for (auto& w : windows_) {
-        w.fill(0.0);
-    }
+    history_.assign(channels, std::vector<double>(2 * kTruePeakTaps, 0.0));
+    hot_.assign(channels, 0);
+    hotThreshold_ = ceiling_ / oversamplingKernel().bound * (1.0 - 1e-9);
     delay_.assign(channels, std::vector<double>(latency_, 0.0));
     smoothing_.assign(lookahead_ + 1, 1.0);
     smoothingSum_ = static_cast<double>(smoothing_.size());
@@ -34,11 +33,19 @@ void TruePeakLimiter::process(AudioBlock& block, size_t frames) {
     for (size_t i = 0; i < frames; ++i) {
         double peak = 0.0;
         for (size_t ch = 0; ch < channels_; ++ch) {
-            std::array<double, kTruePeakTaps>& w = windows_[ch];
-            std::copy(w.begin() + 1, w.end(), w.begin());
-            w[kTruePeakTaps - 1] = block[ch][i];
-            peak = std::max(peak, truePeakOfWindow(w.data()));
+            const double x = block[ch][i];
+            std::vector<double>& h = history_[ch];
+            h[historyPosition_] = x;
+            h[historyPosition_ + kTruePeakTaps] = x;
+            if (std::fabs(x) > hotThreshold_) {
+                hot_[ch] = kTruePeakTaps;
+            }
+            if (hot_[ch] > 0) {
+                --hot_[ch];
+                peak = std::max(peak, truePeakOfWindow(h.data() + historyPosition_ + 1));
+            }
         }
+        historyPosition_ = (historyPosition_ + 1) % kTruePeakTaps;
         const double required = std::max(previousPeak_, peak);
         previousPeak_ = peak;
         const double ratio = required > ceiling_ ? ceiling_ / required : 1.0;

@@ -43,14 +43,19 @@ OversamplingKernel buildKernel() {
         h[n] = sinc * window;
     }
     OversamplingKernel kernel;
+    kernel.bound = 1.0;
     for (int p = 0; p < 4; ++p) {
         double sum = 0.0;
         for (size_t m = 0; m < kTruePeakTaps; ++m) {
             sum += h[4 * m + static_cast<size_t>(p)];
         }
+        double absolute = 0.0;
         for (size_t m = 0; m < kTruePeakTaps; ++m) {
-            kernel.phases[static_cast<size_t>(p)][m] = h[4 * m + static_cast<size_t>(p)] / sum;
+            const double value = h[4 * m + static_cast<size_t>(p)] / sum;
+            kernel.phases[static_cast<size_t>(p)][m] = value;
+            absolute += std::fabs(value);
         }
+        kernel.bound = std::max(kernel.bound, absolute);
     }
     return kernel;
 }
@@ -107,8 +112,8 @@ const OversamplingKernel& oversamplingKernel() {
 
 double truePeakOfWindow(const double* window) {
     const OversamplingKernel& kernel = oversamplingKernel();
-    double peak = 0.0;
-    for (size_t p = 0; p < 4; ++p) {
+    double peak = std::fabs(window[kTruePeakTaps - 1 - kTruePeakDelay]);
+    for (size_t p = 1; p < 4; ++p) {
         double sum = 0.0;
         for (size_t m = 0; m < kTruePeakTaps; ++m) {
             sum += kernel.phases[p][m] * window[kTruePeakTaps - 1 - m];
@@ -238,7 +243,8 @@ LoudnessResult LoudnessMeter::finish() const {
     return result;
 }
 
-TruePeakMeter::TruePeakMeter(size_t channels) : channels_(channels), history_(channels, std::vector<double>(kTruePeakTaps - 1, 0.0)) {}
+TruePeakMeter::TruePeakMeter(size_t channels)
+    : channels_(channels), history_(channels, std::vector<double>(kTruePeakTaps - 1, 0.0)), hot_(channels, 0) {}
 
 void TruePeakMeter::process(const AudioBlock& block, size_t frames) {
     for (size_t ch = 0; ch < channels_; ++ch) {
@@ -246,8 +252,15 @@ void TruePeakMeter::process(const AudioBlock& block, size_t frames) {
         work_.resize(history + frames);
         std::copy(history_[ch].begin(), history_[ch].end(), work_.begin());
         std::copy(block[ch].begin(), block[ch].begin() + static_cast<std::ptrdiff_t>(frames), work_.begin() + static_cast<std::ptrdiff_t>(history));
+        const double bound = oversamplingKernel().bound;
         for (size_t i = 0; i < frames; ++i) {
-            peak_ = std::max(peak_, truePeakOfWindow(work_.data() + i));
+            if (std::fabs(block[ch][i]) * bound > peak_ * (1.0 + 1e-9)) {
+                hot_[ch] = kTruePeakTaps;
+            }
+            if (hot_[ch] > 0) {
+                --hot_[ch];
+                peak_ = std::max(peak_, truePeakOfWindow(work_.data() + i));
+            }
         }
         std::copy(work_.begin() + static_cast<std::ptrdiff_t>(frames), work_.begin() + static_cast<std::ptrdiff_t>(frames + history), history_[ch].begin());
     }
@@ -262,12 +275,14 @@ double TruePeakMeter::peakDb() const {
     return 20.0 * std::log10(std::max(peak_, 1e-10));
 }
 
-Meter::Meter(double sampleRate, size_t channels)
-    : channels_(channels), loudness_(sampleRate, channels), truePeak_(channels) {}
+Meter::Meter(double sampleRate, size_t channels, bool measureTruePeak)
+    : channels_(channels), measureTruePeak_(measureTruePeak), loudness_(sampleRate, channels), truePeak_(channels) {}
 
 void Meter::process(const AudioBlock& block, size_t frames) {
     loudness_.process(block, frames);
-    truePeak_.process(block, frames);
+    if (measureTruePeak_) {
+        truePeak_.process(block, frames);
+    }
     if (channels_ >= 2) {
         for (size_t i = 0; i < frames; ++i) {
             const double l = block[0][i];
@@ -284,12 +299,16 @@ void Meter::process(const AudioBlock& block, size_t frames) {
 }
 
 Measurements Meter::finish() {
-    truePeak_.finish();
+    if (measureTruePeak_) {
+        truePeak_.finish();
+    }
     const LoudnessResult loudness = loudness_.finish();
     Measurements m;
     m.integratedLufs = loudness.integratedLufs;
     m.loudnessRangeLu = loudness.loudnessRangeLu;
-    m.truePeakDb = truePeak_.peakDb();
+    if (measureTruePeak_) {
+        m.truePeakDb = truePeak_.peakDb();
+    }
     if (channels_ >= 2) {
         m.hasStereo = true;
         if (leftEnergy_ <= 0.0 && rightEnergy_ <= 0.0) {

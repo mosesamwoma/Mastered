@@ -44,6 +44,8 @@ void printUsage() {
         "  --lookahead MS        Limiter look-ahead, 0.5 to 20 (default 3)\n"
         "  --release MS          Limiter release, 5 to 1000 (default 80)\n"
         "  --fft N               FFT size, power of two 1024 to 65536 (default 8192)\n"
+        "  --passes N            Maximum loudness passes, 1 to 30 (default 10)\n"
+        "  --tolerance LU        Loudness tolerance, 0.01 to 2 (default 0.1)\n"
         "  --verbose             Print EQ bands and measurements\n"
         "  --help                Show this help\n";
 }
@@ -169,6 +171,10 @@ int run(int argc, char** argv) {
             config.limiterReleaseMs = parseNumber(arg, value());
         } else if (arg == "--fft") {
             config.fftSize = parseCount(arg, value(), 1024, 65536);
+        } else if (arg == "--passes") {
+            config.maxLoudnessIterations = static_cast<int>(parseCount(arg, value(), 1, 30));
+        } else if (arg == "--tolerance") {
+            config.loudnessToleranceLu = parseNumber(arg, value());
         } else if (arg == "--verbose") {
             verbose = true;
         } else if (arg.size() > 1 && arg[0] == '-' && arg != "-") {

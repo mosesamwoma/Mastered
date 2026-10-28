@@ -20,6 +20,7 @@ Everything runs as a streaming pipeline in fixed-size blocks, so memory use stay
 - WAV output: 16/24-bit PCM, 32-bit float (format tag 3), extensible header above two channels
 - JSON report, ReaEQ and Equalizer APO band lists
 - C API shared library
+- Web app (FastAPI + a single static page) with a Docker image and a Render blueprint
 
 ## Build
 
@@ -73,9 +74,87 @@ By default the mastered file is written next to the input as `<input>_mastered.w
 | `--lookahead MS` | 3 | Limiter look-ahead, 0.5 to 20 |
 | `--release MS` | 80 | Limiter release, 5 to 1000 |
 | `--fft N` | 8192 | FFT size, power of two 1024 to 65536 |
+| `--passes N` | 10 | Maximum loudness passes, 1 to 30 |
+| `--tolerance LU` | 0.1 | Loudness tolerance, 0.01 to 2 |
 | `--verbose` | | Print EQ bands and stereo/dynamics details |
 
 Exit codes: 0 success, 1 error, 2 usage.
+
+## Web app
+
+A small web page lets you upload a reference and your track, watch progress, see the measurements and EQ curves, and download the mastered WAV.
+
+```
+Mastered/
+  Dockerfile        builds the engine, then the Python image
+  render.yaml       Render blueprint (free plan)
+  web/
+    app/            FastAPI service
+    static/         index.html, style.css, app.js
+```
+
+### Run it locally
+
+```
+./build.sh
+cd web
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --port 8000
+```
+
+Open http://localhost:8000. The service looks for the engine at `/usr/local/bin/mastered_cli` and then at `build/mastered_cli`; set `MASTERED_CLI` to use another path.
+
+With Docker:
+
+```
+docker build -t mastered .
+docker run --rm -p 10000:10000 mastered
+```
+
+### Deploy on Render (free)
+
+1. Push this folder to a GitHub repository.
+2. In Render choose New, then Blueprint, and select the repository. Render reads `render.yaml` and creates a free Docker web service. Alternatively choose New, then Web Service, pick the repository, set the runtime to Docker and the plan to Free.
+3. Wait for the build to finish and open the service URL.
+
+The free plan has a small CPU share and sleeps after 15 minutes without visitors, so the first visit can take about a minute and a 3-minute song can take several minutes to master. Disk is temporary: results are removed after `JOB_TTL_MINUTES` and on every restart. The page shows a waking-up message while the service starts and keeps polling your job if you reload.
+
+### Settings
+
+All settings are environment variables with safe defaults.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MASTERED_CLI` | auto | Path to `mastered_cli` |
+| `WORK_DIR` | system temp dir | Where uploads and results live |
+| `MAX_FILE_MB` | 60 | Largest single upload |
+| `MAX_DURATION_SEC` | 420 | Longest audio file accepted |
+| `MAX_PENDING_JOBS` | 2 | Jobs waiting or running before new ones get HTTP 429 |
+| `JOB_TTL_MINUTES` | 20 | How long finished jobs stay downloadable |
+| `JOB_TIMEOUT_SEC` | 1800 | A job running longer than this is stopped |
+| `PORT` | 10000 | Port used by the Docker image |
+
+### How it works
+
+- One job runs at a time in a background queue; the engine is started as a separate process in its own process group, so cancelling or timing out a job kills it cleanly.
+- Progress lines printed by the engine are parsed and exposed through the status endpoint.
+- Uploads are streamed to disk with size limits enforced both on the whole request and on each file, and each file's WAV header is checked before the job is queued.
+- Files are stored under random job ids with fixed names, never under user-supplied names.
+- The page sets a strict content security policy and builds all dynamic content with `textContent`.
+- Run a single worker process only. Job state is kept in memory.
+
+### API
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /api/health` | Health check |
+| `GET /api/config` | Limits shown on the page |
+| `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `soft_clip`, `dither`, `noise_shaping`, `mid_side`, `match_width`; returns 202 with the job id |
+| `GET /api/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`), progress, queue position, and the report when done |
+| `GET /api/jobs/{id}/download` | Mastered WAV |
+| `DELETE /api/jobs/{id}` | Cancel and delete a job |
 
 ## Processing chain
 
