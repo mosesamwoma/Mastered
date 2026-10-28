@@ -44,7 +44,6 @@ Outputs: `build/mastered_cli`, `build/libmastered.so` (or the platform equivalen
 
 ```
 ./build/mastered_cli <reference.wav> <input.wav> [options]
-./master.sh <reference.wav> <input.wav> [options]
 ```
 
 By default the mastered file is written next to the input as `<input>_mastered.wav`, with a JSON report next to it.
