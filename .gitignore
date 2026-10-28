@@ -39,3 +39,5 @@ result2.json
 mastering_result.json
 *_reaEQ.txt
 *_EqualizerAPO.txt
+*.pyc
+
