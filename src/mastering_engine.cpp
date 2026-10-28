@@ -1,575 +1,612 @@
 #include "mastering_engine.h"
-#include <cmath>
-#include <sstream>
-#include <iomanip>
-#include <stdexcept>
+
+#include "constants.h"
+#include "dynamics.h"
+#include "error.h"
+#include "wav_io.h"
+
 #include <algorithm>
-#include <iostream>
+#include <array>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
 
 namespace mastered {
 
-MasteringEngine::MasteringEngine(const MasteringConfig& config)
-    : config_(config),
-      fftAnalyzer_(std::make_unique<FFTAnalyzer>(constants::DEFAULT_FFT_SIZE)),
-      eqCalculator_(std::make_unique<EQCalculator>()),
-      spectrumMatcher_(std::make_unique<SpectrumMatcher>()) {
+namespace {
+
+constexpr double kMinLevelHz = 63.0;
+constexpr double kMaxLevelHz = 12500.0;
+constexpr double kSideFloorDb = -45.0;
+constexpr double kMaxTargetDb = 12.0;
+constexpr double kMaxWidthDb = 3.0;
+constexpr double kMaxMakeupDb = 40.0;
+
+struct FileScan {
+    uint32_t sampleRate = 0;
+    uint16_t channels = 0;
+    uint16_t bitDepth = 0;
+    bool isFloat = false;
+    uint64_t frames = 0;
+    AverageSpectrum spectrum;
+    Measurements measurements;
+    std::array<double, 3> bandRmsDb{{-90.0, -90.0, -90.0}};
+};
+
+void requireFinite(double value, const char* name) {
+    if (!std::isfinite(value)) {
+        throw MasteredError(std::string("Configuration value is not finite: ") + name);
+    }
+}
+
+void requireRange(double value, double low, double high, const char* name) {
+    requireFinite(value, name);
+    if (value < low || value > high) {
+        std::ostringstream message;
+        message << "Configuration value out of range: " << name << " must be between " << low << " and " << high;
+        throw MasteredError(message.str());
+    }
+}
+
+void validateConfig(const MasteringConfig& c) {
+    requireRange(c.targetLufs, -60.0, -1.0, "targetLufs");
+    requireRange(c.aggressiveness, 0.0, 1.0, "aggressiveness");
+    requireRange(c.ceilingDb, -12.0, 0.0, "ceilingDb");
+    requireRange(static_cast<double>(c.maxEQBands), 0.0, 32.0, "maxEQBands");
+    requireRange(static_cast<double>(c.maxSideBands), 0.0, 32.0, "maxSideBands");
+    requireRange(c.dynamicsRatio, 1.0, 20.0, "dynamicsRatio");
+    requireRange(c.dynamicsThresholdOffsetDb, -24.0, 24.0, "dynamicsThresholdOffsetDb");
+    requireRange(c.softClipKneeDb, 0.1, 12.0, "softClipKneeDb");
+    requireRange(c.limiterLookaheadMs, 0.5, 20.0, "limiterLookaheadMs");
+    requireRange(c.limiterReleaseMs, 5.0, 1000.0, "limiterReleaseMs");
+    requireRange(c.loudnessToleranceLu, 0.01, 2.0, "loudnessToleranceLu");
+    requireRange(static_cast<double>(c.maxLoudnessIterations), 1.0, 30.0, "maxLoudnessIterations");
+    if (c.bitDepth != 0 && c.bitDepth != 16 && c.bitDepth != 24 && c.bitDepth != 32) {
+        throw MasteredError("Configuration value out of range: bitDepth must be 0, 16, 24 or 32");
+    }
+    if (c.fftSize < 1024 || c.fftSize > 65536 || (c.fftSize & (c.fftSize - 1)) != 0) {
+        throw MasteredError("Configuration value out of range: fftSize must be a power of two between 1024 and 65536");
+    }
+}
+
+FileScan scanFile(const std::string& path, size_t fftSize) {
+    WavReader reader(path);
+    if (reader.frames() < std::max<uint64_t>(reader.sampleRate(), fftSize)) {
+        throw MasteredError(path + ": audio must be at least one second long");
+    }
+    FileScan scan;
+    scan.sampleRate = reader.sampleRate();
+    scan.channels = reader.channels();
+    scan.bitDepth = reader.bitDepth();
+    scan.isFloat = reader.isFloat();
+    scan.frames = reader.frames();
+    SpectrumAccumulator spectrum(scan.sampleRate, scan.channels, fftSize);
+    Meter meter(scan.sampleRate, scan.channels);
+    BandLevelMeter bands(scan.sampleRate, DynamicsSettings().lowCrossoverHz, DynamicsSettings().highCrossoverHz);
+    AudioBlock block;
+    size_t n;
+    while ((n = reader.read(block, kBlockFrames)) > 0) {
+        spectrum.push(block, n);
+        meter.process(block, n);
+        bands.process(block, n);
+    }
+    scan.spectrum = spectrum.finish();
+    scan.measurements = meter.finish();
+    scan.bandRmsDb = bands.rmsDb();
+    return scan;
+}
+
+double meanOverRange(const std::vector<double>& values, const std::vector<size_t>& range) {
+    double sum = 0.0;
+    for (size_t i : range) {
+        sum += values[i];
+    }
+    return sum / static_cast<double>(range.size());
+}
+
+std::vector<double> shapeOf(const std::vector<double>& levels, const std::vector<size_t>& range) {
+    const double mean = meanOverRange(levels, range);
+    std::vector<double> shape(levels.size());
+    for (size_t i = 0; i < levels.size(); ++i) {
+        shape[i] = levels[i] - mean;
+    }
+    return shape;
+}
+
+CurveFit fitCurve(const std::vector<double>& centres, const std::vector<double>& target, size_t maxBands, double sampleRate, double maxHz, bool perceptual) {
+    FitOptions options;
+    options.sampleRate = sampleRate;
+    options.maxHz = maxHz;
+    options.maxBands = maxBands;
+    options.perceptualWeighting = perceptual;
+    const FitResult fit = fitEQ(centres, target, options);
+    CurveFit curve;
+    curve.bands = fit.bands;
+    curve.frequenciesHz = fit.gridHz;
+    curve.targetDb = fit.targetDb;
+    curve.responseDb = fit.responseDb;
+    curve.residualRmsDb = fit.residualRmsDb;
+    return curve;
+}
+
+std::vector<double> buildTarget(const AverageSpectrum& input, const std::vector<const AverageSpectrum*>& references, bool side,
+                                const std::vector<double>& centres, double width, const std::vector<size_t>& range, double aggressiveness) {
+    const std::vector<double> inputShape = shapeOf(bandLevelsDb(input, side, centres, width), range);
+    std::vector<double> referenceShape(centres.size(), 0.0);
+    for (const AverageSpectrum* reference : references) {
+        const std::vector<double> shape = shapeOf(bandLevelsDb(*reference, side, centres, width), range);
+        for (size_t i = 0; i < shape.size(); ++i) {
+            referenceShape[i] += shape[i] / static_cast<double>(references.size());
+        }
+    }
+    std::vector<double> difference(centres.size());
+    for (size_t i = 0; i < difference.size(); ++i) {
+        difference[i] = referenceShape[i] - inputShape[i];
+    }
+    std::vector<double> inRange;
+    inRange.reserve(range.size());
+    for (size_t i : range) {
+        inRange.push_back(difference[i]);
+    }
+    std::sort(inRange.begin(), inRange.end());
+    const size_t middle = inRange.size() / 2;
+    const double offset = inRange.size() % 2 == 1 ? inRange[middle] : 0.5 * (inRange[middle - 1] + inRange[middle]);
+    std::vector<double> target(centres.size());
+    for (size_t i = 0; i < target.size(); ++i) {
+        const double value = (difference[i] - offset) * aggressiveness;
+        target[i] = std::min(std::max(value, -kMaxTargetDb), kMaxTargetDb);
+    }
+    return target;
+}
+
+Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter* writer) {
+    WavReader reader(input);
+    const size_t channels = reader.channels();
+    ProcessingChain chain(plan, reader.sampleRate(), channels);
+    Meter meter(reader.sampleRate(), channels);
+    size_t skip = chain.latency();
+    AudioBlock block;
+
+    auto emitBlock = [&](AudioBlock& data, size_t frames) {
+        size_t offset = 0;
+        if (skip > 0) {
+            offset = std::min(skip, frames);
+            skip -= offset;
+        }
+        if (offset >= frames) {
+            return;
+        }
+        if (offset > 0) {
+            for (auto& channel : data) {
+                channel.erase(channel.begin(), channel.begin() + static_cast<std::ptrdiff_t>(offset));
+            }
+        }
+        const size_t count = frames - offset;
+        meter.process(data, count);
+        if (writer) {
+            writer->write(data, count);
+        }
+    };
+
+    size_t n;
+    while ((n = reader.read(block, kBlockFrames)) > 0) {
+        chain.process(block, n);
+        emitBlock(block, n);
+    }
+    size_t pending = chain.latency();
+    while (pending > 0) {
+        const size_t count = std::min(pending, kBlockFrames);
+        AudioBlock tail = makeBlock(channels, count);
+        chain.process(tail, count);
+        emitBlock(tail, count);
+        pending -= count;
+    }
+    return meter.finish();
+}
+
+std::string escapeJson(const std::string& text) {
+    std::ostringstream out;
+    for (unsigned char c : text) {
+        switch (c) {
+            case '"': out << "\\\""; break;
+            case '\\': out << "\\\\"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(c) << std::dec << std::setfill(' ');
+                } else {
+                    out << c;
+                }
+        }
+    }
+    return out.str();
+}
+
+std::string num(double value, int precision) {
+    if (!std::isfinite(value)) {
+        return "null";
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(precision) << value;
+    return out.str();
+}
+
+std::string quote(const std::string& text) {
+    return "\"" + escapeJson(text) + "\"";
+}
+
+std::string measurementsJson(const Measurements& m) {
+    std::ostringstream out;
+    out << "{\"integratedLufs\": " << num(m.integratedLufs, 2)
+        << ", \"loudnessRangeLu\": " << num(m.loudnessRangeLu, 2)
+        << ", \"truePeakDb\": " << num(m.truePeakDb, 2)
+        << ", \"stereoCorrelation\": " << (m.hasStereo ? num(m.correlation, 3) : "null")
+        << ", \"sideToMidDb\": " << (m.hasStereo ? num(m.sideToMidDb, 2) : "null") << "}";
+    return out.str();
+}
+
+std::string curveJson(const CurveFit& curve) {
+    std::ostringstream out;
+    out << "{\"bands\": [";
+    for (size_t i = 0; i < curve.bands.size(); ++i) {
+        const EQBand& b = curve.bands[i];
+        if (i > 0) {
+            out << ", ";
+        }
+        out << "{\"id\": " << (i + 1) << ", \"frequency\": " << num(b.frequency, 1) << ", \"gain\": " << num(b.gainDb, 2)
+            << ", \"q\": " << num(b.q, 3) << ", \"type\": " << quote(bandTypeName(b.type)) << "}";
+    }
+    out << "], \"residualRmsDb\": " << num(curve.residualRmsDb, 3) << ", \"curve\": {\"frequencies\": [";
+    for (size_t i = 0; i < curve.frequenciesHz.size(); ++i) {
+        out << (i > 0 ? ", " : "") << num(curve.frequenciesHz[i], 1);
+    }
+    out << "], \"targetDb\": [";
+    for (size_t i = 0; i < curve.targetDb.size(); ++i) {
+        out << (i > 0 ? ", " : "") << num(curve.targetDb[i], 2);
+    }
+    out << "], \"responseDb\": [";
+    for (size_t i = 0; i < curve.responseDb.size(); ++i) {
+        out << (i > 0 ? ", " : "") << num(curve.responseDb[i], 2);
+    }
+    out << "]}}";
+    return out.str();
+}
+
+std::string bandLine(size_t index, const EQBand& band, const char* style) {
+    std::ostringstream out;
+    out << std::fixed;
+    if (std::string(style) == "apo") {
+        const char* type = band.type == BandType::LowShelf ? "LSC" : (band.type == BandType::HighShelf ? "HSC" : "PK");
+        out << "Filter " << index << ": ON " << type << " Fc " << std::setprecision(1) << band.frequency << " Hz Gain "
+            << std::setprecision(2) << band.gainDb << " dB Q " << std::setprecision(3) << band.q;
+    } else {
+        const char* type = band.type == BandType::LowShelf ? "Low Shelf" : (band.type == BandType::HighShelf ? "High Shelf" : "Band");
+        out << "Band " << index << ": " << type << " Freq " << std::setprecision(1) << band.frequency << " Hz Gain "
+            << std::setprecision(2) << band.gainDb << " dB Q " << std::setprecision(3) << band.q;
+    }
+    return out.str();
+}
+
+}
+
+MasteringEngine::MasteringEngine(const MasteringConfig& config) : config_(config) {
     validateConfig(config_);
 }
 
-MasteringEngine::~MasteringEngine() = default;
-
-MasteringResult MasteringEngine::analyzeTracks(const std::string& referenceTrackPath,
-                                               const std::string& unmasteredTrackPath) {
-    auto referenceBuffer = AudioLoader::loadWAV(referenceTrackPath);
-    auto unmasteredBuffer = AudioLoader::loadWAV(unmasteredTrackPath);
-
-    return analyzeBuffers(referenceBuffer, unmasteredBuffer);
+void MasteringEngine::setConfig(const MasteringConfig& config) {
+    validateConfig(config);
+    config_ = config;
 }
 
-MasteringResult MasteringEngine::analyzeBuffers(const AudioBuffer& reference,
-                                                const AudioBuffer& unmastered) {
-    MasteringResult result;
-    result.inputBuffer = unmastered;
+void MasteringEngine::emit(const std::string& message, double percent) const {
+    if (progress_) {
+        progress_(message, percent);
+    }
+}
 
-    try {
-        emitProgress("Starting audio analysis...", 0.f);
-
-        validateAudioBuffer(reference, "Reference");
-        validateAudioBuffer(unmastered, "Unmastered");
-        validateConfig(config_);
-
-        emitProgress("Validating audio parameters...", 10.f);
-
-        if (reference.sampleRate != unmastered.sampleRate) {
-            throw std::runtime_error(
-                "Sample rate mismatch: reference=" + std::to_string(reference.sampleRate) +
-                " Hz, unmastered=" + std::to_string(unmastered.sampleRate) + " Hz"
-            );
-        }
-
-        fftAnalyzer_->setSampleRate(reference.sampleRate);
-
-        emitProgress("Computing reference spectrum...", 20.f);
-        auto refSpectrum = fftAnalyzer_->getAveragedSpectrum(reference.samples);
-
-        emitProgress("Computing target spectrum...", 30.f);
-        auto targetSpectrum = fftAnalyzer_->getAveragedSpectrum(unmastered.samples);
-
-        emitProgress("Smoothing frequency response...", 40.f);
-        refSpectrum = fftAnalyzer_->smoothSpectrum(refSpectrum, 7);
-        targetSpectrum = fftAnalyzer_->smoothSpectrum(targetSpectrum, 7);
-
-        emitProgress("Matching spectral characteristics...", 50.f);
-        result.matchingStats = spectrumMatcher_->matchSpectra(refSpectrum, targetSpectrum);
-
-        emitProgress("Generating EQ curve...", 60.f);
-        result.eqCurve = eqCalculator_->calculateEQFromReference(refSpectrum, targetSpectrum);
-
-        for (auto& band : result.eqCurve.bands) {
-            band.gain *= config_.aggressiveness;
-        }
-        for (float& val : result.eqCurve.curveResponse) {
-            val *= config_.aggressiveness;
-        }
-
-        emitProgress("Calculating loudness (LUFS)...", 75.f);
-        result.estimatedLUFS = calculateLUFS(unmastered);
-
-        emitProgress("Computing makeup gain...", 85.f);
-        if (config_.autoGain) {
-            result.makeupGain = calculateMakeupGain(unmastered, config_.targetLoudnessLUFS);
-        }
-
-        result.success = true;
-        result.message = "Analysis completed successfully";
-
-        emitProgress("Analysis complete", 100.f);
-
-        if (config_.verbose) {
-            std::cout << "✓ FFT Size: " << constants::DEFAULT_FFT_SIZE << "\n";
-            std::cout << "✓ Sample Rate: " << reference.sampleRate << " Hz\n";
-            std::cout << "✓ EQ Bands: " << result.eqCurve.bands.size() << "\n";
-        }
-
-    } catch (const std::exception& e) {
-        result.success = false;
-        result.message = std::string("Analysis failed: ") + e.what();
-        emitProgress("Analysis failed: " + std::string(e.what()), -1.f);
+Analysis MasteringEngine::analyze(const std::vector<std::string>& references, const std::string& input) {
+    validateConfig(config_);
+    if (references.empty()) {
+        throw MasteredError("At least one reference track is required");
+    }
+    emit("Analysing input track", 0.0);
+    const FileScan in = scanFile(input, config_.fftSize);
+    std::vector<FileScan> refs;
+    refs.reserve(references.size());
+    for (size_t i = 0; i < references.size(); ++i) {
+        emit("Analysing reference " + std::to_string(i + 1) + " of " + std::to_string(references.size()),
+             30.0 * static_cast<double>(i + 1) / static_cast<double>(references.size() + 1));
+        refs.push_back(scanFile(references[i], config_.fftSize));
     }
 
+    Analysis analysis;
+    analysis.sampleRate = in.sampleRate;
+    analysis.channels = in.channels;
+    analysis.frames = in.frames;
+    analysis.sourceBitDepth = in.bitDepth;
+    analysis.sourceFloat = in.isFloat;
+    analysis.referenceCount = refs.size();
+    analysis.input = in.measurements;
+
+    const double count = static_cast<double>(refs.size());
+    double minRate = in.sampleRate;
+    Measurements averaged;
+    averaged.integratedLufs = 0.0;
+    averaged.truePeakDb = 0.0;
+    averaged.correlation = 0.0;
+    averaged.sideToMidDb = 0.0;
+    size_t stereoRefs = 0;
+    for (const FileScan& ref : refs) {
+        minRate = std::min(minRate, static_cast<double>(ref.sampleRate));
+        averaged.integratedLufs += ref.measurements.integratedLufs / count;
+        averaged.loudnessRangeLu += ref.measurements.loudnessRangeLu / count;
+        averaged.truePeakDb += ref.measurements.truePeakDb / count;
+        if (ref.measurements.hasStereo) {
+            ++stereoRefs;
+            averaged.correlation += ref.measurements.correlation;
+            averaged.sideToMidDb += ref.measurements.sideToMidDb;
+        }
+    }
+    if (stereoRefs > 0) {
+        averaged.hasStereo = true;
+        averaged.correlation /= static_cast<double>(stereoRefs);
+        averaged.sideToMidDb /= static_cast<double>(stereoRefs);
+    } else {
+        averaged.correlation = 1.0;
+        averaged.sideToMidDb = -120.0;
+    }
+    analysis.reference = averaged;
+
+    const double maxHz = std::min(18000.0, 0.45 * minRate);
+    const std::vector<double> centres = makeBandCentres(30.0, maxHz);
+    const double width = config_.smoothing ? 1.0 / 3.0 : 1.0 / 6.0;
+    std::vector<size_t> range;
+    for (size_t i = 0; i < centres.size(); ++i) {
+        if (centres[i] >= kMinLevelHz && centres[i] <= kMaxLevelHz) {
+            range.push_back(i);
+        }
+    }
+    if (range.empty()) {
+        for (size_t i = 0; i < centres.size(); ++i) {
+            range.push_back(i);
+        }
+    }
+
+    emit("Fitting mid EQ", 32.0);
+    std::vector<const AverageSpectrum*> referenceSpectra;
+    for (const FileScan& ref : refs) {
+        referenceSpectra.push_back(&ref.spectrum);
+    }
+    const std::vector<double> midTarget = buildTarget(in.spectrum, referenceSpectra, false, centres, width, range, config_.aggressiveness);
+    analysis.mid = fitCurve(centres, midTarget, config_.maxEQBands, in.sampleRate, maxHz, config_.perceptualWeighting);
+    analysis.plan.midBands = analysis.mid.bands;
+
+    const bool inputStereo = in.channels == 2 && in.measurements.sideToMidDb > kSideFloorDb;
+    bool referencesStereo = true;
+    for (const FileScan& ref : refs) {
+        if (!ref.spectrum.hasSide || !ref.measurements.hasStereo || ref.measurements.sideToMidDb <= kSideFloorDb) {
+            referencesStereo = false;
+        }
+    }
+    if (inputStereo && referencesStereo) {
+        if (config_.midSide && config_.maxSideBands > 0) {
+            emit("Fitting side EQ", 34.0);
+            const std::vector<double> sideTarget = buildTarget(in.spectrum, referenceSpectra, true, centres, width, range, config_.aggressiveness);
+            analysis.side = fitCurve(centres, sideTarget, config_.maxSideBands, in.sampleRate, maxHz, config_.perceptualWeighting);
+            analysis.plan.sideBands = analysis.side.bands;
+        }
+        if (config_.matchWidth) {
+            const double difference = (averaged.sideToMidDb - in.measurements.sideToMidDb) * config_.aggressiveness;
+            analysis.sideGainDb = std::min(std::max(difference, -kMaxWidthDb), kMaxWidthDb);
+            analysis.plan.sideGain = std::pow(10.0, analysis.sideGainDb / 20.0);
+        }
+    }
+    analysis.plan.midSide = in.channels == 2 && (!analysis.plan.sideBands.empty() || std::fabs(analysis.sideGainDb) >= 0.05);
+
+    if (config_.dynamics) {
+        DynamicsSettings dynamics;
+        dynamics.enabled = true;
+        double ratio = config_.dynamicsRatio;
+        if (config_.dynamicsMatch) {
+            const bool measurable = in.measurements.integratedLufs > -100.0 && averaged.integratedLufs > -100.0;
+            const double inputPlr = in.measurements.truePeakDb - in.measurements.integratedLufs;
+            const double referencePlr = averaged.truePeakDb - averaged.integratedLufs;
+            double delta = 0.0;
+            if (measurable) {
+                delta = std::max(0.0, inputPlr - referencePlr) +
+                        0.5 * std::max(0.0, in.measurements.loudnessRangeLu - averaged.loudnessRangeLu);
+            }
+            ratio = std::min(std::max(1.0 + delta / 4.0, 1.0), 4.0);
+        }
+        if (ratio < 1.05) {
+            dynamics.enabled = false;
+            analysis.warnings.push_back("Dynamics already match the reference; compression skipped");
+        } else {
+            const std::array<double, 3> attack = {30.0, 15.0, 5.0};
+            const std::array<double, 3> release = {250.0, 150.0, 100.0};
+            for (size_t b = 0; b < 3; ++b) {
+                dynamics.bands[b].thresholdDb = in.bandRmsDb[b] + config_.dynamicsThresholdOffsetDb;
+                dynamics.bands[b].ratio = ratio;
+                dynamics.bands[b].kneeDb = 6.0;
+                dynamics.bands[b].attackMs = attack[b];
+                dynamics.bands[b].releaseMs = release[b];
+            }
+        }
+        analysis.plan.dynamics = dynamics;
+    }
+
+    analysis.plan.softClip = config_.softClip;
+    analysis.plan.softClipKneeDb = config_.softClipKneeDb;
+    analysis.plan.limiterEnabled = true;
+    analysis.plan.ceilingDb = config_.ceilingDb;
+    analysis.plan.lookaheadMs = config_.limiterLookaheadMs;
+    analysis.plan.releaseMs = config_.limiterReleaseMs;
+
+    if (in.measurements.truePeakDb > 0.0) {
+        analysis.warnings.push_back("Input contains true peaks above 0 dBTP");
+    }
+    if (in.measurements.integratedLufs <= -100.0) {
+        analysis.warnings.push_back("Input is too quiet to measure loudness");
+    }
+    emit("Analysis complete", 35.0);
+    return analysis;
+}
+
+MasteringResult MasteringEngine::render(const Analysis& analysis, const std::string& input, const std::string& output) {
+    validateConfig(config_);
+    {
+        WavReader probe(input);
+        if (probe.sampleRate() != analysis.sampleRate || probe.channels() != analysis.channels || probe.frames() != analysis.frames) {
+            throw MasteredError("Input file does not match the analysis it is being rendered with");
+        }
+    }
+    MasteringResult result;
+    result.analysis = analysis;
+    result.inputPath = input;
+    result.outputPath = output;
+    result.warnings = analysis.warnings;
+
+    const ChainPlan base = analysis.plan;
+    double gain = 0.0;
+    int iterations = 0;
+    double bestError = 0.0;
+
+    if (config_.autoGain) {
+        emit("Measuring loudness", 38.0);
+        ChainPlan pre = base;
+        pre.limiterEnabled = false;
+        pre.gainDb = 0.0;
+        const Measurements preMeasure = runPass(input, pre, nullptr);
+        if (preMeasure.integratedLufs <= -100.0) {
+            throw MasteredError("Audio is too quiet to normalise to a loudness target");
+        }
+        gain = std::min(std::max(config_.targetLufs - preMeasure.integratedLufs, -kMaxMakeupDb), kMaxMakeupDb);
+        double bestGain = gain;
+        bestError = 1e9;
+        double previousGain = 0.0;
+        double previousLufs = 0.0;
+        for (int i = 1; i <= config_.maxLoudnessIterations; ++i) {
+            emit("Matching loudness (pass " + std::to_string(i) + ")", 38.0 + 52.0 * static_cast<double>(i) / static_cast<double>(config_.maxLoudnessIterations));
+            ChainPlan trial = base;
+            trial.gainDb = gain;
+            const Measurements m = runPass(input, trial, nullptr);
+            iterations = i;
+            const double error = config_.targetLufs - m.integratedLufs;
+            if (std::fabs(error) < std::fabs(bestError)) {
+                bestError = error;
+                bestGain = gain;
+            }
+            if (std::fabs(error) <= config_.loudnessToleranceLu) {
+                break;
+            }
+            double slope = 1.0;
+            if (i > 1 && std::fabs(gain - previousGain) > 1e-6) {
+                slope = std::min(std::max((m.integratedLufs - previousLufs) / (gain - previousGain), 0.15), 1.0);
+            }
+            previousGain = gain;
+            previousLufs = m.integratedLufs;
+            const double next = std::min(std::max(gain + error / slope, -kMaxMakeupDb), kMaxMakeupDb);
+            if (std::fabs(next - gain) < 1e-4) {
+                break;
+            }
+            gain = next;
+        }
+        gain = bestGain;
+    }
+
+    uint16_t depth = config_.bitDepth;
+    if (depth == 0) {
+        depth = analysis.sourceFloat ? 32 : analysis.sourceBitDepth;
+    }
+    if (depth > 32) {
+        depth = 32;
+    }
+    emit("Writing mastered audio", 92.0);
+    ChainPlan finalPlan = base;
+    finalPlan.gainDb = gain;
+    WavWriter writer(output, analysis.sampleRate, analysis.channels, depth, config_.dither, config_.noiseShaping);
+    result.output = runPass(input, finalPlan, &writer);
+    writer.finalize();
+
+    result.analysis.plan = finalPlan;
+    result.outputBitDepth = depth;
+    result.makeupGainDb = gain;
+    result.iterations = iterations;
+    if (config_.autoGain) {
+        const double finalError = config_.targetLufs - result.output.integratedLufs;
+        result.targetReached = std::fabs(finalError) <= std::max(config_.loudnessToleranceLu, 0.05) * 1.5;
+        if (!result.targetReached) {
+            std::ostringstream message;
+            message << "Loudness target not reached: measured " << std::fixed << std::setprecision(1) << result.output.integratedLufs
+                    << " LUFS against a target of " << config_.targetLufs << " LUFS; the true-peak ceiling limits the achievable loudness";
+            result.warnings.push_back(message.str());
+        }
+    }
+    if (result.output.hasStereo && result.output.correlation < 0.0) {
+        result.warnings.push_back("Output stereo correlation is negative; check mono compatibility");
+    }
+    emit("Done", 100.0);
     return result;
 }
 
-AudioBuffer MasteringEngine::applyMastering(const AudioBuffer& input, const EQCurve& eqCurve, float makeupGain) {
-    AudioBuffer output = input;
-
-    if (output.samples.empty()) {
-        throw std::runtime_error("Cannot apply mastering to empty buffer");
-    }
-
-    emitProgress("Applying EQ mastering...", 0.f);
-
-    size_t bandCount = 0;
-
-    if (!output.channelSamples.empty()) {
-        // Stereo path: process each channel independently, skip interleaved output.samples
-        for (auto& channelData : output.channelSamples) {
-            for (const auto& band : eqCurve.bands) {
-                if (band.gain != 0.f && band.frequency > 0.f && band.qFactor > 0.01f) {
-                    applyEQBandInPlace(channelData, band, output.sampleRate);
-                    ++bandCount;
-                }
-            }
-            if (makeupGain != 0.f) {
-                float gainLinear = std::pow(10.f, makeupGain / 20.f);
-                for (float& sample : channelData) {
-                    sample *= gainLinear;
-                }
-            }
-        }
-    } else {
-        // Mono path: process interleaved samples directly
-        for (const auto& band : eqCurve.bands) {
-            if (band.gain != 0.f && band.frequency > 0.f && band.qFactor > 0.01f) {
-                applyEQBandInPlace(output.samples, band, output.sampleRate);
-                ++bandCount;
-            }
-        }
-        if (makeupGain != 0.f) {
-            float gainLinear = std::pow(10.f, makeupGain / 20.f);
-            for (float& sample : output.samples) {
-                sample *= gainLinear;
-            }
-        }
-    }
-
-    if (!eqCurve.bands.empty()) {
-        float progress = 50.f * static_cast<float>(bandCount) / static_cast<float>(eqCurve.bands.size());
-        emitProgress("Applied EQ bands...", progress);
-    }
-
-    emitProgress("Applying makeup gain...", 75.f);
-
-    // Sync output.samples from channelSamples after processing.
-    // For stereo: rebuild interleaved mix as (L+R)/2 so output.samples
-    // reflects the processed audio (used by callers that read samples directly).
-    // For mono: channelSamples[0] IS the processed audio — copy it back.
-    if (!output.channelSamples.empty()) {
-        if (output.channelSamples.size() >= 2) {
-            // Stereo: update mid-channel downmix
-            output.samples.resize(output.numFrames);
-            for (size_t i = 0; i < output.numFrames; ++i) {
-                output.samples[i] = (output.channelSamples[0][i] + output.channelSamples[1][i]) / 2.f;
-            }
-        } else {
-            // Mono: sync processed channel back to samples
-            output.samples = output.channelSamples[0];
-        }
-    }
-
-    emitProgress("Checking true peak (4x oversampling)...", 85.f);
-
-    std::vector<std::vector<float>*> allChannels;
-    allChannels.push_back(&output.samples);
-    for (auto& channel : output.channelSamples) {
-        allChannels.push_back(&channel);
-    }
-
-    constexpr float TRUE_PEAK_LIMIT = 0.891251f;
-    float truePeakMax = 0.f;
-
-    // 4-point sinc-based true peak detection per ITU-R BS.1770-4 Annex 2.
-    // Evaluates 3 inter-sample points between each pair of samples using a
-    // windowed sinc kernel. Catches high-frequency inter-sample peaks that
-    // linear interpolation misses by several dB.
-    // Kernel coefficients for t = 0.25, 0.50, 0.75 (4x oversampling):
-    // h(t) = sinc(t-n) * hann_window(t-n), summed over n = -1..2
-    const float sinc_kernels[3][4] = {
-        // t=0.25: interpolate 1/4 between samples
-        { -0.0947f,  0.6473f,  0.5267f, -0.0793f },
-        // t=0.50: interpolate midpoint
-        { -0.1250f,  0.6250f,  0.6250f, -0.1250f },
-        // t=0.75: interpolate 3/4 between samples
-        { -0.0793f,  0.5267f,  0.6473f, -0.0947f }
-    };
-
-    for (const auto* channelPtr : allChannels) {
-        const auto& channel = *channelPtr;
-        const size_t n = channel.size();
-
-        for (size_t i = 0; i < n; ++i) {
-            // Check the sample itself
-            truePeakMax = std::max(truePeakMax, std::abs(channel[i]));
-
-            // Check 3 inter-sample points using sinc kernel
-            for (int k = 0; k < 3; ++k) {
-                // Gather 4 neighbouring samples with boundary clamping
-                float s0 = (i >= 1)     ? channel[i - 1] : 0.f;
-                float s1 = channel[i];
-                float s2 = (i + 1 < n)  ? channel[i + 1] : 0.f;
-                float s3 = (i + 2 < n)  ? channel[i + 2] : 0.f;
-
-                float interp = sinc_kernels[k][0] * s0
-                             + sinc_kernels[k][1] * s1
-                             + sinc_kernels[k][2] * s2
-                             + sinc_kernels[k][3] * s3;
-
-                truePeakMax = std::max(truePeakMax, std::abs(interp));
-            }
-        }
-    }
-
-    if (truePeakMax > TRUE_PEAK_LIMIT) {
-        float tpScale = TRUE_PEAK_LIMIT / truePeakMax;
-        for (auto* channelPtr : allChannels) {
-            for (float& sample : *channelPtr) {
-                sample *= tpScale;
-            }
-        }
-        if (config_.verbose) {
-            std::cout << "⚠ True peak limiting: scaled by " << tpScale << " (true peak was "
-                      << truePeakMax << " = " << (20.f * std::log10(truePeakMax)) << " dBFS)\n";
-        }
-    }
-
-    emitProgress("Preventing clipping...", 90.f);
-
-    float maxAbs = 0.f;
-    for (const auto* channelPtr : allChannels) {
-        for (float sample : *channelPtr) {
-            maxAbs = std::max(maxAbs, std::abs(sample));
-        }
-    }
-
-    if (maxAbs > 1.f) {
-        float scale = config_.clippingHeadroom / maxAbs;
-        for (auto* channelPtr : allChannels) {
-            for (float& sample : *channelPtr) {
-                sample *= scale;
-            }
-        }
-        if (config_.verbose) {
-            std::cout << "⚠ Clipping prevention: scaled by " << scale << "\n";
-        }
-    }
-
-    emitProgress("Mastering complete", 100.f);
-
-    return output;
+MasteringResult MasteringEngine::run(const std::vector<std::string>& references, const std::string& input, const std::string& output) {
+    const Analysis analysis = analyze(references, input);
+    return render(analysis, input, output);
 }
 
-void MasteringEngine::applyEQBandInPlace(std::vector<float>& samples,
-                                         const EQBand& band,
-                                         uint32_t sampleRate) {
-    if (samples.empty() || band.gain == 0.f) {
-        return;
+std::string MasteringEngine::exportJSON(const MasteringResult& result) {
+    const Analysis& a = result.analysis;
+    std::ostringstream out;
+    out << "{\n";
+    out << "  \"version\": " << quote(kVersion) << ",\n";
+    out << "  \"input\": {\"path\": " << quote(result.inputPath) << ", \"sampleRate\": " << a.sampleRate << ", \"channels\": " << a.channels
+        << ", \"frames\": " << a.frames << ", \"measurements\": " << measurementsJson(a.input) << "},\n";
+    out << "  \"references\": {\"count\": " << a.referenceCount << ", \"measurements\": " << measurementsJson(a.reference) << "},\n";
+    out << "  \"output\": {\"path\": " << quote(result.outputPath) << ", \"bitDepth\": " << result.outputBitDepth
+        << ", \"measurements\": " << measurementsJson(result.output) << "},\n";
+    out << "  \"gain\": {\"makeupDb\": " << num(result.makeupGainDb, 2) << ", \"iterations\": " << result.iterations
+        << ", \"targetReached\": " << (result.targetReached ? "true" : "false") << "},\n";
+    out << "  \"mid\": " << curveJson(a.mid) << ",\n";
+    out << "  \"side\": " << curveJson(a.side) << ",\n";
+    out << "  \"width\": {\"sideGainDb\": " << num(a.sideGainDb, 2) << ", \"midSide\": " << (a.plan.midSide ? "true" : "false") << "},\n";
+    out << "  \"dynamics\": {\"enabled\": " << (a.plan.dynamics.enabled ? "true" : "false") << ", \"bands\": [";
+    for (size_t i = 0; i < a.plan.dynamics.bands.size(); ++i) {
+        const CompressorBand& b = a.plan.dynamics.bands[i];
+        out << (i > 0 ? ", " : "") << "{\"thresholdDb\": " << num(b.thresholdDb, 2) << ", \"ratio\": " << num(b.ratio, 2)
+            << ", \"kneeDb\": " << num(b.kneeDb, 1) << ", \"attackMs\": " << num(b.attackMs, 1) << ", \"releaseMs\": " << num(b.releaseMs, 1) << "}";
     }
-
-    if (band.frequency <= 0.f || sampleRate == 0 || band.qFactor <= 0.01f) {
-        return;
+    out << "]},\n";
+    out << "  \"warnings\": [";
+    for (size_t i = 0; i < result.warnings.size(); ++i) {
+        out << (i > 0 ? ", " : "") << quote(result.warnings[i]);
     }
-
-    float nyquist = sampleRate / 2.f;
-    if (band.frequency >= nyquist) {
-        return;
-    }
-
-    // RBJ Audio EQ Cookbook — choose correct filter type based on band.type.
-    // Shelf filters use different coefficient formulas to peaking EQ.
-    float A   = std::pow(10.f, band.gain / 40.f);
-    float w0  = 2.f * M_PI * band.frequency / static_cast<float>(sampleRate);
-    float sinW0 = std::sin(w0);
-    float cosW0 = std::cos(w0);
-
-    float b0, b1, b2, a0, a1, a2;
-
-    if (band.type == "shelf-low") {
-        // RBJ low-shelf (provides smooth gain below the corner frequency)
-        float beta = std::sqrt(A) / band.qFactor;
-        b0 =    A * ((A + 1.f) - (A - 1.f) * cosW0 + beta * sinW0);
-        b1 =  2.f * A * ((A - 1.f) - (A + 1.f) * cosW0);
-        b2 =    A * ((A + 1.f) - (A - 1.f) * cosW0 - beta * sinW0);
-        a0 =        (A + 1.f) + (A - 1.f) * cosW0 + beta * sinW0;
-        a1 = -2.f * ((A - 1.f) + (A + 1.f) * cosW0);
-        a2 =        (A + 1.f) + (A - 1.f) * cosW0 - beta * sinW0;
-    } else if (band.type == "shelf-high") {
-        // RBJ high-shelf (provides smooth gain above the corner frequency)
-        float beta = std::sqrt(A) / band.qFactor;
-        b0 =    A * ((A + 1.f) + (A - 1.f) * cosW0 + beta * sinW0);
-        b1 = -2.f * A * ((A - 1.f) + (A + 1.f) * cosW0);
-        b2 =    A * ((A + 1.f) + (A - 1.f) * cosW0 - beta * sinW0);
-        a0 =        (A + 1.f) - (A - 1.f) * cosW0 + beta * sinW0;
-        a1 =  2.f * ((A - 1.f) - (A + 1.f) * cosW0);
-        a2 =        (A + 1.f) - (A - 1.f) * cosW0 - beta * sinW0;
-    } else {
-        // RBJ peaking EQ (all other types)
-        float alpha = sinW0 / (2.f * band.qFactor);
-        b0 = 1.f + alpha * A;
-        b1 = -2.f * cosW0;
-        b2 = 1.f - alpha * A;
-        a0 = 1.f + alpha / A;
-        a1 = -2.f * cosW0;
-        a2 = 1.f - alpha / A;
-    }
-
-    b0 /= a0;
-    b1 /= a0;
-    b2 /= a0;
-    a1 /= a0;
-    a2 /= a0;
-
-    float w_n1 = 0.f, w_n2 = 0.f;
-    for (size_t i = 0; i < samples.size(); ++i) {
-        float w_n = samples[i] - a1 * w_n1 - a2 * w_n2;
-        samples[i] = b0 * w_n + b1 * w_n1 + b2 * w_n2;
-
-        w_n2 = w_n1;
-        w_n1 = w_n;
-    }
+    out << "]\n}\n";
+    return out.str();
 }
 
-std::string MasteringEngine::exportEQasJSON(const MasteringResult& result) const {
-    std::ostringstream json;
-    json << std::fixed << std::setprecision(2);
-
-    json << "{\n";
-    json << "  \"success\": " << (result.success ? "true" : "false") << ",\n";
-    json << "  \"message\": \"" << result.message << "\",\n";
-    json << "  \"version\": \"1.1\",\n";
-    json << "  \"stats\": {\n";
-    json << "    \"correlation\": " << result.matchingStats.correlation << ",\n";
-    json << "    \"spectralDifference\": " << result.matchingStats.spectralDifference << ",\n";
-    json << "    \"confidence\": " << result.matchingStats.confidenceScore << ",\n";
-    json << "    \"estimatedLUFS\": " << result.estimatedLUFS << ",\n";
-    json << "    \"makeupGain\": " << result.makeupGain << "\n";
-    json << "  },\n";
-
-    json << "  \"eqBands\": [\n";
-    for (size_t i = 0; i < result.eqCurve.bands.size(); ++i) {
-        const auto& band = result.eqCurve.bands[i];
-        json << "    {\n";
-        json << "      \"id\": " << i << ",\n";
-        json << "      \"frequency\": " << band.frequency << ",\n";
-        json << "      \"gain\": " << band.gain << ",\n";
-        json << "      \"q\": " << band.qFactor << ",\n";
-        json << "      \"type\": \"" << band.type << "\",\n";
-        json << "      \"bandwidth\": " << (band.frequency / band.qFactor) << "\n";
-        json << "    }";
-        if (i < result.eqCurve.bands.size() - 1) json << ",";
-        json << "\n";
+std::string MasteringEngine::exportReaEQ(const Analysis& analysis) {
+    std::ostringstream out;
+    out << "Mid EQ\n";
+    for (size_t i = 0; i < analysis.mid.bands.size(); ++i) {
+        out << bandLine(i + 1, analysis.mid.bands[i], "rea") << "\n";
     }
-    json << "  ],\n";
-
-    json << "  \"curveResponse\": [\n";
-    for (size_t i = 0; i < result.eqCurve.curveResponse.size(); ++i) {
-        if (i % 10 == 0) json << "    ";
-        json << result.eqCurve.curveResponse[i];
-        if (i < result.eqCurve.curveResponse.size() - 1) json << ", ";
-        if ((i + 1) % 10 == 0) json << "\n";
+    if (!analysis.side.bands.empty()) {
+        out << "Side EQ\n";
+        for (size_t i = 0; i < analysis.side.bands.size(); ++i) {
+            out << bandLine(i + 1, analysis.side.bands[i], "rea") << "\n";
+        }
     }
-    json << "  ]\n";
-    json << "}\n";
-
-    return json.str();
+    return out.str();
 }
 
-std::string MasteringEngine::exportEQasReaEQ(const MasteringResult& result) const {
-    std::ostringstream reaEQ;
-
-    reaEQ << "# ReaEQ Band Reference (enter manually into Reaper ReaEQ plugin)\n";
-    reaEQ << "# Bands: " << result.eqCurve.bands.size() << "\n\n";
-
-    for (size_t i = 0; i < result.eqCurve.bands.size(); ++i) {
-        const auto& band = result.eqCurve.bands[i];
-        float bandwidth = band.frequency / band.qFactor;
-        // Map internal type names to ReaEQ filter type labels
-        std::string reaType = "Band";
-        if (band.type == "shelf-low")  reaType = "Low Shelf";
-        if (band.type == "shelf-high") reaType = "High Shelf";
-        reaEQ << "Band " << (i + 1) << ": freq=" << std::fixed << std::setprecision(1) << band.frequency
-              << " Hz  gain=" << std::setprecision(2) << band.gain
-              << " dB  bw=" << std::setprecision(1) << bandwidth
-              << " Hz  Q=" << band.qFactor
-              << "  type=" << reaType << "\n";
+std::string MasteringEngine::exportEqualizerAPO(const Analysis& analysis) {
+    std::ostringstream out;
+    for (size_t i = 0; i < analysis.mid.bands.size(); ++i) {
+        out << bandLine(i + 1, analysis.mid.bands[i], "apo") << "\n";
     }
-
-    return reaEQ.str();
+    return out.str();
 }
 
-std::string MasteringEngine::exportEQasEqualizerAPO(const MasteringResult& result) const {
-    std::ostringstream apoEQ;
-    apoEQ << std::fixed << std::setprecision(2);
-
-    for (const auto& band : result.eqCurve.bands) {
-        std::string apoType = "PK";
-        if (band.type == "shelf-low")  apoType = "LS";
-        if (band.type == "shelf-high") apoType = "HS";
-        apoEQ << "Filter: ON " << apoType << " Fc=" << std::setprecision(1) << band.frequency
-              << " Gain=" << std::setprecision(2) << band.gain
-              << " Q=" << band.qFactor << "\n";
-    }
-
-    return apoEQ.str();
 }
-
-float MasteringEngine::calculateLUFS(const AudioBuffer& buffer) const {
-    if (buffer.samples.empty()) return -120.f;
-
-    const double fs = static_cast<double>(buffer.sampleRate);
-    constexpr float CALIBRATION_CONST = -0.691f;
-
-    auto calcBiquad = [](double b0, double b1, double b2,
-                         double a0, double a1, double a2,
-                         const std::vector<float>& x) -> std::vector<float> {
-        std::vector<float> y(x.size());
-        const double nb0 = b0 / a0;
-        const double nb1 = b1 / a0;
-        const double nb2 = b2 / a0;
-        const double na1 = a1 / a0;
-        const double na2 = a2 / a0;
-        double w1 = 0.0;
-        double w2 = 0.0;
-        for (size_t i = 0; i < x.size(); ++i) {
-            const double w = static_cast<double>(x[i]) - na1 * w1 - na2 * w2;
-            y[i] = static_cast<float>(nb0 * w + nb1 * w1 + nb2 * w2);
-            w2 = w1;
-            w1 = w;
-        }
-        return y;
-    };
-
-    auto kWeight = [&](const std::vector<float>& input) -> std::vector<float> {
-        std::vector<float> filtered = input;
-
-        {
-            const double fc = 1681.974450955533;
-            const double Q = 0.7071752369554196;
-            const double gainDb = 4.0;
-            const double A = std::pow(10.0, gainDb / 20.0);
-            const double K = std::tan(M_PI * fc / fs);
-            const double K2 = K * K;
-            const double Vh = A;
-            const double Vb = 1.0;
-
-            const double b0 = Vh + Vb * K / Q + K2;
-            const double b1 = 2.0 * (K2 - Vh);
-            const double b2 = Vh - Vb * K / Q + K2;
-            const double a0 = 1.0 + K / Q + K2;
-            const double a1 = 2.0 * (K2 - 1.0);
-            const double a2 = 1.0 - K / Q + K2;
-
-            filtered = calcBiquad(b0, b1, b2, a0, a1, a2, filtered);
-        }
-
-        {
-            const double fc = 38.1354708681762;
-            const double Q = 0.50032959205650;
-            const double K = std::tan(M_PI * fc / fs);
-            const double K2 = K * K;
-
-            const double b0 = 1.0;
-            const double b1 = -2.0;
-            const double b2 = 1.0;
-            const double a0 = 1.0 + K / Q + K2;
-            const double a1 = 2.0 * (K2 - 1.0);
-            const double a2 = 1.0 - K / Q + K2;
-
-            filtered = calcBiquad(b0, b1, b2, a0, a1, a2, filtered);
-        }
-
-        return filtered;
-    };
-
-    const bool hasStereoChannels = !buffer.channelSamples.empty() && buffer.channelSamples.size() >= 2;
-    std::vector<std::vector<float>> filteredChannels;
-    std::vector<float> filtered = kWeight(buffer.samples);
-
-    if (hasStereoChannels) {
-        filteredChannels.reserve(buffer.channelSamples.size());
-        for (const auto& channel : buffer.channelSamples) {
-            filteredChannels.push_back(kWeight(channel));
-        }
-    }
-
-    uint32_t blockSize = static_cast<uint32_t>(fs * 0.4);
-    uint32_t hopSize = static_cast<uint32_t>(fs * 0.1);
-    if (blockSize < 1024) blockSize = 1024;
-    if (hopSize < 256) hopSize = 256;
-
-    std::vector<float> blockLoudnesses;
-    if (hasStereoChannels && !filteredChannels.empty()) {
-        for (size_t start = 0; start + blockSize <= filteredChannels.front().size(); start += hopSize) {
-            float channelPowerSum = 0.f;
-            size_t validChannels = 0;
-            for (const auto& channel : filteredChannels) {
-                if (start + blockSize > channel.size()) {
-                    continue;
-                }
-
-                float meanSquare = 0.f;
-                for (size_t i = 0; i < blockSize; ++i) {
-                    const float s = channel[start + i];
-                    meanSquare += s * s;
-                }
-                meanSquare /= static_cast<float>(blockSize);
-                channelPowerSum += meanSquare;
-                ++validChannels;
-            }
-
-            if (validChannels == 0) {
-                continue;
-            }
-
-            float meanSquare = channelPowerSum / static_cast<float>(validChannels);
-            blockLoudnesses.push_back(CALIBRATION_CONST + 10.f * std::log10(std::max(meanSquare, 1e-10f)));
-        }
-    } else {
-        for (size_t start = 0; start + blockSize <= filtered.size(); start += hopSize) {
-            float meanSquare = 0.f;
-            for (size_t i = 0; i < blockSize; ++i) {
-                const float s = filtered[start + i];
-                meanSquare += s * s;
-            }
-            meanSquare /= static_cast<float>(blockSize);
-            blockLoudnesses.push_back(CALIBRATION_CONST + 10.f * std::log10(std::max(meanSquare, 1e-10f)));
-        }
-    }
-
-    if (blockLoudnesses.empty()) return -120.f;
-
-    float sumP = 0.f;
-    int cnt = 0;
-    for (float lk : blockLoudnesses) {
-        if (lk >= -70.f) {
-            sumP += std::pow(10.f, (lk - CALIBRATION_CONST) / 10.f);
-            ++cnt;
-        }
-    }
-    if (cnt == 0) return -120.f;
-
-    const float overallLUFS = CALIBRATION_CONST + 10.f * std::log10(sumP / cnt);
-    const float relGate = overallLUFS - 10.f;
-
-    float sumP2 = 0.f;
-    int cnt2 = 0;
-    for (float lk : blockLoudnesses) {
-        if (lk >= -70.f && lk >= relGate) {
-            sumP2 += std::pow(10.f, (lk - CALIBRATION_CONST) / 10.f);
-            ++cnt2;
-        }
-    }
-    if (cnt2 == 0) return -120.f;
-
-    const float finalLUFS = CALIBRATION_CONST + 10.f * std::log10(sumP2 / cnt2);
-    return std::max(-120.f, std::min(0.f, finalLUFS));
-}
-
-float MasteringEngine::calculateMakeupGain(const AudioBuffer& original,
-                                          float targetLUFS) const {
-    float originalLUFS = calculateLUFS(original);
-    float difference = targetLUFS - originalLUFS;
-    return difference;
-}
-
-} // namespace mastered
-// minor cleanup
