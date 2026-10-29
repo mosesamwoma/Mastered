@@ -1,43 +1,48 @@
-# Build artifacts (but keep .gitkeep)
-build/*
-!build/.gitkeep
-lib/*
-!lib/.gitkeep
-# Generated files
+# CMake build directories and generated files
+/build/*
+!/build/.gitkeep
+/lib/*
+!/lib/.gitkeep
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CMakeUserPresets.json
+CMakeLists.txt.user
+# Native build outputs
 *.o
 *.a
 *.so
 *.dylib
 *.dll
 *.exe
-# Audio files
+# Generated audio and mastering outputs
 *.wav
 *.mp3
 *.flac
-mastered_*.wav
-# Temporary files
-*.swp
-*.swo
-*~
-.DS_Store
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-# CMake
-CMakeUserPresets.json
-Makefile
-CMakeLists.txt.user
-CMakeCache.txt
-cmake_install.cmake
-CMakeFiles/
-# Generated results
-*.json
-result.json
-result2.json
+*_mastered.json
+result*.json
 mastering_result.json
 *_reaEQ.txt
 *_EqualizerAPO.txt
-*.pyc
-
+# Python caches, virtual environments, and local configuration
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

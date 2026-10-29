@@ -1,0 +1,49 @@
+# Git and local project metadata
+.git/
+.gitignore
+.dockerignore
+.github/
+.vscode/
+.idea/
+# Local build artifacts
+build/
+lib/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+# Native build outputs
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+# Test fixtures and generated audio
+test_audio/
+*.wav
+*.mp3
+*.flac
+*.json
+*_reaEQ.txt
+*_EqualizerAPO.txt
+# Python caches, environments, and local configuration
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.env.*
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+# Documentation and development-only files
+README.md
+*.md
+*.txt
+!web/requirements.txt
