@@ -46,4 +46,5 @@ env/
 README.md
 *.md
 *.txt
+!CMakeLists.txt
 !web/requirements.txt
