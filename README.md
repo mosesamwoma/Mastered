@@ -112,6 +112,15 @@ docker build -t mastered .
 docker run --rm -p 10000:10000 mastered
 ```
 
+With Docker Compose:
+
+```
+docker compose up --build
+```
+
+Open http://localhost:10000. Stop the service with `Ctrl+C`, or run
+`docker compose down` from another terminal.
+
 ### Deploy on Render (free)
 
 1. Push this folder to a GitHub repository.
