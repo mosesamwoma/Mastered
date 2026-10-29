@@ -41,7 +41,7 @@ env/
 *.tmp
 *.swp
 *.swo
-*~
+*~`
 # Documentation and development-only files
 README.md
 *.md
