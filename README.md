@@ -122,6 +122,31 @@ docker build -t mastered .
 docker run --rm -p 10000:10000 mastered
 ```
 
+### Run with Docker Compose
+
+Docker Compose is an alternative to running the container commands manually. It
+builds the image, starts the web app on port 10000, performs a health check, and
+stores uploaded files and job results in a named volume.
+
+Requires Docker Engine with the Compose plugin (`docker compose`):
+
+```
+docker compose -f docker-compose.yml up --build
+```
+
+Open http://localhost:10000. Stop the service with `Ctrl+C`, or run:
+
+```
+docker compose -f docker-compose.yml down
+```
+
+The named `mastered-data` volume keeps job data across container restarts. To
+remove the container and its stored data:
+
+```
+docker compose -f docker-compose.yml down --volumes
+```
+
 ### Deploy on Render (free)
 
 1. Push this folder to a GitHub repository.
@@ -268,7 +293,3 @@ The JSON report contains input, reference and output measurements, the makeup ga
 - Dynamics matching moves each band's level spread toward the reference; it is an approximation and a band is left alone when it already matches.
 - `--bitdepth 32` writes IEEE float. 32-bit integer PCM input is accepted and converted.
 - Bundled FFmpeg-based conversion is only as capable as the FFmpeg build installed on the server.
-
-## License
-
-MIT. See `LICENSE`.

@@ -8,6 +8,7 @@ services:
       - "10000:10000"
     environment:
       PORT: "10000"
+      WORK_DIR: /data
       MAX_FILE_MB: "60"
       MAX_DURATION_SEC: "420"
       MAX_PENDING_JOBS: "2"
@@ -24,3 +25,8 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    volumes:
+      - mastered-data:/data
+
+volumes:
+  mastered-data:
