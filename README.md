@@ -131,20 +131,20 @@ stores uploaded files and job results in a named volume.
 Requires Docker Engine with the Compose plugin (`docker compose`):
 
 ```
-docker compose -f docker-compose.yml up --build
+docker compose -f docker-compose.yaml up --build
 ```
 
 Open http://localhost:10000. Stop the service with `Ctrl+C`, or run:
 
 ```
-docker compose -f docker-compose.yml down
+docker compose -f docker-compose.yaml down
 ```
 
 The named `mastered-data` volume keeps job data across container restarts. To
 remove the container and its stored data:
 
 ```
-docker compose -f docker-compose.yml down --volumes
+docker compose -f docker-compose.yaml down --volumes
 ```
 
 ### Deploy on Render (free)
