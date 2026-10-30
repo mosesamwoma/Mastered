@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title>Mastered</title>
+  <rect width="64" height="64" rx="14" fill="#2457d6"/>
+  <path d="M10 35h7l4-16 7 30 7-38 7 28 4-10h8" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="5"/>
+</svg>
