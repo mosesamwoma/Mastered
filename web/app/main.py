@@ -1,29 +1,34 @@
+import os
 import re
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from .config import load_settings
-from .jobs import JobManager, QueueFull, describe_duration
+from .jobs import JobManager, QueueFull, RateLimited, describe_duration
+from .media import SOURCE_EXTENSIONS, MediaError, MediaTools
 from .middleware import BodySizeLimitMiddleware, SecurityHeadersMiddleware
+from .ratelimit import RateLimitMiddleware, client_key
 from .wav_info import WavError, inspect_wav
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024
 BIT_DEPTHS = (0, 16, 24, 32)
 
 settings = load_settings()
-manager = JobManager(settings)
+media = MediaTools(settings.ffmpeg_path, settings.ffprobe_path)
+manager = JobManager(settings, media)
 
 
 @asynccontextmanager
 async def lifespan(_app):
+    await media.detect_preview_codec()
     await manager.start()
     try:
         yield
@@ -36,6 +41,12 @@ app.add_middleware(
     BodySizeLimitMiddleware,
     max_bytes=settings.max_file_bytes * 2 + BODY_OVERHEAD_BYTES,
     path="/api/jobs",
+)
+app.add_middleware(
+    RateLimitMiddleware,
+    requests_per_minute=settings.api_requests_per_minute,
+    uploads_per_hour=settings.upload_attempts_per_hour,
+    header=settings.client_ip_header,
 )
 app.add_middleware(SecurityHeadersMiddleware)
 
@@ -54,22 +65,52 @@ def copy_limited(source, destination, limit):
     return written
 
 
-async def store_upload(upload, destination, label):
+def check_duration(seconds, label):
+    if seconds < 1.0:
+        raise HTTPException(400, f"The {label} file must be at least one second long")
+    if seconds > settings.max_duration_sec:
+        raise HTTPException(413, f"The {label} file is longer than {describe_duration(settings.max_duration_sec)}")
+
+
+async def classify_upload(raw, wav, label):
     try:
-        size = await run_in_threadpool(copy_limited, upload.file, destination, settings.max_file_bytes)
+        info = await run_in_threadpool(inspect_wav, raw)
+    except WavError as error:
+        wav_problem = str(error)
+    else:
+        check_duration(info.duration, label)
+        await run_in_threadpool(os.replace, raw, wav)
+        return {"convert": False}
+    if not media.available:
+        raise HTTPException(
+            400,
+            f"The {label} file is not a usable WAV file ({wav_problem}). Only WAV files are supported on this server.",
+        )
+    try:
+        probe = await media.probe(raw)
+    except MediaError as error:
+        raise HTTPException(400, f"The {label} file is not a supported audio file: {error}.") from None
+    check_duration(probe.duration, label)
+    return {
+        "convert": True,
+        "codec": probe.codec,
+        "channels": probe.channels,
+        "sample_rate": probe.sample_rate,
+        "bits": probe.bits,
+        "duration": probe.duration,
+    }
+
+
+async def store_upload(upload, directory, label):
+    raw = directory / f"{label}.src"
+    try:
+        size = await run_in_threadpool(copy_limited, upload.file, raw, settings.max_file_bytes)
     except OverflowError:
         limit_mb = settings.max_file_bytes / (1024 * 1024)
         raise HTTPException(413, f"The {label} file is larger than {limit_mb:g} MB") from None
     if size == 0:
         raise HTTPException(400, f"The {label} file is empty")
-    try:
-        info = await run_in_threadpool(inspect_wav, destination)
-    except WavError as error:
-        raise HTTPException(400, f"The {label} file is not a usable WAV file: {error}") from None
-    if info.duration < 1.0:
-        raise HTTPException(400, f"The {label} file must be at least one second long")
-    if info.duration > settings.max_duration_sec:
-        raise HTTPException(413, f"The {label} file is longer than {describe_duration(settings.max_duration_sec)}")
+    return await classify_upload(raw, directory / f"{label}.wav", label)
 
 
 def build_engine_arguments(
@@ -95,7 +136,7 @@ def build_engine_arguments(
     if bit_depth:
         arguments += ["--bitdepth", str(bit_depth)]
     if precision == "fast":
-        arguments += ["--passes", "4", "--tolerance", "0.25"]
+        arguments += ["--passes", "4", "--tolerance", "0.25", "--fast-peak"]
     elif precision == "high":
         arguments += ["--passes", "15", "--tolerance", "0.05"]
     if dynamics:
@@ -113,11 +154,11 @@ def build_engine_arguments(
     return arguments
 
 
-def require_job(job_id):
-    job = manager.get(job_id) if JOB_ID.match(job_id) else None
-    if job is None or job.status == "uploading":
+async def require_job(job_id):
+    row = await manager.row(job_id) if JOB_ID.match(job_id) else None
+    if row is None or row["cancel"] or row["status"] == "uploading":
         raise HTTPException(404, "Job not found or expired")
-    return job
+    return row
 
 
 @app.get("/api/health")
@@ -133,11 +174,15 @@ async def public_config():
         "maxDurationSec": settings.max_duration_sec,
         "maxPendingJobs": settings.max_pending_jobs,
         "resultMinutes": settings.job_ttl_sec // 60,
+        "jobsPerHour": settings.jobs_per_hour_per_client,
+        "formats": list(SOURCE_EXTENSIONS) if media.available else [".wav"],
+        "preview": media.preview_codec is not None,
     }
 
 
 @app.post("/api/jobs", status_code=202)
 async def create_job(
+    request: Request,
     reference: UploadFile = File(...),
     track: UploadFile = File(...),
     target_lufs: float = Form(-14.0, ge=-60.0, le=-1.0),
@@ -159,39 +204,56 @@ async def create_job(
         target_lufs, aggressiveness, ceiling_db, bands, bit_depth, precision,
         dynamics, soft_clip, dither, noise_shaping, mid_side, match_width,
     )
+    client = client_key(request.scope, settings.client_ip_header)
     try:
-        job = manager.reserve(track.filename or "track.wav", arguments)
+        job_id = await manager.reserve(track.filename or "track.wav", arguments, client)
     except QueueFull:
-        raise HTTPException(429, "The server is busy. Please try again in a few minutes.") from None
+        raise HTTPException(
+            429, "The server is busy. Please try again in a few minutes.", headers={"Retry-After": "60"}
+        ) from None
+    except RateLimited as error:
+        raise HTTPException(429, error.message, headers={"Retry-After": str(error.retry_after)}) from None
+    directory = manager.job_directory(job_id)
     try:
-        await store_upload(reference, job.reference_path, "reference")
-        await store_upload(track, job.track_path, "track")
+        sources = {
+            "reference": await store_upload(reference, directory, "reference"),
+            "track": await store_upload(track, directory, "track"),
+        }
+        await manager.set_sources(job_id, sources)
     except BaseException:
-        await manager.remove(job.id)
+        await manager.discard(job_id)
         raise
-    manager.enqueue(job)
-    return JSONResponse(
-        {"id": job.id, "status": job.status, "position": manager.position(job.id)},
-        status_code=202,
-    )
+    await manager.enqueue(job_id)
+    view = await manager.view(await manager.row(job_id))
+    return JSONResponse({"id": job_id, "status": view["status"], "position": view.get("position", 0)}, status_code=202)
 
 
 @app.get("/api/jobs/{job_id}")
 async def job_status(job_id: str):
-    return manager.view(require_job(job_id))
+    return await manager.view(await require_job(job_id))
 
 
 @app.get("/api/jobs/{job_id}/download")
 async def job_download(job_id: str):
-    job = require_job(job_id)
-    if job.status != "done" or not job.output_path.is_file():
+    row = await require_job(job_id)
+    path = manager.job_directory(job_id) / "mastered.wav"
+    if row["status"] != "done" or not path.is_file():
         raise HTTPException(409, "The mastered file is not ready")
-    return FileResponse(job.output_path, media_type="audio/wav", filename=job.download_name)
+    return FileResponse(path, media_type="audio/wav", filename=(await manager.view(row))["downloadName"])
+
+
+@app.get("/api/jobs/{job_id}/audio/{version}")
+async def job_audio(job_id: str, version: Literal["original", "mastered"]):
+    row = await require_job(job_id)
+    path = manager.job_directory(job_id) / f"{version}.{media.preview_extension}"
+    if row["status"] != "done" or not row["preview"] or not path.is_file():
+        raise HTTPException(404, "No preview is available for this job")
+    return FileResponse(path, media_type=media.preview_media_type)
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
 async def job_delete(job_id: str):
-    require_job(job_id)
+    await require_job(job_id)
     await manager.remove(job_id)
 
 
