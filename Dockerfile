@@ -15,8 +15,12 @@ RUN cmake -S . -B build \
 FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=10000
-RUN useradd --create-home --uid 10001 app
+    PORT=10000 \
+    CLIENT_IP_HEADER=cf-connecting-ip
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 app
 WORKDIR /app
 COPY web/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

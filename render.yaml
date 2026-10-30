@@ -6,13 +6,27 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     envVars:
+      - key: CLIENT_IP_HEADER
+        value: cf-connecting-ip
       - key: MAX_FILE_MB
         value: "60"
       - key: MAX_DURATION_SEC
         value: "420"
       - key: MAX_PENDING_JOBS
         value: "2"
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: PENDING_PER_CLIENT
+        value: "1"
+      - key: JOBS_PER_HOUR_PER_CLIENT
+        value: "6"
+      - key: API_REQUESTS_PER_MINUTE
+        value: "240"
+      - key: UPLOAD_ATTEMPTS_PER_HOUR
+        value: "30"
       - key: JOB_TTL_MINUTES
         value: "20"
       - key: JOB_TIMEOUT_SEC
         value: "1800"
+      - key: CONVERT_TIMEOUT_SEC
+        value: "300"
