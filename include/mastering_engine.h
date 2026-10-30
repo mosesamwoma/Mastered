@@ -5,6 +5,7 @@
 #include "loudness.h"
 #include "spectrum.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -31,6 +32,7 @@ struct MasteringConfig {
     double dynamicsThresholdOffsetDb = 0.0;
     bool softClip = false;
     double softClipKneeDb = 3.0;
+    bool accuratePeak = true;
     double limiterLookaheadMs = 3.0;
     double limiterReleaseMs = 80.0;
     uint16_t bitDepth = 0;
@@ -54,6 +56,8 @@ struct Analysis {
     CurveFit mid;
     CurveFit side;
     double sideGainDb = 0.0;
+    std::array<double, 3> inputSpreadDb{{0.0, 0.0, 0.0}};
+    std::array<double, 3> referenceSpreadDb{{0.0, 0.0, 0.0}};
     uint32_t sampleRate = 0;
     uint16_t channels = 0;
     uint64_t frames = 0;

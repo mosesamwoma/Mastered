@@ -55,17 +55,30 @@ private:
     LR4 align_;
 };
 
+struct BandStatistics {
+    double meanDb = -90.0;
+    double p10Db = -90.0;
+    double p50Db = -90.0;
+    double p95Db = -90.0;
+
+    double spreadDb() const { return p95Db - p50Db; }
+};
+
 class BandLevelMeter {
 public:
     BandLevelMeter(double sampleRate, double lowHz, double highHz);
 
     void process(const AudioBlock& block, size_t frames);
-    std::array<double, 3> rmsDb() const;
+    std::array<BandStatistics, 3> statistics() const;
 
 private:
     ThreeBandSplitter splitter_;
-    std::array<double, 3> sums_{{0.0, 0.0, 0.0}};
-    double count_ = 0.0;
+    size_t blockFrames_;
+    size_t blockFilled_ = 0;
+    std::array<double, 3> blockSums_{{0.0, 0.0, 0.0}};
+    std::array<double, 3> totalSums_{{0.0, 0.0, 0.0}};
+    double totalFrames_ = 0.0;
+    std::array<std::vector<double>, 3> levels_;
 };
 
 class MultibandCompressor {
@@ -82,7 +95,7 @@ private:
     std::vector<ThreeBandSplitter> splitters_;
     std::array<double, 3> attack_{{0.0, 0.0, 0.0}};
     std::array<double, 3> release_{{0.0, 0.0, 0.0}};
-    std::array<double, 3> envelope_{{0.0, 0.0, 0.0}};
+    std::array<double, 3> power_{{0.0, 0.0, 0.0}};
 };
 
 class SoftClipper {

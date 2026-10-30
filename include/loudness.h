@@ -11,12 +11,21 @@
 namespace mastered {
 
 struct OversamplingKernel {
-    std::array<std::array<double, kTruePeakTaps>, 4> phases;
+    size_t factor = 4;
+    size_t tapsPerPhase = 24;
+    size_t delay = 12;
+    size_t firstPhase = 1;
     double bound = 1.0;
+    std::vector<double> coefficients;
+
+    const double* phase(size_t index) const { return coefficients.data() + index * tapsPerPhase; }
 };
 
-const OversamplingKernel& oversamplingKernel();
-double truePeakOfWindow(const double* window);
+enum class PeakMode { Off, Standard, Accurate };
+
+const OversamplingKernel& standardKernel();
+const OversamplingKernel& accurateKernel();
+double truePeakOfWindow(const double* window, const OversamplingKernel& kernel);
 double channelWeight(size_t index, size_t channels);
 
 struct LoudnessResult {
@@ -49,7 +58,7 @@ private:
 
 class TruePeakMeter {
 public:
-    explicit TruePeakMeter(size_t channels);
+    TruePeakMeter(size_t channels, const OversamplingKernel& kernel);
 
     void process(const AudioBlock& block, size_t frames);
     void finish();
@@ -58,6 +67,7 @@ public:
 
 private:
     size_t channels_;
+    const OversamplingKernel& kernel_;
     std::vector<std::vector<double>> history_;
     std::vector<size_t> hot_;
     std::vector<double> work_;
@@ -75,14 +85,14 @@ struct Measurements {
 
 class Meter {
 public:
-    Meter(double sampleRate, size_t channels, bool measureTruePeak = true);
+    Meter(double sampleRate, size_t channels, PeakMode peakMode = PeakMode::Standard);
 
     void process(const AudioBlock& block, size_t frames);
     Measurements finish();
 
 private:
     size_t channels_;
-    bool measureTruePeak_;
+    PeakMode peakMode_;
     LoudnessMeter loudness_;
     TruePeakMeter truePeak_;
     double leftEnergy_ = 0.0;

@@ -17,7 +17,5 @@ constexpr uint16_t kMaxChannels = 8;
 constexpr size_t kBlockFrames = 4096;
 constexpr double kSilenceLufs = -120.0;
 constexpr double kLimiterMarginDb = 0.3;
-constexpr size_t kTruePeakTaps = 24;
-constexpr size_t kTruePeakDelay = 12;
 
 }

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "constants.h"
+#include "loudness.h"
 #include "types.h"
 
 #include <array>
@@ -21,6 +21,7 @@ public:
 
 private:
     size_t channels_;
+    const OversamplingKernel* kernel_ = nullptr;
     size_t lookahead_;
     size_t latency_;
     double ceiling_;

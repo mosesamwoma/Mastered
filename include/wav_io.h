@@ -40,7 +40,8 @@ private:
 
 class WavWriter {
 public:
-    WavWriter(const std::string& path, uint32_t sampleRate, uint16_t channels, uint16_t bitDepth, bool dither, bool noiseShaping);
+    WavWriter(const std::string& path, uint32_t sampleRate, uint16_t channels, uint16_t bitDepth, bool dither, bool noiseShaping,
+              uint64_t sizeLimit = 0xFFFFFFFEULL);
     WavWriter(const WavWriter&) = delete;
     WavWriter& operator=(const WavWriter&) = delete;
     ~WavWriter();
@@ -62,6 +63,7 @@ private:
     uint16_t bitDepth_;
     bool dither_;
     bool noiseShaping_;
+    uint64_t sizeLimit_;
     bool finalized_ = false;
     uint64_t dataBytes_ = 0;
     uint64_t framesWritten_ = 0;
