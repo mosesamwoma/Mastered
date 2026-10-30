@@ -21,14 +21,16 @@
       <div class="field">
         <label for="reference">Reference song</label>
         <input id="reference" name="reference" type="file" accept=".wav,audio/wav,audio/x-wav">
-        <small>A finished track whose sound you like (WAV).</small>
+        <small>A finished track whose sound you like.</small>
       </div>
       <div class="field">
         <label for="track">Your track</label>
         <input id="track" name="track" type="file" accept=".wav,audio/wav,audio/x-wav">
-        <small>The mix you want to master (WAV).</small>
+        <small>The mix you want to master.</small>
       </div>
     </div>
+
+    <p id="formats-hint" class="hint"></p>
 
     <div class="grid two">
       <div class="field">
@@ -110,6 +112,24 @@
     <h2>Your master is ready</h2>
     <p><a id="download" class="button primary" href="#" download>Download WAV</a></p>
     <ul id="warnings" class="warnings" hidden></ul>
+
+    <section id="player" class="player" hidden aria-label="Listen to the result">
+      <h3>Listen</h3>
+      <div id="player-media"></div>
+      <div class="player-row">
+        <button id="play" type="button" class="primary">Play</button>
+        <input id="seek" type="range" min="0" max="1000" step="1" value="0" aria-label="Seek">
+        <span id="time" class="time">0:00 / 0:00</span>
+      </div>
+      <div class="player-row">
+        <div class="segmented" role="group" aria-label="Which version to hear">
+          <button id="hear-original" type="button" aria-pressed="false">Original</button>
+          <button id="hear-mastered" type="button" aria-pressed="true">Mastered</button>
+        </div>
+        <label class="inline"><input type="checkbox" id="match-level" checked> Match loudness</label>
+      </div>
+      <p id="player-note" class="hint" role="status"></p>
+    </section>
 
     <h3>Measurements</h3>
     <div class="table-wrap">

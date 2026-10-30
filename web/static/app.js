@@ -46,6 +46,16 @@
   const gainSummary = byId('gain-summary');
   const chartsContainer = byId('charts');
   const againButton = byId('again');
+  const formatsHint = byId('formats-hint');
+  const playerSection = byId('player');
+  const playerMedia = byId('player-media');
+  const playButton = byId('play');
+  const seekInput = byId('seek');
+  const timeLabel = byId('time');
+  const hearOriginal = byId('hear-original');
+  const hearMastered = byId('hear-mastered');
+  const matchLevel = byId('match-level');
+  const playerNote = byId('player-note');
   const panels = [form, progressPanel, errorPanel, resultPanel];
 
   let limits = null;
@@ -54,6 +64,7 @@
   let pollFailures = 0;
   let activeUpload = null;
   let busy = false;
+  let player = null;
 
   function readStorage() {
     try {
@@ -73,6 +84,10 @@
     } catch (error) {
       return;
     }
+  }
+
+  function ignore() {
+    return undefined;
   }
 
   function delay(ms) {
@@ -156,6 +171,15 @@
     return false;
   }
 
+  function allowedFormats() {
+    return limits && Array.isArray(limits.formats) && limits.formats.length > 0 ? limits.formats : ['.wav'];
+  }
+
+  function hasAllowedExtension(name) {
+    const lower = name.toLowerCase();
+    return allowedFormats().some((extension) => lower.endsWith(extension));
+  }
+
   function checkInputs() {
     const files = [
       ['The reference song', referenceInput.files[0]],
@@ -163,10 +187,10 @@
     ];
     for (const [label, file] of files) {
       if (!file) {
-        return label + ' is missing. Choose a WAV file.';
+        return label + ' is missing. Choose an audio file.';
       }
-      if (!/\.wav$/i.test(file.name)) {
-        return label + ' must be a WAV file.';
+      if (!hasAllowedExtension(file.name)) {
+        return label + ' must be one of: ' + allowedFormats().map((item) => item.slice(1).toUpperCase()).join(', ') + '.';
       }
       if (file.size === 0) {
         return label + ' is empty.';
@@ -241,6 +265,7 @@
   }
 
   function backToForm() {
+    teardownPlayer();
     stopPolling();
     busy = false;
     jobId = null;
@@ -251,6 +276,7 @@
   }
 
   function showError(message) {
+    teardownPlayer();
     stopPolling();
     busy = false;
     errorMessage.textContent = message;
@@ -479,6 +505,261 @@
     chartsContainer.appendChild(block);
   }
 
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      return '0:00';
+    }
+    const total = Math.floor(seconds);
+    return Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0');
+  }
+
+  function levelMatchGains(report) {
+    const gains = { original: 1, mastered: 1 };
+    const before = report.input.measurements.integratedLufs;
+    const after = report.output.measurements.integratedLufs;
+    if (typeof before === 'number' && typeof after === 'number' && before > -100 && after > -100) {
+      const difference = after - before;
+      if (difference > 0) {
+        gains.mastered = Math.pow(10, -difference / 20);
+      } else {
+        gains.original = Math.pow(10, difference / 20);
+      }
+    }
+    return gains;
+  }
+
+  function setPlayerNote(text) {
+    playerNote.textContent = text;
+  }
+
+  function createAudio(source) {
+    const audio = document.createElement('audio');
+    audio.preload = 'auto';
+    audio.src = source;
+    return audio;
+  }
+
+  function applyLevels() {
+    if (!player) {
+      return;
+    }
+    ['original', 'mastered'].forEach((name) => {
+      const active = player.active === name;
+      const level = active ? (player.match ? player.gains[name] : 1) : 0;
+      if (player.nodes) {
+        player.nodes[name].gain.setTargetAtTime(level, player.context.currentTime, 0.015);
+      } else {
+        player[name].muted = !active;
+        player[name].volume = Math.min(1, level);
+      }
+    });
+    hearOriginal.setAttribute('aria-pressed', String(player.active === 'original'));
+    hearMastered.setAttribute('aria-pressed', String(player.active === 'mastered'));
+  }
+
+  function ensureGraph() {
+    if (player.nodes || player.graphFailed) {
+      return;
+    }
+    const Context = window.AudioContext || window.webkitAudioContext;
+    if (!Context) {
+      player.graphFailed = true;
+      return;
+    }
+    let context = null;
+    try {
+      context = new Context();
+      const nodes = {};
+      ['original', 'mastered'].forEach((name) => {
+        const source = context.createMediaElementSource(player[name]);
+        const gain = context.createGain();
+        source.connect(gain);
+        gain.connect(context.destination);
+        nodes[name] = gain;
+      });
+      player.context = context;
+      player.nodes = nodes;
+      ['original', 'mastered'].forEach((name) => {
+        player[name].muted = false;
+        player[name].volume = 1;
+      });
+    } catch (error) {
+      player.graphFailed = true;
+      if (context) {
+        context.close().then(ignore, ignore);
+      }
+    }
+  }
+
+  function refreshTime() {
+    if (!player) {
+      return;
+    }
+    const clock = player.mastered;
+    const duration = Number.isFinite(clock.duration) ? clock.duration : 0;
+    if (!player.dragging) {
+      seekInput.value = duration > 0 ? String(Math.round((clock.currentTime / duration) * 1000)) : '0';
+    }
+    timeLabel.textContent = formatTime(clock.currentTime) + ' / ' + formatTime(duration);
+  }
+
+  function setPlaying(playing) {
+    player.playing = playing;
+    playButton.textContent = playing ? 'Pause' : 'Play';
+  }
+
+  function pausePlayer() {
+    player.original.pause();
+    player.mastered.pause();
+    setPlaying(false);
+  }
+
+  async function togglePlay() {
+    if (!player) {
+      return;
+    }
+    if (player.playing) {
+      pausePlayer();
+      return;
+    }
+    ensureGraph();
+    if (player.context && player.context.state === 'suspended') {
+      try {
+        await player.context.resume();
+      } catch (error) {
+        setPlayerNote('The browser blocked audio playback. Tap Play again.');
+        return;
+      }
+    }
+    const duration = Number.isFinite(player.mastered.duration) ? player.mastered.duration : 0;
+    if (player.mastered.ended || (duration > 0 && player.mastered.currentTime >= duration - 0.05)) {
+      player.mastered.currentTime = 0;
+    }
+    player.original.currentTime = player.mastered.currentTime;
+    applyLevels();
+    setPlayerNote('');
+    try {
+      await Promise.all([player.mastered.play(), player.original.play()]);
+      setPlaying(true);
+    } catch (error) {
+      pausePlayer();
+      setPlayerNote('Playback could not start. Tap Play again.');
+    }
+    refreshTime();
+  }
+
+  function onSeek() {
+    if (!player) {
+      return;
+    }
+    const duration = Number.isFinite(player.mastered.duration) ? player.mastered.duration : 0;
+    if (duration > 0) {
+      const target = (Number(seekInput.value) / 1000) * duration;
+      player.mastered.currentTime = target;
+      player.original.currentTime = target;
+    }
+    refreshTime();
+  }
+
+  function onTimeUpdate() {
+    if (!player) {
+      return;
+    }
+    if (player.playing && Math.abs(player.original.currentTime - player.mastered.currentTime) > 0.2) {
+      player.original.currentTime = player.mastered.currentTime;
+    }
+    refreshTime();
+  }
+
+  function onEnded() {
+    if (!player) {
+      return;
+    }
+    player.original.pause();
+    setPlaying(false);
+    refreshTime();
+  }
+
+  function onMediaError() {
+    if (player) {
+      pausePlayer();
+      setPlayerNote('The preview could not be loaded. You can still download the WAV file.');
+    }
+  }
+
+  function chooseVersion(name) {
+    if (!player) {
+      return;
+    }
+    player.active = name;
+    applyLevels();
+  }
+
+  function setupPlayer(job, report) {
+    teardownPlayer();
+    if (!job.preview) {
+      playerSection.hidden = true;
+      return;
+    }
+    const original = createAudio(job.preview.original);
+    const mastered = createAudio(job.preview.mastered);
+    player = {
+      original,
+      mastered,
+      active: 'mastered',
+      match: matchLevel.checked,
+      gains: levelMatchGains(report),
+      context: null,
+      nodes: null,
+      graphFailed: false,
+      playing: false,
+      dragging: false,
+    };
+    mastered.addEventListener('timeupdate', onTimeUpdate);
+    mastered.addEventListener('durationchange', refreshTime);
+    mastered.addEventListener('loadedmetadata', refreshTime);
+    mastered.addEventListener('ended', onEnded);
+    mastered.addEventListener('error', onMediaError);
+    original.addEventListener('error', onMediaError);
+    playerMedia.replaceChildren(original, mastered);
+    const before = report.input.measurements.integratedLufs;
+    const after = report.output.measurements.integratedLufs;
+    const louder = typeof before === 'number' && typeof after === 'number' && before > -100 && after > -100 ? after - before : 0;
+    setPlayerNote(
+      Math.abs(louder) >= 0.1
+        ? 'The mastered version is ' + Math.abs(louder).toFixed(1) + ' dB ' + (louder > 0 ? 'louder' : 'quieter') +
+          ' than your original. Match loudness compares them at the same volume.'
+        : ''
+    );
+    setPlaying(false);
+    applyLevels();
+    refreshTime();
+    playerSection.hidden = false;
+  }
+
+  function teardownPlayer() {
+    if (!player) {
+      playerSection.hidden = true;
+      return;
+    }
+    const current = player;
+    player = null;
+    ['original', 'mastered'].forEach((name) => {
+      current[name].pause();
+      current[name].removeAttribute('src');
+      current[name].load();
+    });
+    if (current.context) {
+      current.context.close().then(ignore, ignore);
+    }
+    playerMedia.replaceChildren();
+    playButton.textContent = 'Play';
+    seekInput.value = '0';
+    timeLabel.textContent = '0:00 / 0:00';
+    setPlayerNote('');
+    playerSection.hidden = true;
+  }
+
   function showResult(job) {
     stopPolling();
     busy = false;
@@ -501,6 +782,7 @@
     }
     downloadLink.href = job.downloadUrl;
     downloadLink.setAttribute('download', job.downloadName);
+    setupPlayer(job, report);
     show(resultPanel);
   }
 
@@ -518,6 +800,26 @@
     cancelButton.addEventListener('click', onCancel);
     retryButton.addEventListener('click', onRetry);
     againButton.addEventListener('click', onAgain);
+    playButton.addEventListener('click', togglePlay);
+    seekInput.addEventListener('input', onSeek);
+    seekInput.addEventListener('pointerdown', () => {
+      if (player) {
+        player.dragging = true;
+      }
+    });
+    seekInput.addEventListener('pointerup', () => {
+      if (player) {
+        player.dragging = false;
+      }
+    });
+    hearOriginal.addEventListener('click', () => chooseVersion('original'));
+    hearMastered.addEventListener('click', () => chooseVersion('mastered'));
+    matchLevel.addEventListener('change', () => {
+      if (player) {
+        player.match = matchLevel.checked;
+        applyLevels();
+      }
+    });
     show(form);
     const ready = await loadConfig();
     if (!ready) {
@@ -525,8 +827,13 @@
       return;
     }
     setStatus('');
+    const extensions = allowedFormats();
+    referenceInput.setAttribute('accept', extensions.join(',') + ',audio/*');
+    trackInput.setAttribute('accept', extensions.join(',') + ',audio/*');
+    formatsHint.textContent = 'Accepted files: ' + extensions.map((item) => item.slice(1).toUpperCase()).join(', ') + '.';
     limitsText.textContent =
-      'Limits: ' + limits.maxFileMb + ' MB and ' + Math.round(limits.maxDurationSec / 60) + ' minutes per file.';
+      'Limits: ' + limits.maxFileMb + ' MB and ' + Math.round(limits.maxDurationSec / 60) + ' minutes per file, ' +
+      limits.jobsPerHour + ' jobs per hour.';
     submitButton.disabled = false;
     const saved = readStorage();
     if (saved) {
