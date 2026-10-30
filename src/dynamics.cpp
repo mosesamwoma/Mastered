@@ -36,7 +36,20 @@ void ThreeBandSplitter::split(double x, double* out) {
     out[2] = high;
 }
 
-BandLevelMeter::BandLevelMeter(double sampleRate, double lowHz, double highHz) : splitter_(lowHz, highHz, sampleRate) {}
+namespace {
+
+double percentileOf(const std::vector<double>& sorted, double fraction) {
+    const double position = fraction * static_cast<double>(sorted.size() - 1);
+    const size_t lower = static_cast<size_t>(std::floor(position));
+    const size_t upper = std::min(lower + 1, sorted.size() - 1);
+    const double weight = position - static_cast<double>(lower);
+    return sorted[lower] * (1.0 - weight) + sorted[upper] * weight;
+}
+
+}
+
+BandLevelMeter::BandLevelMeter(double sampleRate, double lowHz, double highHz)
+    : splitter_(lowHz, highHz, sampleRate), blockFrames_(static_cast<size_t>(std::llround(sampleRate * 0.2))) {}
 
 void BandLevelMeter::process(const AudioBlock& block, size_t frames) {
     const size_t channels = block.size();
@@ -49,21 +62,50 @@ void BandLevelMeter::process(const AudioBlock& block, size_t frames) {
         double bands[3];
         splitter_.split(x, bands);
         for (size_t b = 0; b < 3; ++b) {
-            sums_[b] += bands[b] * bands[b];
+            const double power = bands[b] * bands[b];
+            blockSums_[b] += power;
+            totalSums_[b] += power;
         }
-        count_ += 1.0;
+        totalFrames_ += 1.0;
+        if (++blockFilled_ == blockFrames_) {
+            for (size_t b = 0; b < 3; ++b) {
+                levels_[b].push_back(10.0 * std::log10(std::max(blockSums_[b] / static_cast<double>(blockFrames_), 1e-12)));
+                blockSums_[b] = 0.0;
+            }
+            blockFilled_ = 0;
+        }
     }
 }
 
-std::array<double, 3> BandLevelMeter::rmsDb() const {
-    std::array<double, 3> out{{-90.0, -90.0, -90.0}};
-    if (count_ <= 0.0) {
-        return out;
-    }
+std::array<BandStatistics, 3> BandLevelMeter::statistics() const {
+    std::array<BandStatistics, 3> result;
     for (size_t b = 0; b < 3; ++b) {
-        out[b] = std::max(-90.0, 10.0 * std::log10(std::max(sums_[b] / count_, 1e-12)));
+        if (totalFrames_ > 0.0) {
+            result[b].meanDb = std::max(-90.0, 10.0 * std::log10(std::max(totalSums_[b] / totalFrames_, 1e-12)));
+        }
+        std::vector<double> audible;
+        for (double level : levels_[b]) {
+            if (level > -80.0) {
+                audible.push_back(level);
+            }
+        }
+        if (audible.empty()) {
+            continue;
+        }
+        std::sort(audible.begin(), audible.end());
+        const double gate = percentileOf(audible, 0.95) - 40.0;
+        std::vector<double> gated;
+        for (double level : audible) {
+            if (level >= gate) {
+                gated.push_back(level);
+            }
+        }
+        const std::vector<double>& used = gated.size() >= 5 ? gated : audible;
+        result[b].p10Db = percentileOf(used, 0.10);
+        result[b].p50Db = percentileOf(used, 0.50);
+        result[b].p95Db = percentileOf(used, 0.95);
     }
-    return out;
+    return result;
 }
 
 MultibandCompressor::MultibandCompressor(const DynamicsSettings& settings, double sampleRate, size_t channels)
@@ -101,14 +143,14 @@ void MultibandCompressor::process(AudioBlock& block, size_t frames) {
         for (size_t ch = 0; ch < channels_; ++ch) {
             splitters_[ch].split(block[ch][i], bandSamples[ch]);
             for (size_t b = 0; b < 3; ++b) {
-                level[b] = std::max(level[b], std::fabs(bandSamples[ch][b]));
+                level[b] = std::max(level[b], bandSamples[ch][b] * bandSamples[ch][b]);
             }
         }
         double gain[3];
         for (size_t b = 0; b < 3; ++b) {
-            const double coefficient = level[b] > envelope_[b] ? attack_[b] : release_[b];
-            envelope_[b] = coefficient * envelope_[b] + (1.0 - coefficient) * level[b];
-            gain[b] = gainFor(b, envelope_[b]);
+            const double coefficient = level[b] > power_[b] ? attack_[b] : release_[b];
+            power_[b] = coefficient * power_[b] + (1.0 - coefficient) * level[b];
+            gain[b] = gainFor(b, std::sqrt(power_[b]));
         }
         for (size_t ch = 0; ch < channels_; ++ch) {
             block[ch][i] = bandSamples[ch][0] * gain[0] + bandSamples[ch][1] * gain[1] + bandSamples[ch][2] * gain[2];

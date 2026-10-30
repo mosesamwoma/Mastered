@@ -24,35 +24,40 @@ double besselI0(double x) {
     return sum;
 }
 
-OversamplingKernel buildKernel() {
-    constexpr int taps = static_cast<int>(4 * kTruePeakTaps);
-    constexpr int centre = taps / 2;
-    constexpr double beta = 6.0;
-    std::array<double, static_cast<size_t>(taps)> h{};
+OversamplingKernel buildKernel(size_t factor, size_t tapsPerPhase, double beta) {
+    const size_t taps = factor * tapsPerPhase;
+    const long centre = static_cast<long>(taps / 2);
+    const long step = static_cast<long>(factor);
     const double norm = besselI0(beta);
-    for (int n = 0; n < taps; ++n) {
-        const int offset = n - centre;
-        if (offset % 4 == 0) {
+    std::vector<double> h(taps, 0.0);
+    for (size_t n = 0; n < taps; ++n) {
+        const long offset = static_cast<long>(n) - centre;
+        if (offset % step == 0) {
             h[n] = offset == 0 ? 1.0 : 0.0;
             continue;
         }
-        const double x = static_cast<double>(offset) / 4.0;
+        const double x = static_cast<double>(offset) / static_cast<double>(factor);
         const double sinc = std::sin(kPi * x) / (kPi * x);
         const double r = static_cast<double>(offset) / static_cast<double>(centre);
         const double window = besselI0(beta * std::sqrt(std::max(0.0, 1.0 - r * r))) / norm;
         h[n] = sinc * window;
     }
     OversamplingKernel kernel;
+    kernel.factor = factor;
+    kernel.tapsPerPhase = tapsPerPhase;
+    kernel.delay = tapsPerPhase / 2;
+    kernel.firstPhase = 1;
     kernel.bound = 1.0;
-    for (int p = 0; p < 4; ++p) {
+    kernel.coefficients.assign(taps, 0.0);
+    for (size_t p = 0; p < factor; ++p) {
         double sum = 0.0;
-        for (size_t m = 0; m < kTruePeakTaps; ++m) {
-            sum += h[4 * m + static_cast<size_t>(p)];
+        for (size_t m = 0; m < tapsPerPhase; ++m) {
+            sum += h[factor * m + p];
         }
         double absolute = 0.0;
-        for (size_t m = 0; m < kTruePeakTaps; ++m) {
-            const double value = h[4 * m + static_cast<size_t>(p)] / sum;
-            kernel.phases[static_cast<size_t>(p)][m] = value;
+        for (size_t m = 0; m < tapsPerPhase; ++m) {
+            const double value = h[factor * m + p] / sum;
+            kernel.coefficients[p * tapsPerPhase + (tapsPerPhase - 1 - m)] = value;
             absolute += std::fabs(value);
         }
         kernel.bound = std::max(kernel.bound, absolute);
@@ -105,18 +110,24 @@ double percentile(const std::vector<double>& sorted, double fraction) {
 
 }
 
-const OversamplingKernel& oversamplingKernel() {
-    static const OversamplingKernel kernel = buildKernel();
+const OversamplingKernel& standardKernel() {
+    static const OversamplingKernel kernel = buildKernel(4, 24, 6.0);
     return kernel;
 }
 
-double truePeakOfWindow(const double* window) {
-    const OversamplingKernel& kernel = oversamplingKernel();
-    double peak = std::fabs(window[kTruePeakTaps - 1 - kTruePeakDelay]);
-    for (size_t p = 1; p < 4; ++p) {
+const OversamplingKernel& accurateKernel() {
+    static const OversamplingKernel kernel = buildKernel(8, 64, 5.0);
+    return kernel;
+}
+
+double truePeakOfWindow(const double* window, const OversamplingKernel& kernel) {
+    const size_t taps = kernel.tapsPerPhase;
+    double peak = std::fabs(window[taps - 1 - kernel.delay]);
+    for (size_t p = kernel.firstPhase; p < kernel.factor; ++p) {
+        const double* coefficients = kernel.phase(p);
         double sum = 0.0;
-        for (size_t m = 0; m < kTruePeakTaps; ++m) {
-            sum += kernel.phases[p][m] * window[kTruePeakTaps - 1 - m];
+        for (size_t j = 0; j < taps; ++j) {
+            sum += coefficients[j] * window[j];
         }
         peak = std::max(peak, std::fabs(sum));
     }
@@ -243,23 +254,25 @@ LoudnessResult LoudnessMeter::finish() const {
     return result;
 }
 
-TruePeakMeter::TruePeakMeter(size_t channels)
-    : channels_(channels), history_(channels, std::vector<double>(kTruePeakTaps - 1, 0.0)), hot_(channels, 0) {}
+TruePeakMeter::TruePeakMeter(size_t channels, const OversamplingKernel& kernel)
+    : channels_(channels),
+      kernel_(kernel),
+      history_(channels, std::vector<double>(kernel.tapsPerPhase - 1, 0.0)),
+      hot_(channels, 0) {}
 
 void TruePeakMeter::process(const AudioBlock& block, size_t frames) {
+    const size_t history = kernel_.tapsPerPhase - 1;
     for (size_t ch = 0; ch < channels_; ++ch) {
-        const size_t history = kTruePeakTaps - 1;
         work_.resize(history + frames);
         std::copy(history_[ch].begin(), history_[ch].end(), work_.begin());
         std::copy(block[ch].begin(), block[ch].begin() + static_cast<std::ptrdiff_t>(frames), work_.begin() + static_cast<std::ptrdiff_t>(history));
-        const double bound = oversamplingKernel().bound;
         for (size_t i = 0; i < frames; ++i) {
-            if (std::fabs(block[ch][i]) * bound > peak_ * (1.0 + 1e-9)) {
-                hot_[ch] = kTruePeakTaps;
+            if (std::fabs(block[ch][i]) * kernel_.bound > peak_ * (1.0 + 1e-9)) {
+                hot_[ch] = kernel_.tapsPerPhase;
             }
             if (hot_[ch] > 0) {
                 --hot_[ch];
-                peak_ = std::max(peak_, truePeakOfWindow(work_.data() + i));
+                peak_ = std::max(peak_, truePeakOfWindow(work_.data() + i, kernel_));
             }
         }
         std::copy(work_.begin() + static_cast<std::ptrdiff_t>(frames), work_.begin() + static_cast<std::ptrdiff_t>(frames + history), history_[ch].begin());
@@ -267,20 +280,23 @@ void TruePeakMeter::process(const AudioBlock& block, size_t frames) {
 }
 
 void TruePeakMeter::finish() {
-    AudioBlock tail = makeBlock(channels_, kTruePeakDelay);
-    process(tail, kTruePeakDelay);
+    AudioBlock tail = makeBlock(channels_, kernel_.delay);
+    process(tail, kernel_.delay);
 }
 
 double TruePeakMeter::peakDb() const {
     return 20.0 * std::log10(std::max(peak_, 1e-10));
 }
 
-Meter::Meter(double sampleRate, size_t channels, bool measureTruePeak)
-    : channels_(channels), measureTruePeak_(measureTruePeak), loudness_(sampleRate, channels), truePeak_(channels) {}
+Meter::Meter(double sampleRate, size_t channels, PeakMode peakMode)
+    : channels_(channels),
+      peakMode_(peakMode),
+      loudness_(sampleRate, channels),
+      truePeak_(channels, peakMode == PeakMode::Accurate ? accurateKernel() : standardKernel()) {}
 
 void Meter::process(const AudioBlock& block, size_t frames) {
     loudness_.process(block, frames);
-    if (measureTruePeak_) {
+    if (peakMode_ != PeakMode::Off) {
         truePeak_.process(block, frames);
     }
     if (channels_ >= 2) {
@@ -299,14 +315,14 @@ void Meter::process(const AudioBlock& block, size_t frames) {
 }
 
 Measurements Meter::finish() {
-    if (measureTruePeak_) {
+    if (peakMode_ != PeakMode::Off) {
         truePeak_.finish();
     }
     const LoudnessResult loudness = loudness_.finish();
     Measurements m;
     m.integratedLufs = loudness.integratedLufs;
     m.loudnessRangeLu = loudness.loudnessRangeLu;
-    if (measureTruePeak_) {
+    if (peakMode_ != PeakMode::Off) {
         m.truePeakDb = truePeak_.peakDb();
     }
     if (channels_ >= 2) {

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <utility>
 
 namespace mastered {
 
@@ -15,6 +16,8 @@ namespace {
 constexpr uint16_t kFormatPcm = 1;
 constexpr uint16_t kFormatFloat = 3;
 constexpr uint16_t kFormatExtensible = 0xFFFE;
+constexpr uint64_t kUnknownSize = 0xFFFFFFFFULL;
+constexpr size_t kDs64Payload = 28;
 
 uint16_t readU16(const unsigned char* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -38,6 +41,11 @@ void putU32(std::vector<unsigned char>& out, uint32_t v) {
     for (int i = 0; i < 4; ++i) {
         out.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xFF));
     }
+}
+
+void putU64(std::vector<unsigned char>& out, uint64_t v) {
+    putU32(out, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
+    putU32(out, static_cast<uint32_t>(v >> 32));
 }
 
 void putTag(std::vector<unsigned char>& out, const char* tag) {
@@ -72,23 +80,49 @@ WavReader::WavReader(const std::string& path) : path_(path) {
     }
     unsigned char header[12];
     readExact(header, 12, "RIFF header");
-    if (std::memcmp(header, "RIFF", 4) != 0 || std::memcmp(header + 8, "WAVE", 4) != 0) {
+    const bool rf64 = std::memcmp(header, "RF64", 4) == 0 || std::memcmp(header, "BW64", 4) == 0;
+    if ((!rf64 && std::memcmp(header, "RIFF", 4) != 0) || std::memcmp(header + 8, "WAVE", 4) != 0) {
         throw MasteredError(path + ": not a RIFF/WAVE file");
     }
 
     bool foundFormat = false;
     bool foundData = false;
+    bool foundDs64 = false;
     uint16_t tag = 0;
     uint64_t dataBytes = 0;
+    uint64_t ds64DataSize = 0;
+    std::vector<std::pair<std::string, uint64_t>> ds64Table;
     uint64_t position = 12;
     while (position + 8 <= fileSize && !(foundFormat && foundData)) {
         file_.clear();
         file_.seekg(static_cast<std::streamoff>(position));
         unsigned char chunkHeader[8];
         readExact(chunkHeader, 8, "chunk header");
-        const uint64_t chunkSize = readU32(chunkHeader + 4);
+        uint64_t chunkSize = readU32(chunkHeader + 4);
         const uint64_t payload = position + 8;
-        if (std::memcmp(chunkHeader, "fmt ", 4) == 0 && !foundFormat) {
+        if (rf64 && chunkSize == kUnknownSize) {
+            const std::string id(reinterpret_cast<const char*>(chunkHeader), 4);
+            for (const auto& entry : ds64Table) {
+                if (entry.first == id) {
+                    chunkSize = entry.second;
+                }
+            }
+        }
+        if (rf64 && std::memcmp(chunkHeader, "ds64", 4) == 0 && !foundDs64) {
+            if (chunkSize < kDs64Payload || payload + kDs64Payload > fileSize) {
+                throw MasteredError(path + ": invalid ds64 chunk");
+            }
+            const size_t toRead = static_cast<size_t>(std::min<uint64_t>(chunkSize, kDs64Payload + 12 * 32));
+            std::vector<unsigned char> ds64(toRead);
+            readExact(ds64.data(), toRead, "ds64 chunk");
+            ds64DataSize = readU64(ds64.data() + 8);
+            const uint32_t tableLength = readU32(ds64.data() + 24);
+            for (size_t i = 0; i < tableLength && kDs64Payload + 12 * (i + 1) <= toRead; ++i) {
+                const unsigned char* entry = ds64.data() + kDs64Payload + 12 * i;
+                ds64Table.emplace_back(std::string(reinterpret_cast<const char*>(entry), 4), readU64(entry + 4));
+            }
+            foundDs64 = true;
+        } else if (std::memcmp(chunkHeader, "fmt ", 4) == 0 && !foundFormat) {
             if (chunkSize < 16 || payload + 16 > fileSize) {
                 throw MasteredError(path + ": invalid fmt chunk");
             }
@@ -109,8 +143,9 @@ WavReader::WavReader(const std::string& path) : path_(path) {
             foundFormat = true;
         } else if (std::memcmp(chunkHeader, "data", 4) == 0 && !foundData) {
             dataOffset_ = payload;
-            dataBytes = chunkSize;
+            dataBytes = (rf64 && foundDs64 && chunkSize == kUnknownSize) ? ds64DataSize : chunkSize;
             foundData = true;
+            chunkSize = dataBytes;
         }
         position = payload + chunkSize + (chunkSize & 1);
     }
@@ -217,7 +252,8 @@ size_t WavReader::read(AudioBlock& block, size_t maxFrames) {
     return want;
 }
 
-WavWriter::WavWriter(const std::string& path, uint32_t sampleRate, uint16_t channels, uint16_t bitDepth, bool dither, bool noiseShaping)
+WavWriter::WavWriter(const std::string& path, uint32_t sampleRate, uint16_t channels, uint16_t bitDepth, bool dither, bool noiseShaping,
+                     uint64_t sizeLimit)
     : path_(path),
       tempPath_(path + ".tmp"),
       sampleRate_(sampleRate),
@@ -225,6 +261,7 @@ WavWriter::WavWriter(const std::string& path, uint32_t sampleRate, uint16_t chan
       bitDepth_(bitDepth),
       dither_(dither),
       noiseShaping_(noiseShaping),
+      sizeLimit_(sizeLimit),
       shapingError_(channels, 0.0) {
     if (bitDepth != 16 && bitDepth != 24 && bitDepth != 32) {
         throw MasteredError("Output bit depth must be 16, 24 or 32");
@@ -264,7 +301,7 @@ WavWriter::~WavWriter() {
 size_t WavWriter::headerSize() const {
     const bool isFloat = bitDepth_ == 32;
     const bool extensible = channels_ > 2;
-    size_t size = 12 + 8 + (extensible ? 40 : (isFloat ? 18 : 16)) + 8;
+    size_t size = 12 + 8 + kDs64Payload + 8 + (extensible ? 40 : (isFloat ? 18 : 16)) + 8;
     if (isFloat) {
         size += 12;
     }
@@ -277,11 +314,23 @@ std::vector<unsigned char> WavWriter::buildHeader(uint64_t dataBytes) const {
     const uint16_t blockAlign = static_cast<uint16_t>(channels_ * (bitDepth_ / 8));
     const uint16_t tag = isFloat ? kFormatFloat : kFormatPcm;
     const uint64_t padded = dataBytes + (dataBytes & 1);
+    const uint64_t riffSize = headerSize() - 8 + padded;
+    const bool rf64 = riffSize > sizeLimit_ || dataBytes > sizeLimit_;
     std::vector<unsigned char> out;
     out.reserve(headerSize());
-    putTag(out, "RIFF");
-    putU32(out, static_cast<uint32_t>(headerSize() - 8 + padded));
+    putTag(out, rf64 ? "RF64" : "RIFF");
+    putU32(out, rf64 ? static_cast<uint32_t>(kUnknownSize) : static_cast<uint32_t>(riffSize));
     putTag(out, "WAVE");
+    putTag(out, rf64 ? "ds64" : "JUNK");
+    putU32(out, static_cast<uint32_t>(kDs64Payload));
+    if (rf64) {
+        putU64(out, riffSize);
+        putU64(out, dataBytes);
+        putU64(out, framesWritten_);
+        putU32(out, 0);
+    } else {
+        out.insert(out.end(), kDs64Payload, 0);
+    }
     putTag(out, "fmt ");
     putU32(out, extensible ? 40 : (isFloat ? 18 : 16));
     putU16(out, extensible ? kFormatExtensible : tag);
@@ -303,10 +352,10 @@ std::vector<unsigned char> WavWriter::buildHeader(uint64_t dataBytes) const {
     if (isFloat) {
         putTag(out, "fact");
         putU32(out, 4);
-        putU32(out, static_cast<uint32_t>(framesWritten_));
+        putU32(out, rf64 ? static_cast<uint32_t>(kUnknownSize) : static_cast<uint32_t>(framesWritten_));
     }
     putTag(out, "data");
-    putU32(out, static_cast<uint32_t>(dataBytes));
+    putU32(out, rf64 ? static_cast<uint32_t>(kUnknownSize) : static_cast<uint32_t>(dataBytes));
     return out;
 }
 
@@ -331,9 +380,6 @@ void WavWriter::write(const AudioBlock& block, size_t frames) {
     }
     const size_t bytes = bitDepth_ / 8;
     const uint64_t add = static_cast<uint64_t>(frames) * channels_ * bytes;
-    if (headerSize() + dataBytes_ + add + 1 > 0xFFFFFFFFULL) {
-        throw MasteredError("Output exceeds the 4 GB WAV size limit");
-    }
     buffer_.resize(frames * channels_ * bytes);
     unsigned char* p = buffer_.data();
     const bool isFloat = bitDepth_ == 32;

@@ -41,6 +41,7 @@ void printUsage() {
         "  --dynamics            Enable multiband compression matched to the reference\n"
         "  --dynamics-ratio N    Fixed compression ratio, 1 to 20 (implies --dynamics)\n"
         "  --soft-clip           Enable soft clipping before the limiter\n"
+        "  --fast-peak           Use the faster 4x peak detector and skip the ceiling check\n"
         "  --lookahead MS        Limiter look-ahead, 0.5 to 20 (default 3)\n"
         "  --release MS          Limiter release, 5 to 1000 (default 80)\n"
         "  --fft N               FFT size, power of two 1024 to 65536 (default 8192)\n"
@@ -165,6 +166,8 @@ int run(int argc, char** argv) {
             config.dynamicsRatio = parseNumber(arg, value());
         } else if (arg == "--soft-clip") {
             config.softClip = true;
+        } else if (arg == "--fast-peak") {
+            config.accuratePeak = false;
         } else if (arg == "--lookahead") {
             config.limiterLookaheadMs = parseNumber(arg, value());
         } else if (arg == "--release") {
@@ -226,7 +229,9 @@ int run(int argc, char** argv) {
             std::cout << "  Side gain " << std::showpos << result.analysis.sideGainDb << std::noshowpos << " dB\n";
         }
         if (result.analysis.plan.dynamics.enabled) {
-            std::cout << "  Dynamics ratio " << result.analysis.plan.dynamics.bands[0].ratio << ":1 (3 bands)\n";
+            const auto& bands = result.analysis.plan.dynamics.bands;
+            std::cout << "  Dynamics ratios " << std::setprecision(2) << bands[0].ratio << ", " << bands[1].ratio << ", " << bands[2].ratio
+                      << " (low, mid, high)\n";
         }
     }
     for (const std::string& warning : result.warnings) {

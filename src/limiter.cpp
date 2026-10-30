@@ -18,34 +18,36 @@ TruePeakLimiter::TruePeakLimiter(double sampleRate, size_t channels, double ceil
         throw MasteredError("Invalid limiter settings");
     }
     lookahead_ = std::max<size_t>(8, static_cast<size_t>(std::llround(lookaheadMs * 0.001 * sampleRate)));
-    latency_ = lookahead_ + kTruePeakDelay;
+    kernel_ = &standardKernel();
+    latency_ = lookahead_ + kernel_->delay;
     ceiling_ = std::pow(10.0, (ceilingDb - kLimiterMarginDb) / 20.0);
     releaseCoefficient_ = std::exp(-1.0 / (releaseMs * 0.001 * sampleRate));
-    history_.assign(channels, std::vector<double>(2 * kTruePeakTaps, 0.0));
+    history_.assign(channels, std::vector<double>(2 * kernel_->tapsPerPhase, 0.0));
     hot_.assign(channels, 0);
-    hotThreshold_ = ceiling_ / oversamplingKernel().bound * (1.0 - 1e-9);
+    hotThreshold_ = ceiling_ / kernel_->bound * (1.0 - 1e-9);
     delay_.assign(channels, std::vector<double>(latency_, 0.0));
     smoothing_.assign(lookahead_ + 1, 1.0);
     smoothingSum_ = static_cast<double>(smoothing_.size());
 }
 
 void TruePeakLimiter::process(AudioBlock& block, size_t frames) {
+    const size_t taps = kernel_->tapsPerPhase;
     for (size_t i = 0; i < frames; ++i) {
         double peak = 0.0;
         for (size_t ch = 0; ch < channels_; ++ch) {
             const double x = block[ch][i];
             std::vector<double>& h = history_[ch];
             h[historyPosition_] = x;
-            h[historyPosition_ + kTruePeakTaps] = x;
+            h[historyPosition_ + taps] = x;
             if (std::fabs(x) > hotThreshold_) {
-                hot_[ch] = kTruePeakTaps;
+                hot_[ch] = taps;
             }
             if (hot_[ch] > 0) {
                 --hot_[ch];
-                peak = std::max(peak, truePeakOfWindow(h.data() + historyPosition_ + 1));
+                peak = std::max(peak, truePeakOfWindow(h.data() + historyPosition_ + 1, *kernel_));
             }
         }
-        historyPosition_ = (historyPosition_ + 1) % kTruePeakTaps;
+        historyPosition_ = (historyPosition_ + 1) % taps;
         const double required = std::max(previousPeak_, peak);
         previousPeak_ = peak;
         const double ratio = required > ceiling_ ? ceiling_ / required : 1.0;
