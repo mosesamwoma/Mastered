@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Mastered</title>
-<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
 <script src="app.js" defer></script>
 </head>
@@ -13,6 +12,10 @@
 <header class="site-header">
   <h1>Mastered</h1>
   <p>Match your track to a reference song. Upload both, press the button, download the result.</p>
+  <div id="account" class="account" hidden>
+    <span id="account-name"></span>
+    <button id="logout" type="button">Sign out</button>
+  </div>
 </header>
 <main>
   <p id="server-status" class="notice" role="status">Connecting to the server…</p>

@@ -46,6 +46,9 @@
   const gainSummary = byId('gain-summary');
   const chartsContainer = byId('charts');
   const againButton = byId('again');
+  const accountBox = byId('account');
+  const accountName = byId('account-name');
+  const logoutButton = byId('logout');
   const formatsHint = byId('formats-hint');
   const playerSection = byId('player');
   const playerMedia = byId('player-media');
@@ -94,12 +97,21 @@
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
+  function redirectToLogin() {
+    window.location.assign('/login');
+  }
+
   async function request(url, options) {
+    let response;
     try {
-      return await fetch(url, options);
+      response = await fetch(url, options);
     } catch (error) {
       return null;
     }
+    if (response.status === 401) {
+      redirectToLogin();
+    }
+    return response;
   }
 
   function show(panel) {
@@ -164,6 +176,9 @@
       if (response !== null && response.ok) {
         limits = await response.json();
         return true;
+      }
+      if (response !== null && response.status === 401) {
+        return false;
       }
       setStatus('The server is waking up. This can take up to a minute…');
       await delay(CONFIG_RETRY_MS);
@@ -239,7 +254,12 @@
           setProgress(percent, 'Uploading', 'Uploading your files… ' + Math.round(percent) + '%');
         }
       });
-      xhr.addEventListener('load', () => resolve({ status: xhr.status, body: parseJson(xhr.responseText) }));
+      xhr.addEventListener('load', () => {
+        if (xhr.status === 401) {
+          redirectToLogin();
+        }
+        resolve({ status: xhr.status, body: parseJson(xhr.responseText) });
+      });
       xhr.addEventListener('error', () => resolve({ status: 0, body: null }));
       xhr.addEventListener('abort', () => resolve({ status: -1, body: null }));
       xhr.send(data);
@@ -786,6 +806,23 @@
     show(resultPanel);
   }
 
+  async function onLogout() {
+    await request('/api/logout', { method: 'POST' });
+    redirectToLogin();
+  }
+
+  async function showAccount() {
+    const response = await request('/api/session', { cache: 'no-store' });
+    if (response === null || !response.ok) {
+      return;
+    }
+    const session = parseJson(await response.text());
+    if (session && session.authRequired && session.user) {
+      accountName.textContent = 'Signed in as ' + session.user;
+      accountBox.hidden = false;
+    }
+  }
+
   async function onAgain() {
     const id = jobId;
     backToForm();
@@ -800,6 +837,7 @@
     cancelButton.addEventListener('click', onCancel);
     retryButton.addEventListener('click', onRetry);
     againButton.addEventListener('click', onAgain);
+    logoutButton.addEventListener('click', onLogout);
     playButton.addEventListener('click', togglePlay);
     seekInput.addEventListener('input', onSeek);
     seekInput.addEventListener('pointerdown', () => {
@@ -827,6 +865,7 @@
       return;
     }
     setStatus('');
+    showAccount();
     const extensions = allowedFormats();
     referenceInput.setAttribute('accept', extensions.join(',') + ',audio/*');
     trackInput.setAttribute('accept', extensions.join(',') + ',audio/*');

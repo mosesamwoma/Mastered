@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Sign in - Mastered</title>
+<link rel="stylesheet" href="style.css">
+<script src="login.js" defer></script>
+</head>
+<body>
+<header class="site-header">
+  <h1>Mastered</h1>
+  <p>Sign in to continue.</p>
+</header>
+<main>
+  <form id="login-form" class="login" novalidate>
+    <div class="field">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="64" required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required>
+    </div>
+    <p id="login-message" class="form-error" role="alert" hidden></p>
+    <button id="login-submit" type="submit" class="primary">Sign in</button>
+  </form>
+</main>
+<footer class="site-footer">
+  <p>Access is limited to invited users.</p>
+</footer>
+</body>
+</html>
