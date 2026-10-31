@@ -316,7 +316,3 @@ The JSON report contains input, reference and output measurements, the makeup ga
 - Dynamics matching moves each band's level spread toward the reference; it is an approximation and a band is left alone when it already matches.
 - `--bitdepth 32` writes IEEE float. 32-bit integer PCM input is accepted and converted.
 - Bundled FFmpeg-based conversion is only as capable as the FFmpeg build installed on the server.
-
-## License
-
-MIT. See `LICENSE`.
