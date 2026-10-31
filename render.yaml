@@ -8,6 +8,8 @@ services:
     envVars:
       - key: CLIENT_IP_HEADER
         value: cf-connecting-ip
+      - key: SESSION_SECRET
+        generateValue: true
       - key: MAX_FILE_MB
         value: "60"
       - key: MAX_DURATION_SEC

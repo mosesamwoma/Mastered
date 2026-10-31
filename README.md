@@ -20,7 +20,7 @@ Everything runs as a streaming pipeline in fixed-size blocks, so memory use stay
 - WAV output: 16/24-bit PCM, 32-bit float (format tag 3), extensible header above two channels, automatic RF64 beyond 4 GB
 - JSON report, ReaEQ band list and Equalizer APO config (including mid/side)
 - C API shared library
-- Web app (FastAPI + a single static page): MP3, FLAC, M4A, OGG and AAC upload, a before/after player, per-visitor rate limits, persistent job storage, Docker image and Render blueprint
+- Web app (FastAPI + a single static page): optional sign-in page, MP3, FLAC, M4A, OGG and AAC upload, a before/after player, per-visitor rate limits, persistent job storage, Docker image and Render blueprint
 
 ## Build
 
@@ -97,7 +97,7 @@ Mastered/
   render.yaml       Render blueprint (free plan)
   web/
     app/            FastAPI service
-    static/         index.html, style.css, app.js
+    static/         index.html, login.html, style.css, app.js, login.js
 ```
 
 ### Run it locally
@@ -122,31 +122,6 @@ docker build -t mastered .
 docker run --rm -p 10000:10000 mastered
 ```
 
-### Run with Docker Compose
-
-Docker Compose is an alternative to running the container commands manually. It
-builds the image, starts the web app on port 10000, performs a health check, and
-stores uploaded files and job results in a named volume.
-
-Requires Docker Engine with the Compose plugin (`docker compose`):
-
-```
-docker compose -f docker-compose.yaml up --build
-```
-
-Open http://localhost:10000. Stop the service with `Ctrl+C`, or run:
-
-```
-docker compose -f docker-compose.yaml down
-```
-
-The named `mastered-data` volume keeps job data across container restarts. To
-remove the container and its stored data:
-
-```
-docker compose -f docker-compose.yaml down --volumes
-```
-
 ### Deploy on Render (free)
 
 1. Push this folder to a GitHub repository.
@@ -154,6 +129,45 @@ docker compose -f docker-compose.yaml down --volumes
 3. Wait for the build to finish and open the service URL.
 
 The free plan has a small CPU share and sleeps after 15 minutes without visitors, so the first visit can take about a minute and a 3-minute song can take several minutes to master. Conversion and preview creation add to that. Disk is temporary: results and the job database are removed on every restart. The page shows a waking-up message while the service starts and keeps polling your job if you reload.
+
+### Sign-in
+
+The web app can require a username and password. It needs no database: accounts come from an environment variable and sessions are signed cookies.
+
+Sign-in is off until `AUTH_USERS` is set. When it is on, every page and API call needs a valid session except the login page and its files, the sign-in and sign-out calls, `/api/health` and `/api/session`; visitors without a session are sent to `/login`.
+
+1. Create a password hash for each user (passwords must be at least 10 characters):
+
+   ```
+   cd web
+   python3 -m app.passwd alice
+   ```
+
+   With Docker: `docker run --rm -it mastered python -m app.passwd alice`. Each run prints one `name:hash` entry.
+2. Join the entries with commas or new lines and set them as `AUTH_USERS`. Hashes contain `$`, so put them in single quotes in a shell and enter them as they are in a hosting dashboard.
+3. Set `SESSION_SECRET` to a random string of at least 32 characters. For example: `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`. The secret signs the sessions, so every server process that shares users must use the same one.
+
+```
+AUTH_USERS='alice:scrypt$16384$8$1$...,bob:scrypt$16384$8$1$...'
+SESSION_SECRET='...'
+```
+
+On Render the blueprint already creates a random `SESSION_SECRET`. Add `AUTH_USERS` yourself under the service's Environment settings. Without it the site stays public.
+
+How it works:
+
+- Passwords are stored as salted scrypt hashes. Login checks take the same time for unknown users and wrong passwords, and the same message is returned for both.
+- A session is a signed cookie (HttpOnly, SameSite=Lax, Secure over HTTPS) that lasts `SESSION_HOURS` (12 by default). Nothing is stored on the server.
+- Failed logins are limited per visitor (`LOGIN_ATTEMPTS` per 15 minutes, 8 by default). The count is kept in each process.
+- Requests that change data are rejected when their `Origin` header does not match the site, which blocks cross-site requests.
+- Each job belongs to the user who created it. Other users, and anyone not signed in, get a not-found response for its status, download, preview and delete.
+- Job limits (one job at a time, jobs per hour) are counted per user instead of per IP address.
+
+Limits to know about:
+
+- Sessions are not stored, so Sign out only removes the cookie from your browser. A copy of the cookie stays valid until it expires. To cut off a user immediately, remove them from `AUTH_USERS` or change their hash; either one ends all of that user's sessions. Changing `SESSION_SECRET` ends everyone's.
+- There is no sign-up, password reset or account page; you manage users by editing the environment variable.
+- Use HTTPS in production. Render provides it. Set `COOKIE_SECURE=always` if your proxy does not send `X-Forwarded-Proto`.
 
 ### Formats and previews
 
@@ -202,6 +216,11 @@ All settings are environment variables with safe defaults.
 | `API_REQUESTS_PER_MINUTE` | 240 | API requests per visitor per minute, per process |
 | `UPLOAD_ATTEMPTS_PER_HOUR` | 30 | Upload attempts per visitor per hour, per process |
 | `CLIENT_IP_HEADER` | empty (Docker: `cf-connecting-ip`) | Header that carries the visitor address |
+| `AUTH_USERS` | empty | `name:hash` entries that enable sign-in; see Sign-in |
+| `SESSION_SECRET` | empty | Signing key for sessions, at least 32 characters, required with `AUTH_USERS` |
+| `SESSION_HOURS` | 12 | How long a sign-in lasts |
+| `COOKIE_SECURE` | auto | `auto` marks the cookie Secure over HTTPS, `always` or `never` force it |
+| `LOGIN_ATTEMPTS` | 8 | Failed sign-ins per visitor per 15 minutes, per process |
 | `JOB_TTL_MINUTES` | 20 | How long finished jobs stay downloadable |
 | `JOB_TIMEOUT_SEC` | 1800 | A mastering run longer than this is stopped |
 | `CONVERT_TIMEOUT_SEC` | 300 | Time allowed to convert one uploaded file |
@@ -213,6 +232,7 @@ All settings are environment variables with safe defaults.
 - Progress lines printed by the engine are parsed and exposed through the status endpoint.
 - Uploads are streamed to disk with size limits enforced on the whole request and on each file, and each file is checked before the job is queued.
 - Files are stored under random job ids with fixed names, never under user-supplied names.
+- Validation errors never echo the submitted values, so passwords do not appear in responses.
 - The page sets a strict content security policy and builds all dynamic content with `textContent`.
 
 ### API
@@ -220,7 +240,10 @@ All settings are environment variables with safe defaults.
 | Method and path | Purpose |
 | --- | --- |
 | `GET /api/health` | Health check |
-| `GET /api/config` | Limits, accepted formats and whether previews are available |
+| `POST /api/login` | JSON `username` and `password`; sets the session cookie |
+| `POST /api/logout` | Clears the session cookie |
+| `GET /api/session` | Whether sign-in is required and who is signed in |
+| `GET /api/config` | Limits, accepted formats, whether previews are available and whether sign-in is required |
 | `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `soft_clip`, `dither`, `noise_shaping`, `mid_side`, `match_width`; returns 202 with the job id |
 | `GET /api/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`), progress, queue position, and when done the report, download link and preview links |
 | `GET /api/jobs/{id}/download` | Mastered WAV |
@@ -293,3 +316,7 @@ The JSON report contains input, reference and output measurements, the makeup ga
 - Dynamics matching moves each band's level spread toward the reference; it is an approximation and a band is left alone when it already matches.
 - `--bitdepth 32` writes IEEE float. 32-bit integer PCM input is accepted and converted.
 - Bundled FFmpeg-based conversion is only as capable as the FFmpeg build installed on the server.
+
+## License
+
+MIT. See `LICENSE`.
