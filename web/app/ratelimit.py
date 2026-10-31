@@ -32,6 +32,20 @@ class SlidingWindow:
         self.max_keys = max_keys
         self.entries = OrderedDict()
 
+    def retry_after(self, key, now=None):
+        now = time.monotonic() if now is None else now
+        stamps = self.entries.get(key)
+        if stamps is None:
+            return 0.0
+        while stamps and now - stamps[0] >= self.window:
+            stamps.popleft()
+        if len(stamps) >= self.limit:
+            return max(1.0, self.window - (now - stamps[0]))
+        return 0.0
+
+    def clear(self, key):
+        self.entries.pop(key, None)
+
     def hit(self, key, now=None):
         now = time.monotonic() if now is None else now
         stamps = self.entries.get(key)

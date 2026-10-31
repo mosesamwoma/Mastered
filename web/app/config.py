@@ -4,6 +4,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .auth import parse_users
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -66,13 +68,38 @@ class Settings:
     job_ttl_sec: int
     job_timeout_sec: int
     convert_timeout_sec: int
+    auth_users: dict
+    session_secret: bytes
+    session_seconds: int
+    cookie_secure: str
+    login_attempts: int
+
+    @property
+    def auth_enabled(self):
+        return bool(self.auth_users)
 
     @property
     def database_path(self):
         return self.work_dir / "jobs.db"
 
 
+def load_auth():
+    raw = os.environ.get("AUTH_USERS") or ""
+    try:
+        users = parse_users(raw)
+    except ValueError as error:
+        raise ConfigError(f"AUTH_USERS is not valid: {error}") from None
+    secret = (os.environ.get("SESSION_SECRET") or "").strip()
+    if users and len(secret) < 32:
+        raise ConfigError("SESSION_SECRET must be set to a random value of at least 32 characters when AUTH_USERS is used")
+    mode = (os.environ.get("COOKIE_SECURE") or "auto").strip().lower()
+    if mode not in ("auto", "always", "never"):
+        raise ConfigError("COOKIE_SECURE must be auto, always or never")
+    return users, secret.encode("utf-8"), mode
+
+
 def load_settings():
+    users, secret, cookie_mode = load_auth()
     work_dir = Path(os.environ.get("WORK_DIR") or Path(tempfile.gettempdir()) / "mastered_jobs")
     max_file_mb = read_number("MAX_FILE_MB", 60.0, 0.1, 2048.0, float)
     return Settings(
@@ -93,4 +120,9 @@ def load_settings():
         job_ttl_sec=read_number("JOB_TTL_MINUTES", 20, 1, 1440, int) * 60,
         job_timeout_sec=read_number("JOB_TIMEOUT_SEC", 1800, 30, 86400, int),
         convert_timeout_sec=read_number("CONVERT_TIMEOUT_SEC", 300, 10, 3600, int),
+        auth_users=users,
+        session_secret=secret,
+        session_seconds=int(read_number("SESSION_HOURS", 12.0, 0.1, 720.0, float) * 3600),
+        cookie_secure=cookie_mode,
+        login_attempts=read_number("LOGIN_ATTEMPTS", 8, 1, 100, int),
     )

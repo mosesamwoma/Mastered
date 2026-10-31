@@ -1,3 +1,7 @@
+from urllib.parse import urlsplit
+
+from .auth import session_token
+
 SECURITY_HEADERS = [
     (b"x-content-type-options", b"nosniff"),
     (b"x-frame-options", b"DENY"),
@@ -32,16 +36,23 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+PUBLIC_PATHS = {
+    "/login", "/login.js", "/style.css", "/api/health", "/api/login", "/api/logout", "/api/session",
+}
+
+
 class BodyTooLarge(Exception):
     pass
 
 
 class BodySizeLimitMiddleware:
-    def __init__(self, app, max_bytes, path, method="POST"):
+    def __init__(self, app, max_bytes, path, method="POST", message=None):
         self.app = app
         self.max_bytes = max_bytes
         self.path = path
         self.method = method
+        self.message = message
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["path"] != self.path or scope["method"] != self.method:
@@ -93,6 +104,8 @@ class BodySizeLimitMiddleware:
             await self._reject(send, 413, self._message())
 
     def _message(self):
+        if self.message:
+            return ('{"detail":"%s"}' % self.message).encode()
         limit_mb = self.max_bytes / (1024 * 1024)
         return ('{"detail":"Upload is too large. The combined limit is %g MB."}' % round(limit_mb, 1)).encode()
 
@@ -105,6 +118,54 @@ class BodySizeLimitMiddleware:
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(body)).encode()),
                     (b"connection", b"close"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+class AuthMiddleware:
+    def __init__(self, app, signer, users):
+        self.app = app
+        self.signer = signer
+        self.users = users
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = scope.get("headers", [])
+        scope["mastered_user"] = self.signer.read(session_token(headers), self.users)
+        path = scope["path"]
+        if scope["method"] not in SAFE_METHODS and not self.same_origin(headers):
+            await self.reply(send, 403, b'{"detail":"Cross-site request blocked."}')
+            return
+        if path in PUBLIC_PATHS or scope["mastered_user"] is not None:
+            await self.app(scope, receive, send)
+            return
+        if path.startswith("/api/") or scope["method"] not in SAFE_METHODS:
+            await self.reply(send, 401, b'{"detail":"Please sign in."}')
+            return
+        await self.reply(send, 302, b"", [(b"location", b"/login")])
+
+    def same_origin(self, headers):
+        values = {name: value for name, value in headers}
+        origin = values.get(b"origin")
+        if origin is None:
+            return True
+        host = values.get(b"host", b"").decode("latin-1").lower()
+        return urlsplit(origin.decode("latin-1")).netloc.lower() == host and host != ""
+
+    async def reply(self, send, status, body, extra=None):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"cache-control", b"no-store"),
+                    *(extra or []),
                 ],
             }
         )

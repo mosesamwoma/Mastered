@@ -1,29 +1,44 @@
+import asyncio
 import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from .auth import COOKIE_NAME, MAX_PASSWORD_BYTES, SessionSigner, hash_password, verify_password
 from .config import load_settings
 from .jobs import JobManager, QueueFull, RateLimited, describe_duration
 from .media import SOURCE_EXTENSIONS, MediaError, MediaTools
-from .middleware import BodySizeLimitMiddleware, SecurityHeadersMiddleware
-from .ratelimit import RateLimitMiddleware, client_key
+from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeadersMiddleware
+from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key
 from .wav_info import WavError, inspect_wav
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024
 BIT_DEPTHS = (0, 16, 24, 32)
+LOGIN_WINDOW_SEC = 900.0
+LOGIN_BODY_BYTES = 4096
 
 settings = load_settings()
 media = MediaTools(settings.ffmpeg_path, settings.ffprobe_path)
 manager = JobManager(settings, media)
+signer = SessionSigner(settings.session_secret, settings.session_seconds) if settings.auth_enabled else None
+login_limiter = SlidingWindow(settings.login_attempts, LOGIN_WINDOW_SEC)
+placeholder_hash = hash_password(secrets.token_urlsafe(16)) if settings.auth_enabled else ""
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=MAX_PASSWORD_BYTES)
 
 
 @asynccontextmanager
@@ -43,12 +58,26 @@ app.add_middleware(
     path="/api/jobs",
 )
 app.add_middleware(
+    BodySizeLimitMiddleware,
+    max_bytes=LOGIN_BODY_BYTES,
+    path="/api/login",
+    message="The request is too large.",
+)
+if signer is not None:
+    app.add_middleware(AuthMiddleware, signer=signer, users=settings.auth_users)
+app.add_middleware(
     RateLimitMiddleware,
     requests_per_minute=settings.api_requests_per_minute,
     uploads_per_hour=settings.upload_attempts_per_hour,
     header=settings.client_ip_header,
 )
 app.add_middleware(SecurityHeadersMiddleware)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_failed(_request, error):
+    details = [{"loc": list(item["loc"]), "msg": item["msg"], "type": item["type"]} for item in error.errors()]
+    return JSONResponse({"detail": details}, status_code=422)
 
 
 def copy_limited(source, destination, limit):
@@ -154,11 +183,76 @@ def build_engine_arguments(
     return arguments
 
 
-async def require_job(job_id):
+def identity(request):
+    user = request.scope.get("mastered_user")
+    return f"user:{user}" if user else client_key(request.scope, settings.client_ip_header)
+
+
+def secure_cookie(request):
+    if settings.cookie_secure != "auto":
+        return settings.cookie_secure == "always"
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or forwarded == "https"
+
+
+def cookie_options(request):
+    return {"httponly": True, "samesite": "lax", "secure": secure_cookie(request), "path": "/"}
+
+
+async def require_job(job_id, request):
     row = await manager.row(job_id) if JOB_ID.match(job_id) else None
     if row is None or row["cancel"] or row["status"] == "uploading":
         raise HTTPException(404, "Job not found or expired")
+    if signer is not None and row["client"] != identity(request):
+        raise HTTPException(404, "Job not found or expired")
     return row
+
+
+@app.post("/api/login")
+async def login(request: Request, body: LoginRequest):
+    if signer is None:
+        raise HTTPException(404, "Sign-in is not enabled on this server.")
+    key = client_key(request.scope, settings.client_ip_header)
+    wait = login_limiter.retry_after(key)
+    if wait > 0:
+        raise HTTPException(
+            429,
+            f"Too many failed attempts. Please try again in {describe_duration(wait)}.",
+            headers={"Retry-After": str(int(wait) + 1)},
+        )
+    stored = settings.auth_users.get(body.username)
+    valid = await asyncio.to_thread(verify_password, body.password, stored or placeholder_hash)
+    if stored is None or not valid:
+        login_limiter.hit(key)
+        raise HTTPException(401, "Incorrect username or password.")
+    login_limiter.clear(key)
+    response = JSONResponse({"user": body.username}, headers={"Cache-Control": "no-store"})
+    response.set_cookie(
+        COOKIE_NAME, signer.issue(body.username, stored), max_age=settings.session_seconds, **cookie_options(request)
+    )
+    return response
+
+
+@app.post("/api/logout", status_code=204)
+async def logout(request: Request):
+    response = Response(status_code=204)
+    response.set_cookie(COOKIE_NAME, "", max_age=0, **cookie_options(request))
+    return response
+
+
+@app.get("/api/session")
+async def session(request: Request):
+    return JSONResponse(
+        {"authRequired": signer is not None, "user": request.scope.get("mastered_user")},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/login", include_in_schema=False)
+async def login_page(request: Request):
+    if signer is None or request.scope.get("mastered_user"):
+        return RedirectResponse("/", status_code=302)
+    return FileResponse(settings.static_dir / "login.html", media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/health")
@@ -177,6 +271,7 @@ async def public_config():
         "jobsPerHour": settings.jobs_per_hour_per_client,
         "formats": list(SOURCE_EXTENSIONS) if media.available else [".wav"],
         "preview": media.preview_codec is not None,
+        "authRequired": signer is not None,
     }
 
 
@@ -204,7 +299,7 @@ async def create_job(
         target_lufs, aggressiveness, ceiling_db, bands, bit_depth, precision,
         dynamics, soft_clip, dither, noise_shaping, mid_side, match_width,
     )
-    client = client_key(request.scope, settings.client_ip_header)
+    client = identity(request)
     try:
         job_id = await manager.reserve(track.filename or "track.wav", arguments, client)
     except QueueFull:
@@ -229,13 +324,13 @@ async def create_job(
 
 
 @app.get("/api/jobs/{job_id}")
-async def job_status(job_id: str):
-    return await manager.view(await require_job(job_id))
+async def job_status(job_id: str, request: Request):
+    return await manager.view(await require_job(job_id, request))
 
 
 @app.get("/api/jobs/{job_id}/download")
-async def job_download(job_id: str):
-    row = await require_job(job_id)
+async def job_download(job_id: str, request: Request):
+    row = await require_job(job_id, request)
     path = manager.job_directory(job_id) / "mastered.wav"
     if row["status"] != "done" or not path.is_file():
         raise HTTPException(409, "The mastered file is not ready")
@@ -243,8 +338,8 @@ async def job_download(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/audio/{version}")
-async def job_audio(job_id: str, version: Literal["original", "mastered"]):
-    row = await require_job(job_id)
+async def job_audio(job_id: str, version: Literal["original", "mastered"], request: Request):
+    row = await require_job(job_id, request)
     path = manager.job_directory(job_id) / f"{version}.{media.preview_extension}"
     if row["status"] != "done" or not row["preview"] or not path.is_file():
         raise HTTPException(404, "No preview is available for this job")
@@ -252,8 +347,8 @@ async def job_audio(job_id: str, version: Literal["original", "mastered"]):
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
-async def job_delete(job_id: str):
-    await require_job(job_id)
+async def job_delete(job_id: str, request: Request):
+    await require_job(job_id, request)
     await manager.remove(job_id)
 
 
