@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
+<meta name="color-scheme" content="dark light">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Mastered</title>
 <link rel="stylesheet" href="style.css">
@@ -11,8 +11,13 @@
 </head>
 <body>
 <header class="site-header">
-  <h1>Mastered</h1>
-  <p>Match your track to a reference song. Upload both, press the button, download the result.</p>
+  <div class="brand">
+    <img class="logo" src="/favicon.svg" alt="" width="40" height="40">
+    <div>
+      <h1>Mastered</h1>
+      <p>Match your track to a reference song, then check the result by ear and by the numbers.</p>
+    </div>
+  </div>
   <div id="account" class="account" hidden>
     <span id="account-name"></span>
     <button id="logout" type="button">Sign out</button>
@@ -22,47 +27,71 @@
   <p id="server-status" class="notice" role="status">Connecting to the server…</p>
 
   <form id="job-form" novalidate>
-    <div class="grid two">
-      <div class="field">
-        <label for="reference">Reference song</label>
-        <input id="reference" name="reference" type="file" accept=".wav,audio/wav,audio/x-wav">
-        <small>A finished track whose sound you like.</small>
+    <section class="step" aria-labelledby="step-files">
+      <h2 id="step-files"><span class="num">1</span>Your files</h2>
+      <div class="grid two">
+        <div class="field">
+          <label class="dropzone" id="drop-reference" for="reference">
+            <span class="drop-title">Reference song</span>
+            <span class="drop-name" id="reference-name">Drop a finished track here or click to choose</span>
+            <span class="drop-hint">A release whose sound you like.</span>
+          </label>
+          <input id="reference" name="reference" type="file" class="file-input" accept=".wav,audio/wav,audio/x-wav">
+        </div>
+        <div class="field">
+          <label class="dropzone" id="drop-track" for="track">
+            <span class="drop-title">Your track</span>
+            <span class="drop-name" id="track-name">Drop your mix here or click to choose</span>
+            <span class="drop-hint">The mix you want to master.</span>
+          </label>
+          <input id="track" name="track" type="file" class="file-input" accept=".wav,audio/wav,audio/x-wav">
+        </div>
       </div>
-      <div class="field">
-        <label for="track">Your track</label>
-        <input id="track" name="track" type="file" accept=".wav,audio/wav,audio/x-wav">
-        <small>The mix you want to master.</small>
-      </div>
-    </div>
+      <p id="formats-hint" class="hint"></p>
+    </section>
 
-    <p id="formats-hint" class="hint"></p>
-
-    <div class="grid two">
-      <div class="field">
-        <label for="target">Loudness target (LUFS)</label>
-        <input id="target" name="target_lufs" type="number" min="-60" max="-1" step="any" value="-14" list="target-presets">
-        <datalist id="target-presets">
-          <option value="-16"></option>
-          <option value="-14"></option>
-          <option value="-11"></option>
-          <option value="-9"></option>
-        </datalist>
-        <small>-14 suits most streaming services.</small>
+    <section class="step" aria-labelledby="step-target">
+      <h2 id="step-target"><span class="num">2</span>Where is it going?</h2>
+      <div id="preset-chips" class="chips" role="group" aria-label="Loudness presets"></div>
+      <p id="preset-note" class="hint" role="status"></p>
+      <div class="grid two">
+        <div class="field">
+          <label for="target">Loudness target (LUFS)</label>
+          <input id="target" name="target_lufs" type="number" min="-60" max="-1" step="any" value="-14">
+        </div>
+        <div class="field">
+          <label for="ceiling">Peak ceiling (dBTP)</label>
+          <input id="ceiling" name="ceiling_db" type="number" min="-12" max="0" step="any" value="-1">
+        </div>
       </div>
+    </section>
+
+    <section class="step" aria-labelledby="step-sound">
+      <h2 id="step-sound"><span class="num">3</span>Sound</h2>
+      <div class="chips" role="group" aria-label="Style">
+        <button type="button" class="chip" data-style="gentle" aria-pressed="false">Gentle</button>
+        <button type="button" class="chip" data-style="balanced" aria-pressed="true">Balanced</button>
+        <button type="button" class="chip" data-style="punchy" aria-pressed="false">Dense</button>
+      </div>
+      <p id="style-note" class="hint"></p>
       <div class="field">
         <label for="aggressiveness">EQ strength: <output id="aggressiveness-value">85%</output></label>
         <input id="aggressiveness" name="aggressiveness" type="range" min="0" max="100" step="5" value="85">
         <small>How closely the tone follows the reference.</small>
       </div>
-    </div>
+      <div class="checks">
+        <label><input type="checkbox" id="mid-side" checked> Mid/side EQ</label>
+        <label><input type="checkbox" id="match-width" checked> Match stereo width</label>
+        <label><input type="checkbox" id="dynamics"> Match dynamics (multiband compression)</label>
+        <label><input type="checkbox" id="soft-clip"> Soft clipper before the limiter</label>
+        <label class="with-input"><input type="checkbox" id="mono-bass"> Mono bass below
+          <input id="mono-bass-hz" type="number" min="20" max="500" step="10" value="120" aria-label="Mono bass frequency in hertz"> Hz</label>
+      </div>
+    </section>
 
-    <details>
-      <summary>More options</summary>
+    <details class="step">
+      <summary>Advanced</summary>
       <div class="grid two">
-        <div class="field">
-          <label for="ceiling">Peak ceiling (dBTP)</label>
-          <input id="ceiling" name="ceiling_db" type="number" min="-12" max="0" step="any" value="-1">
-        </div>
         <div class="field">
           <label for="bands">Maximum EQ bands</label>
           <input id="bands" name="bands" type="number" min="0" max="32" step="1" value="8">
@@ -86,21 +115,18 @@
         </div>
       </div>
       <div class="checks">
-        <label><input type="checkbox" id="mid-side" checked> Mid/side EQ</label>
-        <label><input type="checkbox" id="match-width" checked> Match stereo width</label>
-        <label><input type="checkbox" id="dynamics"> Match dynamics (multiband compression)</label>
-        <label><input type="checkbox" id="soft-clip"> Soft clipper before the limiter</label>
         <label><input type="checkbox" id="dither" checked> Dither (16 and 24-bit)</label>
         <label><input type="checkbox" id="noise-shaping"> Noise shaping</label>
       </div>
     </details>
 
     <p id="form-message" class="form-error" role="alert" hidden></p>
-    <button id="submit" type="submit" class="primary" disabled>Master my track</button>
+    <button id="submit" type="submit" class="primary wide" disabled>Master my track</button>
   </form>
 
   <section id="progress-panel" class="panel" hidden aria-live="polite">
     <h2 id="progress-title">Working</h2>
+    <ol id="progress-steps" class="steps-list"></ol>
     <progress id="progress-bar" max="100" value="0"></progress>
     <p id="progress-message"></p>
     <p class="hint">Mastering runs on a small free server, so longer songs can take a few minutes. You can leave this page open.</p>
@@ -113,14 +139,24 @@
     <button id="retry" type="button">Back to the form</button>
   </section>
 
-  <section id="result-panel" class="panel" hidden>
-    <h2>Your master is ready</h2>
-    <p><a id="download" class="button primary" href="#" download>Download WAV</a></p>
+  <section id="result-panel" class="result" hidden>
+    <div class="panel hero">
+      <div>
+        <h2>Your master is ready</h2>
+        <p id="hero-summary" class="hint"></p>
+      </div>
+      <a id="download" class="button primary" href="#" download>Download WAV</a>
+    </div>
+
+    <div id="stats" class="stats"></div>
     <ul id="warnings" class="warnings" hidden></ul>
 
-    <section id="player" class="player" hidden aria-label="Listen to the result">
-      <h3>Listen</h3>
+    <div class="panel" id="player" hidden>
+      <h3>Compare</h3>
       <div id="player-media"></div>
+      <div class="wave-wrap">
+        <canvas id="wave" class="wave" height="120" role="img" aria-label="Waveform of the selected version. Click to seek."></canvas>
+      </div>
       <div class="player-row">
         <button id="play" type="button" class="primary">Play</button>
         <input id="seek" type="range" min="0" max="1000" step="1" value="0" aria-label="Seek">
@@ -128,28 +164,51 @@
       </div>
       <div class="player-row">
         <div class="segmented" role="group" aria-label="Which version to hear">
-          <button id="hear-original" type="button" aria-pressed="false">Original</button>
-          <button id="hear-mastered" type="button" aria-pressed="true">Mastered</button>
+          <button id="hear-original" type="button" aria-pressed="false">A · Original</button>
+          <button id="hear-mastered" type="button" aria-pressed="true">B · Mastered</button>
         </div>
         <label class="inline"><input type="checkbox" id="match-level" checked> Match loudness</label>
       </div>
       <p id="player-note" class="hint" role="status"></p>
-    </section>
-
-    <h3>Measurements</h3>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th scope="col">Track</th><th scope="col">Loudness</th><th scope="col">True peak</th><th scope="col">Range</th><th scope="col">Stereo correlation</th></tr>
-        </thead>
-        <tbody id="measurements"></tbody>
-      </table>
+      <p class="hint keys">Keys: Space play or pause, A and B switch version, left and right arrows move 5 seconds.</p>
     </div>
-    <p id="gain-summary" class="hint"></p>
 
-    <div id="charts"></div>
+    <div class="panel">
+      <h3>Measurements</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th scope="col">Track</th><th scope="col">Loudness</th><th scope="col">True peak</th><th scope="col">Range</th><th scope="col">Peak to loudness</th><th scope="col">Stereo correlation</th><th scope="col">Mono fold</th></tr>
+          </thead>
+          <tbody id="measurements"></tbody>
+        </table>
+      </div>
+      <p id="gain-summary" class="hint"></p>
+      <p id="limiter-summary" class="hint"></p>
+    </div>
 
-    <button id="again" type="button">Master another track</button>
+    <div class="panel">
+      <h3>On streaming services</h3>
+      <p class="hint">Estimated level change if a service normalises this master to its target. Services differ in whether they also turn quiet tracks up.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th scope="col">Service</th><th scope="col">Target</th><th scope="col">Level change</th><th scope="col">Peak ceiling</th></tr></thead>
+          <tbody id="platforms"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Tone compared with the reference</h3>
+      <div id="spectrum"></div>
+    </div>
+
+    <div class="panel">
+      <h3>EQ</h3>
+      <div id="charts"></div>
+    </div>
+
+    <button id="again" type="button" class="wide">Master another track</button>
   </section>
 </main>
 <footer class="site-footer">
