@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(MasteredEngine VERSION 2.0.0 LANGUAGES CXX)
+project(MasteredEngine VERSION 2.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,8 +24,10 @@ set(MASTERED_SOURCES
     src/limiter.cpp
     src/loudness.cpp
     src/mastering_engine.cpp
+    src/presets.cpp
     src/spectrum.cpp
     src/wav_io.cpp
+    src/waveform.cpp
 )
 
 add_library(mastered_engine STATIC ${MASTERED_SOURCES})
