@@ -36,6 +36,7 @@ bool setOption(mastered::MasteringConfig& c, const std::string& key, double v) {
     else if (key == "dynamics_match") c.dynamicsMatch = flag;
     else if (key == "dynamics_ratio") c.dynamicsRatio = v;
     else if (key == "dynamics_threshold_offset_db") c.dynamicsThresholdOffsetDb = v;
+    else if (key == "mono_bass_hz") c.monoBassHz = v;
     else if (key == "soft_clip") c.softClip = flag;
     else if (key == "soft_clip_knee_db") c.softClipKneeDb = v;
     else if (key == "accurate_peak") c.accuratePeak = flag;
@@ -132,6 +133,11 @@ int mastered_get_metric(mastered_engine* engine, const char* key, double* value)
     else if (k == "output_true_peak_db") *value = r.output.truePeakDb;
     else if (k == "output_lra") *value = r.output.loudnessRangeLu;
     else if (k == "output_correlation") *value = r.output.correlation;
+    else if (k == "output_sample_peak_db") *value = r.output.samplePeakDb;
+    else if (k == "output_mono_loss_db") *value = r.output.monoLossDb;
+    else if (k == "limiter_max_reduction_db") *value = r.limiter.maxReductionDb;
+    else if (k == "match_before_db") *value = r.matchBeforeDb;
+    else if (k == "match_after_db") *value = r.matchAfterDb;
     else if (k == "makeup_gain_db") *value = r.makeupGainDb;
     else if (k == "iterations") *value = static_cast<double>(r.iterations);
     else if (k == "target_reached") *value = r.targetReached ? 1.0 : 0.0;

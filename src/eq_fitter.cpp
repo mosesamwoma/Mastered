@@ -35,6 +35,8 @@ double interpolateTarget(const std::vector<double>& centres, const std::vector<d
     return values[i0] * (1.0 - t) + values[i1] * t;
 }
 
+constexpr double kNoBoostPenalty = 2.0;
+
 class Fitter {
 public:
     Fitter(std::vector<double> grid, std::vector<double> target, std::vector<double> weight, const FitOptions& options, double maxHz)
@@ -44,7 +46,8 @@ public:
           sampleRate_(options.sampleRate),
           minHz_(options.minHz),
           maxHz_(maxHz),
-          maxGain_(options.maxGainDb) {
+          maxGain_(options.maxGainDb),
+          noBoostAbove_(options.noBoostAboveHz) {
         cos1_.resize(grid_.size());
         sin1_.resize(grid_.size());
         cos2_.resize(grid_.size());
@@ -75,6 +78,10 @@ public:
         for (size_t i = 0; i < grid_.size(); ++i) {
             const double d = target_[i] - response[i];
             error += weight_[i] * d * d;
+            if (noBoostAbove_ > 0.0 && grid_[i] >= noBoostAbove_ && response[i] > 0.5) {
+                const double excess = response[i] - 0.5;
+                error += kNoBoostPenalty * excess * excess;
+            }
         }
         return error / weightSum_;
     }
@@ -153,12 +160,56 @@ private:
     double minHz_;
     double maxHz_;
     double maxGain_;
+    double noBoostAbove_;
     double weightSum_ = 0.0;
     std::vector<double> cos1_;
     std::vector<double> sin1_;
     std::vector<double> cos2_;
     std::vector<double> sin2_;
 };
+
+// Replaces two peaking bands of the same sign that sit close together by a single band, when that costs
+// almost nothing in fit quality. Returns true when at least one pair was merged.
+bool mergeNeighbours(std::vector<EQBand>& bands, const Fitter& fitter) {
+    constexpr double kMergeOctaves = 0.5;
+    constexpr double kAllowedCostIncrease = 0.05;
+    bool merged = false;
+    bool again = true;
+    while (again) {
+        again = false;
+        std::sort(bands.begin(), bands.end(), [](const EQBand& a, const EQBand& b) { return a.frequency < b.frequency; });
+        const double baseline = fitter.cost(bands);
+        for (size_t i = 0; i + 1 < bands.size(); ++i) {
+            const EQBand& a = bands[i];
+            const EQBand& b = bands[i + 1];
+            if (a.type != BandType::Peak || b.type != BandType::Peak || (a.gainDb > 0.0) != (b.gainDb > 0.0)) {
+                continue;
+            }
+            if (std::log2(b.frequency / a.frequency) > kMergeOctaves) {
+                continue;
+            }
+            const double weightA = std::fabs(a.gainDb);
+            const double weightB = std::fabs(b.gainDb);
+            EQBand joined;
+            joined.type = BandType::Peak;
+            joined.frequency = std::exp((weightA * std::log(a.frequency) + weightB * std::log(b.frequency)) / (weightA + weightB));
+            joined.gainDb = a.gainDb + b.gainDb;
+            joined.q = 0.5 * (a.q + b.q);
+            fitter.clampBand(joined);
+            std::vector<EQBand> trial = bands;
+            trial[i] = joined;
+            trial.erase(trial.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            fitter.refine(trial, i);
+            if (fitter.cost(trial) <= baseline + kAllowedCostIncrease) {
+                bands = std::move(trial);
+                merged = true;
+                again = true;
+                break;
+            }
+        }
+    }
+    return merged;
+}
 
 }
 
@@ -207,59 +258,74 @@ FitResult fitEQ(const std::vector<double>& centresHz, const std::vector<double>&
     std::vector<EQBand> bands;
     double current = fitter.cost(bands);
     const std::array<BandType, 3> types = {BandType::Peak, BandType::LowShelf, BandType::HighShelf};
+    const auto hasType = [&bands](BandType type) {
+        return std::any_of(bands.begin(), bands.end(), [type](const EQBand& b) { return b.type == type; });
+    };
 
-    for (size_t iteration = 0; iteration < options.maxBands; ++iteration) {
-        const std::vector<double> response = fitter.response(bands);
-        std::vector<double> residual(grid.size());
-        for (size_t i = 0; i < grid.size(); ++i) {
-            residual[i] = target[i] - response[i];
-        }
-        std::vector<double> smoothed(grid.size());
-        for (size_t i = 0; i < grid.size(); ++i) {
-            const size_t lo = i >= 2 ? i - 2 : 0;
-            const size_t hi = std::min(i + 2, grid.size() - 1);
-            double sum = 0.0;
-            for (size_t j = lo; j <= hi; ++j) {
-                sum += residual[j];
+    // Adding bands one at a time can leave a pair of bands that do the work of one. Merging them frees
+    // a band for something else, so the two steps run twice.
+    for (int round = 0; round < 2; ++round) {
+        while (bands.size() < options.maxBands) {
+            const std::vector<double> response = fitter.response(bands);
+            std::vector<double> residual(grid.size());
+            for (size_t i = 0; i < grid.size(); ++i) {
+                residual[i] = target[i] - response[i];
             }
-            smoothed[i] = sum / static_cast<double>(hi - lo + 1);
-        }
-        size_t pick = 0;
-        double significance = 0.0;
-        for (size_t i = 0; i < grid.size(); ++i) {
-            const double s = weight[i] * std::fabs(smoothed[i]);
-            if (s > significance) {
-                significance = s;
-                pick = i;
+            std::vector<double> smoothed(grid.size());
+            for (size_t i = 0; i < grid.size(); ++i) {
+                const size_t lo = i >= 2 ? i - 2 : 0;
+                const size_t hi = std::min(i + 2, grid.size() - 1);
+                double sum = 0.0;
+                for (size_t j = lo; j <= hi; ++j) {
+                    sum += residual[j];
+                }
+                smoothed[i] = sum / static_cast<double>(hi - lo + 1);
             }
+            size_t pick = 0;
+            double significance = 0.0;
+            for (size_t i = 0; i < grid.size(); ++i) {
+                const double s = weight[i] * std::fabs(smoothed[i]);
+                if (s > significance) {
+                    significance = s;
+                    pick = i;
+                }
+            }
+            if (significance < 0.4) {
+                break;
+            }
+            const double initialGain = std::min(std::max(smoothed[pick], -options.maxGainDb), options.maxGainDb);
+            std::vector<EQBand> bestTrial;
+            double bestCost = std::numeric_limits<double>::infinity();
+            for (BandType type : types) {
+                // One shelf of each kind is enough; a second one next to it only repeats the first.
+                if (type != BandType::Peak && hasType(type)) {
+                    continue;
+                }
+                EQBand candidate;
+                candidate.type = type;
+                candidate.frequency = grid[pick];
+                candidate.gainDb = initialGain;
+                candidate.q = type == BandType::Peak ? 1.0 : 0.7;
+                fitter.clampBand(candidate);
+                std::vector<EQBand> trial = bands;
+                trial.push_back(candidate);
+                fitter.refine(trial, trial.size() - 1);
+                const double c = fitter.cost(trial);
+                if (c < bestCost) {
+                    bestCost = c;
+                    bestTrial = std::move(trial);
+                }
+            }
+            if (bestTrial.empty() || !(bestCost < current - 1e-3)) {
+                break;
+            }
+            bands = std::move(bestTrial);
+            fitter.refine(bands, 0);
+            current = fitter.cost(bands);
         }
-        if (significance < 0.4) {
+        if (!mergeNeighbours(bands, fitter)) {
             break;
         }
-        const double initialGain = std::min(std::max(smoothed[pick], -options.maxGainDb), options.maxGainDb);
-        std::vector<EQBand> bestTrial;
-        double bestCost = std::numeric_limits<double>::infinity();
-        for (BandType type : types) {
-            EQBand candidate;
-            candidate.type = type;
-            candidate.frequency = grid[pick];
-            candidate.gainDb = initialGain;
-            candidate.q = type == BandType::Peak ? 1.0 : 0.7;
-            fitter.clampBand(candidate);
-            std::vector<EQBand> trial = bands;
-            trial.push_back(candidate);
-            fitter.refine(trial, trial.size() - 1);
-            const double c = fitter.cost(trial);
-            if (c < bestCost) {
-                bestCost = c;
-                bestTrial = std::move(trial);
-            }
-        }
-        if (!(bestCost < current - 1e-3)) {
-            break;
-        }
-        bands = std::move(bestTrial);
-        fitter.refine(bands, 0);
         current = fitter.cost(bands);
     }
 

@@ -23,14 +23,21 @@ std::vector<Biquad> makeFilters(const std::vector<EQBand>& bands, double sampleR
 ProcessingChain::ProcessingChain(const ChainPlan& plan, double sampleRate, size_t channels)
     : plan_(plan),
       channels_(channels),
-      useMidSide_(plan.midSide && channels == 2),
+      useMidSide_((plan.midSide || plan.monoBassHz > 0.0) && channels == 2),
       gainLinear_(std::pow(10.0, plan.gainDb / 20.0)) {
     if (channels == 0 || channels > kMaxChannels) {
         throw MasteredError("Unsupported channel count");
     }
     if (useMidSide_) {
         midFilters_ = makeFilters(plan.midBands, sampleRate);
-        sideFilters_ = makeFilters(plan.sideBands, sampleRate);
+        // When mid/side is only switched on for bass mono, the side signal gets the same EQ as the mid signal,
+        // which is identical to filtering left and right directly.
+        sideFilters_ = makeFilters(plan.midSide ? plan.sideBands : plan.midBands, sampleRate);
+        if (plan.monoBassHz > 0.0) {
+            // A fourth-order high-pass on the side signal makes everything below the corner frequency mono.
+            const BiquadCoefficients highPass = designButterworth(true, plan.monoBassHz, sampleRate);
+            sideHighPass_.assign(2, Biquad(highPass));
+        }
     } else {
         for (size_t ch = 0; ch < channels; ++ch) {
             channelFilters_.push_back(makeFilters(plan.midBands, sampleRate));
@@ -52,6 +59,16 @@ size_t ProcessingChain::latency() const {
     return limiter_ ? limiter_->latency() : 0;
 }
 
+void ProcessingChain::collectLimiterStatistics(bool enabled) {
+    if (limiter_) {
+        limiter_->collectStatistics(enabled);
+    }
+}
+
+LimiterStats ProcessingChain::limiterStatistics() const {
+    return limiter_ ? limiter_->statistics() : LimiterStats();
+}
+
 void ProcessingChain::process(AudioBlock& block, size_t frames) {
     if (useMidSide_) {
         mid_.resize(frames);
@@ -66,8 +83,12 @@ void ProcessingChain::process(AudioBlock& block, size_t frames) {
         for (Biquad& filter : sideFilters_) {
             filter.processBlock(side_.data(), frames);
         }
+        for (Biquad& filter : sideHighPass_) {
+            filter.processBlock(side_.data(), frames);
+        }
+        const double sideGain = plan_.midSide ? plan_.sideGain : 1.0;
         for (size_t i = 0; i < frames; ++i) {
-            const double s = side_[i] * plan_.sideGain;
+            const double s = side_[i] * sideGain;
             block[0][i] = mid_[i] + s;
             block[1][i] = mid_[i] - s;
         }

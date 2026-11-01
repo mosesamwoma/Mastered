@@ -1,6 +1,7 @@
 #include "constants.h"
 #include "error.h"
 #include "mastering_engine.h"
+#include "presets.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -25,6 +26,10 @@ void printUsage() {
         "  --output PATH         Mastered WAV path (default: <input>_mastered.wav)\n"
         "  --json PATH           Analysis report path (default: output with .json)\n"
         "  --presets             Also write ReaEQ and Equalizer APO band lists\n"
+        "  --preset NAME         Loudness target and ceiling for a service (see --list-presets);\n"
+        "                        --target and --ceiling still override it\n"
+        "  --list-presets        Print the presets as JSON and exit\n"
+        "  --mono-bass HZ        Make everything below HZ mono, 20 to 500 (default off)\n"
         "  --target LUFS         Loudness target, -60 to -1 (default -14)\n"
         "  --aggressive N        EQ strength, 0 to 1 (default 0.85)\n"
         "  --ceiling DB          True-peak ceiling, -12 to 0 (default -1)\n"
@@ -85,7 +90,8 @@ void printMeasurements(const char* label, const mastered::Measurements& m) {
               << std::setw(7) << m.integratedLufs << " LUFS  " << std::setw(6) << m.truePeakDb << " dBTP  LRA "
               << std::setw(4) << m.loudnessRangeLu << " LU";
     if (m.hasStereo) {
-        std::cout << "  corr " << std::setprecision(2) << m.correlation;
+        std::cout << "  corr " << std::setprecision(2) << m.correlation << "  mono " << std::showpos << std::setprecision(1) << m.monoLossDb
+                  << std::noshowpos << " dB";
     }
     std::cout << "\n";
 }
@@ -113,6 +119,26 @@ int run(int argc, char** argv) {
     bool presets = false;
     bool verbose = false;
 
+    // A preset is applied first so that explicit options always win, whatever their order.
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--list-presets") {
+            std::cout << mastered::presetsJson() << "\n";
+            return 0;
+        }
+        if (arg == "--preset") {
+            if (i + 1 >= argc) {
+                throw MasteredError("Missing value for --preset");
+            }
+            const mastered::Preset* preset = mastered::findPreset(argv[i + 1]);
+            if (preset == nullptr) {
+                throw MasteredError(std::string("Unknown preset: ") + argv[i + 1] + " (use --list-presets)");
+            }
+            config.targetLufs = preset->targetLufs;
+            config.ceilingDb = preset->ceilingDb;
+        }
+    }
+
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto value = [&]() -> std::string {
@@ -132,6 +158,10 @@ int run(int argc, char** argv) {
             jsonPath = value();
         } else if (arg == "--presets") {
             presets = true;
+        } else if (arg == "--preset") {
+            value();
+        } else if (arg == "--mono-bass") {
+            config.monoBassHz = parseNumber(arg, value());
         } else if (arg == "--target") {
             config.targetLufs = parseNumber(arg, value());
         } else if (arg == "--aggressive") {
@@ -220,6 +250,12 @@ int run(int argc, char** argv) {
     printMeasurements("Input", result.analysis.input);
     printMeasurements("Reference", result.analysis.reference);
     printMeasurements("Output", result.output);
+    if (result.matchMeasured) {
+        std::cout << "  Tonal match to reference " << std::fixed << std::setprecision(2) << result.matchBeforeDb << " dB -> "
+                  << result.matchAfterDb << " dB RMS difference\n";
+    }
+    std::cout << "  Limiter: max " << std::fixed << std::setprecision(1) << result.limiter.maxReductionDb << " dB, average "
+              << std::setprecision(2) << result.limiter.averageReductionDb << " dB gain reduction\n";
     std::cout << "  Makeup gain " << std::fixed << std::setprecision(2) << result.makeupGainDb << " dB after " << result.iterations
               << " loudness pass" << (result.iterations == 1 ? "" : "es") << "\n";
     if (verbose) {

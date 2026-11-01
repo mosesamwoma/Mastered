@@ -3,6 +3,7 @@
 #include "constants.h"
 #include "dynamics.h"
 #include "error.h"
+#include "presets.h"
 #include "wav_io.h"
 
 #include <algorithm>
@@ -23,6 +24,8 @@ constexpr double kMaxWidthDb = 3.0;
 constexpr double kMaxMakeupDb = 40.0;
 constexpr double kPeakSafetyDb = 0.1;
 constexpr int kMaxPeakTrims = 4;
+constexpr double kEmptyBandDb = -50.0;
+constexpr size_t kWaveformColumns = 800;
 
 struct FileScan {
     uint32_t sampleRate = 0;
@@ -33,6 +36,7 @@ struct FileScan {
     AverageSpectrum spectrum;
     Measurements measurements;
     std::array<BandStatistics, 3> bandStats;
+    Waveform waveform;
 };
 
 void requireFinite(double value, const char* name) {
@@ -59,6 +63,10 @@ void validateConfig(const MasteringConfig& c) {
     requireRange(c.dynamicsRatio, 1.0, 20.0, "dynamicsRatio");
     requireRange(c.dynamicsThresholdOffsetDb, -24.0, 24.0, "dynamicsThresholdOffsetDb");
     requireRange(c.softClipKneeDb, 0.1, 12.0, "softClipKneeDb");
+    requireFinite(c.monoBassHz, "monoBassHz");
+    if (c.monoBassHz != 0.0 && (c.monoBassHz < 20.0 || c.monoBassHz > 500.0)) {
+        throw MasteredError("Configuration value out of range: monoBassHz must be 0 (off) or between 20 and 500");
+    }
     requireRange(c.limiterLookaheadMs, 0.5, 20.0, "limiterLookaheadMs");
     requireRange(c.limiterReleaseMs, 5.0, 1000.0, "limiterReleaseMs");
     requireRange(c.loudnessToleranceLu, 0.01, 2.0, "loudnessToleranceLu");
@@ -86,13 +94,16 @@ FileScan scanFile(const std::string& path, size_t fftSize) {
     SpectrumAccumulator spectrum(scan.sampleRate, scan.channels, fftSize);
     Meter meter(scan.sampleRate, scan.channels);
     BandLevelMeter bands(scan.sampleRate, DynamicsSettings().lowCrossoverHz, DynamicsSettings().highCrossoverHz);
+    WaveformBuilder waveform(scan.frames, kWaveformColumns);
     AudioBlock block;
     size_t n;
     while ((n = reader.read(block, kBlockFrames)) > 0) {
         spectrum.push(block, n);
         meter.process(block, n);
         bands.process(block, n);
+        waveform.process(block, n);
     }
+    scan.waveform = waveform.finish();
     scan.spectrum = spectrum.finish();
     scan.measurements = meter.finish();
     scan.bandStats = bands.statistics();
@@ -129,8 +140,10 @@ std::vector<double> shapeOf(const std::vector<double>& levels, const std::vector
     return shape;
 }
 
-CurveFit fitCurve(const std::vector<double>& centres, const std::vector<double>& target, size_t maxBands, double sampleRate, double maxHz, bool perceptual) {
+CurveFit fitCurve(const std::vector<double>& centres, const std::vector<double>& target, size_t maxBands, double sampleRate, double maxHz, bool perceptual,
+                  double noBoostAboveHz = 0.0) {
     FitOptions options;
+    options.noBoostAboveHz = noBoostAboveHz;
     options.sampleRate = sampleRate;
     options.maxHz = maxHz;
     options.maxBands = maxBands;
@@ -169,17 +182,23 @@ std::vector<double> buildTarget(const AverageSpectrum& input, const std::vector<
     const double offset = inRange.size() % 2 == 1 ? inRange[middle] : 0.5 * (inRange[middle - 1] + inRange[middle]);
     std::vector<double> target(centres.size());
     for (size_t i = 0; i < target.size(); ++i) {
-        const double value = (difference[i] - offset) * aggressiveness;
+        double value = (difference[i] - offset) * aggressiveness;
+        if (inputShape[i] < kEmptyBandDb) {
+            // Nothing is there to match (for example above the cut-off of a lossy file); boosting would only raise noise.
+            value = std::min(value, 0.0);
+        }
         target[i] = std::min(std::max(value, -kMaxTargetDb), kMaxTargetDb);
     }
     return target;
 }
 
-Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter* writer, PeakMode peakMode) {
+Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter* writer, PeakMode peakMode,
+                     WaveformBuilder* waveform = nullptr, LimiterStats* limiter = nullptr) {
     WavReader reader(input);
     const size_t channels = reader.channels();
     ProcessingChain chain(plan, reader.sampleRate(), channels);
     Meter meter(reader.sampleRate(), channels, peakMode);
+    chain.collectLimiterStatistics(limiter != nullptr);
     size_t skip = chain.latency();
     AudioBlock block;
 
@@ -199,6 +218,9 @@ Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter*
         }
         const size_t count = frames - offset;
         meter.process(data, count);
+        if (waveform) {
+            waveform->process(data, count);
+        }
         if (writer) {
             writer->write(data, count);
         }
@@ -217,7 +239,30 @@ Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter*
         emitBlock(tail, count);
         pending -= count;
     }
+    if (limiter) {
+        *limiter = chain.limiterStatistics();
+    }
     return meter.finish();
+}
+
+AverageSpectrum scanSpectrum(const std::string& path, size_t fftSize) {
+    WavReader reader(path);
+    SpectrumAccumulator spectrum(reader.sampleRate(), reader.channels(), fftSize);
+    AudioBlock block;
+    size_t n;
+    while ((n = reader.read(block, kBlockFrames)) > 0) {
+        spectrum.push(block, n);
+    }
+    return spectrum.finish();
+}
+
+double rmsDifference(const std::vector<double>& a, const std::vector<double>& b, const std::vector<size_t>& range) {
+    double sum = 0.0;
+    for (size_t i : range) {
+        const double d = a[i] - b[i];
+        sum += d * d;
+    }
+    return std::sqrt(sum / static_cast<double>(std::max<size_t>(range.size(), 1)));
 }
 
 std::string escapeJson(const std::string& text) {
@@ -257,10 +302,42 @@ std::string measurementsJson(const Measurements& m) {
     std::ostringstream out;
     out << "{\"integratedLufs\": " << num(m.integratedLufs, 2)
         << ", \"loudnessRangeLu\": " << num(m.loudnessRangeLu, 2)
+        << ", \"momentaryMaxLufs\": " << num(m.momentaryMaxLufs, 2)
+        << ", \"shortTermMaxLufs\": " << num(m.shortTermMaxLufs, 2)
         << ", \"truePeakDb\": " << num(m.truePeakDb, 2)
+        << ", \"samplePeakDb\": " << num(m.samplePeakDb, 2)
+        << ", \"plrDb\": " << num(m.plrDb(), 2)
+        << ", \"dcOffset\": " << num(m.dcOffset, 5)
+        << ", \"clippedSamples\": " << m.clippedSamples
         << ", \"stereoCorrelation\": " << (m.hasStereo ? num(m.correlation, 3) : "null")
+        << ", \"lowCorrelation\": " << (m.hasStereo ? num(m.lowCorrelation, 3) : "null")
+        << ", \"monoLossDb\": " << (m.hasStereo ? num(m.monoLossDb, 2) : "null")
         << ", \"sideToMidDb\": " << (m.hasStereo ? num(m.sideToMidDb, 2) : "null") << "}";
     return out.str();
+}
+
+std::string numberArray(const std::vector<double>& values, int precision) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        out << (i > 0 ? ", " : "") << num(values[i], precision);
+    }
+    out << "]";
+    return out.str();
+}
+
+std::string floatArray(const std::vector<float>& values) {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        out << (i > 0 ? "," : "") << num(static_cast<double>(values[i]), 4);
+    }
+    out << "]";
+    return out.str();
+}
+
+std::string waveformJson(const Waveform& w) {
+    return "{\"peak\": " + floatArray(w.peak) + ", \"rms\": " + floatArray(w.rms) + "}";
 }
 
 std::string curveJson(const CurveFit& curve) {
@@ -366,6 +443,8 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     averaged.truePeakDb = 0.0;
     averaged.correlation = 0.0;
     averaged.sideToMidDb = 0.0;
+    averaged.lowCorrelation = 0.0;
+    averaged.monoLossDb = 0.0;
     size_t stereoRefs = 0;
     for (const FileScan& ref : refs) {
         minRate = std::min(minRate, static_cast<double>(ref.sampleRate));
@@ -376,14 +455,19 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
             ++stereoRefs;
             averaged.correlation += ref.measurements.correlation;
             averaged.sideToMidDb += ref.measurements.sideToMidDb;
+            averaged.monoLossDb += ref.measurements.monoLossDb;
+            averaged.lowCorrelation += ref.measurements.lowCorrelation;
         }
     }
     if (stereoRefs > 0) {
         averaged.hasStereo = true;
         averaged.correlation /= static_cast<double>(stereoRefs);
         averaged.sideToMidDb /= static_cast<double>(stereoRefs);
+        averaged.monoLossDb /= static_cast<double>(stereoRefs);
+        averaged.lowCorrelation /= static_cast<double>(stereoRefs);
     } else {
         averaged.correlation = 1.0;
+        averaged.lowCorrelation = 1.0;
         averaged.sideToMidDb = -120.0;
     }
     analysis.reference = averaged;
@@ -403,13 +487,35 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         }
     }
 
+    analysis.shapeCentresHz = centres;
+    analysis.shapeRange = range;
+    analysis.shapeWidthOctaves = width;
+    analysis.inputWaveform = in.waveform;
+    analysis.inputShapeDb = shapeOf(bandLevelsDb(in.spectrum, false, centres, width), range);
+    analysis.referenceShapeDb.assign(centres.size(), 0.0);
+    for (const FileScan& ref : refs) {
+        const std::vector<double> shape = shapeOf(bandLevelsDb(ref.spectrum, false, centres, width), range);
+        for (size_t i = 0; i < shape.size(); ++i) {
+            analysis.referenceShapeDb[i] += shape[i] / count;
+        }
+    }
+
+    // The highest stretch of bands where the input has no content, for example above the cut-off of a lossy file.
+    double emptyAboveHz = 0.0;
+    for (size_t i = centres.size(); i > 0; --i) {
+        if (analysis.inputShapeDb[i - 1] >= kEmptyBandDb) {
+            break;
+        }
+        emptyAboveHz = centres[i - 1];
+    }
+
     emit("Fitting mid EQ", 32.0);
     std::vector<const AverageSpectrum*> referenceSpectra;
     for (const FileScan& ref : refs) {
         referenceSpectra.push_back(&ref.spectrum);
     }
     const std::vector<double> midTarget = buildTarget(in.spectrum, referenceSpectra, false, centres, width, range, config_.aggressiveness);
-    analysis.mid = fitCurve(centres, midTarget, config_.maxEQBands, in.sampleRate, maxHz, config_.perceptualWeighting);
+    analysis.mid = fitCurve(centres, midTarget, config_.maxEQBands, in.sampleRate, maxHz, config_.perceptualWeighting, emptyAboveHz);
     analysis.plan.midBands = analysis.mid.bands;
 
     const bool inputStereo = in.channels == 2 && in.measurements.sideToMidDb > kSideFloorDb;
@@ -433,6 +539,13 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         }
     }
     analysis.plan.midSide = in.channels == 2 && (!analysis.plan.sideBands.empty() || std::fabs(analysis.sideGainDb) >= 0.05);
+    if (config_.monoBassHz > 0.0) {
+        if (in.channels == 2) {
+            analysis.plan.monoBassHz = config_.monoBassHz;
+        } else {
+            analysis.warnings.push_back("Mono bass only applies to stereo files and was skipped");
+        }
+    }
 
     if (config_.dynamics) {
         DynamicsSettings dynamics;
@@ -520,6 +633,15 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     if (in.measurements.truePeakDb > 0.0) {
         analysis.warnings.push_back("Input contains true peaks above 0 dBTP");
     }
+    if (in.measurements.clippedSamples > 0) {
+        analysis.warnings.push_back("Input has " + std::to_string(in.measurements.clippedSamples) + " samples at full scale; it may already be clipped");
+    }
+    if (in.measurements.dcOffset > 0.005) {
+        analysis.warnings.push_back("Input has a DC offset; it wastes headroom and can be removed with a high-pass filter");
+    }
+    if (in.measurements.hasStereo && in.measurements.lowCorrelation < 0.3 && config_.monoBassHz <= 0.0) {
+        analysis.warnings.push_back("Low frequencies are partly out of phase between left and right; mono bass is recommended");
+    }
     if (in.measurements.integratedLufs <= -100.0) {
         analysis.warnings.push_back("Input is too quiet to measure loudness");
     }
@@ -599,7 +721,7 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         pre.gainDb = 0.0;
         const Measurements preMeasure = runPass(input, pre, nullptr, PeakMode::Off);
         if (preMeasure.integratedLufs <= -100.0) {
-            throw MasteredError("Audio is too quiet to normalise to a loudness target");
+            throw MasteredError("Audio is too quiet to measure (below -70 LUFS), so it cannot be normalised to a loudness target; raise its level first");
         }
         startGain = std::min(std::max(config_.targetLufs - preMeasure.integratedLufs, -kMaxMakeupDb), kMaxMakeupDb);
         gain = startGain;
@@ -619,11 +741,16 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         }
         advance(attempt == 0 ? "Writing mastered audio" : "Adjusting the peak ceiling", percent + 3.0);
         WavWriter writer(output, analysis.sampleRate, analysis.channels, depth, config_.dither, config_.noiseShaping);
-        const Measurements measured = runPass(input, planFor(gain), &writer, config_.accuratePeak ? PeakMode::Accurate : PeakMode::Standard);
+        WaveformBuilder waveform(analysis.frames, kWaveformColumns);
+        LimiterStats limiterStats;
+        const Measurements measured = runPass(input, planFor(gain), &writer, config_.accuratePeak ? PeakMode::Accurate : PeakMode::Standard,
+                                              &waveform, &limiterStats);
         const double over = measured.truePeakDb - peakTarget;
         if (!config_.accuratePeak || over <= 0.005 || attempt >= kMaxPeakTrims) {
             writer.finalize();
             result.output = measured;
+            result.outputWaveform = waveform.finish();
+            result.limiter = limiterStats;
             break;
         }
         trimDb += over + 0.02;
@@ -648,6 +775,23 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         std::ostringstream message;
         message << "True peak of " << std::fixed << std::setprecision(2) << result.output.truePeakDb
                 << " dBTP is above the ceiling of " << config_.ceilingDb << " dBTP";
+        result.warnings.push_back(message.str());
+    }
+    if (!analysis.shapeCentresHz.empty()) {
+        try {
+            advance("Checking the match to the reference", 99.0);
+            const AverageSpectrum spectrum = scanSpectrum(output, config_.fftSize);
+            result.outputShapeDb = shapeOf(bandLevelsDb(spectrum, false, analysis.shapeCentresHz, analysis.shapeWidthOctaves), analysis.shapeRange);
+            result.matchBeforeDb = rmsDifference(analysis.referenceShapeDb, analysis.inputShapeDb, analysis.shapeRange);
+            result.matchAfterDb = rmsDifference(analysis.referenceShapeDb, result.outputShapeDb, analysis.shapeRange);
+            result.matchMeasured = true;
+        } catch (const MasteredError&) {
+            result.outputShapeDb.clear();
+        }
+    }
+    if (result.output.hasStereo && result.output.monoLossDb < -4.0) {
+        std::ostringstream message;
+        message << "Folding to mono lowers the level by " << std::fixed << std::setprecision(1) << -result.output.monoLossDb << " dB";
         result.warnings.push_back(message.str());
     }
     if (result.output.hasStereo && result.output.correlation < 0.0) {
@@ -692,6 +836,16 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result) {
         out << (i > 0 ? ", " : "") << num(a.referenceSpreadDb[i], 2);
     }
     out << "]}},\n";
+    out << "  \"limiter\": {\"maxReductionDb\": " << num(result.limiter.maxReductionDb, 2)
+        << ", \"averageReductionDb\": " << num(result.limiter.averageReductionDb, 3)
+        << ", \"reducedFraction\": " << num(result.limiter.reducedFraction, 4) << "},\n";
+    out << "  \"monoBassHz\": " << num(a.plan.monoBassHz, 1) << ",\n";
+    out << "  \"spectrum\": {\"frequencies\": " << numberArray(a.shapeCentresHz, 1) << ", \"input\": " << numberArray(a.inputShapeDb, 2)
+        << ", \"reference\": " << numberArray(a.referenceShapeDb, 2) << ", \"output\": " << numberArray(result.outputShapeDb, 2)
+        << ", \"match\": {\"measured\": " << (result.matchMeasured ? "true" : "false") << ", \"beforeDb\": " << num(result.matchBeforeDb, 2)
+        << ", \"afterDb\": " << num(result.matchAfterDb, 2) << "}},\n";
+    out << "  \"waveform\": {\"columns\": " << a.inputWaveform.peak.size() << ", \"input\": " << waveformJson(a.inputWaveform)
+        << ", \"output\": " << waveformJson(result.outputWaveform) << "},\n";
     out << "  \"warnings\": [";
     for (size_t i = 0; i < result.warnings.size(); ++i) {
         out << (i > 0 ? ", " : "") << quote(result.warnings[i]);
@@ -702,6 +856,10 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result) {
 
 std::string MasteringEngine::exportReaEQ(const Analysis& analysis) {
     std::ostringstream out;
+    if (analysis.plan.monoBassHz > 0.0) {
+        out << "Note: mono bass below " << std::fixed << std::setprecision(0) << analysis.plan.monoBassHz
+            << " Hz is applied by the engine and is not part of these bands\n";
+    }
     out << (analysis.plan.midSide ? "Mid EQ\n" : "EQ\n");
     if (analysis.mid.bands.empty()) {
         out << "No bands\n";
@@ -726,6 +884,10 @@ std::string MasteringEngine::exportReaEQ(const Analysis& analysis) {
 
 std::string MasteringEngine::exportEqualizerAPO(const Analysis& analysis) {
     std::ostringstream out;
+    if (analysis.plan.monoBassHz > 0.0) {
+        out << "# Mono bass below " << std::fixed << std::setprecision(0) << analysis.plan.monoBassHz
+            << " Hz is applied by the engine and is not part of this file\n";
+    }
     double peakGain = 0.0;
     for (double value : analysis.mid.responseDb) {
         peakGain = std::max(peakGain, value);

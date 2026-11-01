@@ -196,6 +196,7 @@ LoudnessResult LoudnessMeter::finish() const {
     momentary.reserve(n);
     for (size_t j = 3; j < n; ++j) {
         momentary.push_back((prefix[j + 1] - prefix[j - 3]) / 4.0);
+        result.momentaryMaxLufs = std::max(result.momentaryMaxLufs, powerToLufs(momentary.back()));
     }
     std::vector<double> gated;
     double sum = 0.0;
@@ -227,6 +228,7 @@ LoudnessResult LoudnessMeter::finish() const {
         shortTerm.reserve(n);
         for (size_t j = 29; j < n; ++j) {
             shortTerm.push_back((prefix[j + 1] - prefix[j - 29]) / 30.0);
+            result.shortTermMaxLufs = std::max(result.shortTermMaxLufs, powerToLufs(shortTerm.back()));
         }
         std::vector<double> absolute;
         double absoluteSum = 0.0;
@@ -288,17 +290,48 @@ double TruePeakMeter::peakDb() const {
     return 20.0 * std::log10(std::max(peak_, 1e-10));
 }
 
+namespace {
+
+constexpr double kLowBandHz = 120.0;
+constexpr double kClipLevel = 0.99995;
+
+}
+
 Meter::Meter(double sampleRate, size_t channels, PeakMode peakMode)
     : channels_(channels),
       peakMode_(peakMode),
       loudness_(sampleRate, channels),
-      truePeak_(channels, peakMode == PeakMode::Accurate ? accurateKernel() : standardKernel()) {}
+      truePeak_(channels, peakMode == PeakMode::Accurate ? accurateKernel() : standardKernel()),
+      sums_(channels, 0.0) {
+    if (channels >= 2 && kLowBandHz < sampleRate * 0.45) {
+        const BiquadCoefficients lowPass = designButterworth(false, kLowBandHz, sampleRate);
+        lowLeft_.setCoefficients(lowPass);
+        lowRight_.setCoefficients(lowPass);
+        lowReady_ = true;
+    }
+}
 
 void Meter::process(const AudioBlock& block, size_t frames) {
     loudness_.process(block, frames);
     if (peakMode_ != PeakMode::Off) {
         truePeak_.process(block, frames);
     }
+    for (size_t ch = 0; ch < channels_; ++ch) {
+        const double* data = block[ch].data();
+        double sum = 0.0;
+        double peak = samplePeak_;
+        uint64_t clipped = 0;
+        for (size_t i = 0; i < frames; ++i) {
+            const double a = std::fabs(data[i]);
+            sum += data[i];
+            peak = std::max(peak, a);
+            clipped += a >= kClipLevel ? 1 : 0;
+        }
+        sums_[ch] += sum;
+        samplePeak_ = peak;
+        clipped_ += clipped;
+    }
+    frames_ += frames;
     if (channels_ >= 2) {
         for (size_t i = 0; i < frames; ++i) {
             const double l = block[0][i];
@@ -310,6 +343,13 @@ void Meter::process(const AudioBlock& block, size_t frames) {
             const double s = 0.5 * (l - r);
             midEnergy_ += m * m;
             sideEnergy_ += s * s;
+            if (lowReady_) {
+                const double ll = lowLeft_.process(l);
+                const double lr = lowRight_.process(r);
+                lowLeftEnergy_ += ll * ll;
+                lowRightEnergy_ += lr * lr;
+                lowCrossEnergy_ += ll * lr;
+            }
         }
     }
 }
@@ -322,8 +362,17 @@ Measurements Meter::finish() {
     Measurements m;
     m.integratedLufs = loudness.integratedLufs;
     m.loudnessRangeLu = loudness.loudnessRangeLu;
+    m.momentaryMaxLufs = loudness.momentaryMaxLufs;
+    m.shortTermMaxLufs = loudness.shortTermMaxLufs;
     if (peakMode_ != PeakMode::Off) {
         m.truePeakDb = truePeak_.peakDb();
+    }
+    m.samplePeakDb = 20.0 * std::log10(std::max(samplePeak_, 1e-10));
+    m.clippedSamples = clipped_;
+    if (frames_ > 0) {
+        for (size_t ch = 0; ch < channels_; ++ch) {
+            m.dcOffset = std::max(m.dcOffset, std::fabs(sums_[ch] / static_cast<double>(frames_)));
+        }
     }
     if (channels_ >= 2) {
         m.hasStereo = true;
@@ -335,6 +384,17 @@ Measurements Meter::finish() {
             m.correlation = crossEnergy_ / std::sqrt(leftEnergy_ * rightEnergy_);
         }
         m.sideToMidDb = 10.0 * std::log10(std::max(sideEnergy_, 1e-20) / std::max(midEnergy_, 1e-20));
+        const double channelPower = 0.5 * (leftEnergy_ + rightEnergy_);
+        if (channelPower > 0.0) {
+            m.monoLossDb = 10.0 * std::log10(std::max(midEnergy_, 1e-20) / channelPower);
+        }
+        if (lowLeftEnergy_ <= 0.0 && lowRightEnergy_ <= 0.0) {
+            m.lowCorrelation = 1.0;
+        } else if (lowLeftEnergy_ <= 0.0 || lowRightEnergy_ <= 0.0) {
+            m.lowCorrelation = 0.0;
+        } else {
+            m.lowCorrelation = lowCrossEnergy_ / std::sqrt(lowLeftEnergy_ * lowRightEnergy_);
+        }
     }
     return m;
 }

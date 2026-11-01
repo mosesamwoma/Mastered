@@ -8,6 +8,16 @@
 
 namespace mastered {
 
+namespace {
+
+constexpr double kSilentPower = 1e-13;
+constexpr double kBucketFloorDb = -130.0;
+constexpr double kBucketStepDb = 10.0;
+constexpr double kNormalGateDb = -70.0;
+constexpr double kRelativeGateDb = 50.0;
+
+}
+
 SpectrumAccumulator::SpectrumAccumulator(double sampleRate, size_t channels, size_t fftSize)
     : sampleRate_(sampleRate),
       channels_(channels),
@@ -15,8 +25,9 @@ SpectrumAccumulator::SpectrumAccumulator(double sampleRate, size_t channels, siz
       fft_(fftSize),
       window_(fftSize),
       work_(fftSize),
-      midSum_(fftSize / 2 + 1, 0.0),
-      sideSum_(fftSize / 2 + 1, 0.0) {
+      midSum_(kLevelBuckets),
+      sideSum_(kLevelBuckets),
+      bucketFrames_(kLevelBuckets, 0) {
     for (size_t i = 0; i < fftSize; ++i) {
         window_[i] = 0.5 * (1.0 - std::cos(2.0 * kPi * static_cast<double>(i) / static_cast<double>(fftSize)));
         windowEnergy_ += window_[i] * window_[i];
@@ -51,41 +62,75 @@ void SpectrumAccumulator::processFrame(size_t offset) {
         const double m = midPending_[offset + i];
         energy += m * m;
     }
-    if (energy / static_cast<double>(fftSize_) < 1e-7) {
+    const double meanPower = energy / static_cast<double>(fftSize_);
+    if (meanPower < kSilentPower) {
         ++silent_;
         return;
     }
+    const double levelDb = 10.0 * std::log10(meanPower);
+    loudestDb_ = std::max(loudestDb_, levelDb);
+    const double slot = std::floor((levelDb - kBucketFloorDb) / kBucketStepDb);
+    const size_t bucket = static_cast<size_t>(std::min(std::max(slot, 0.0), static_cast<double>(kLevelBuckets - 1)));
     for (size_t i = 0; i < fftSize_; ++i) {
         work_[i] = std::complex<double>(midPending_[offset + i] * window_[i], sidePending_[offset + i] * window_[i]);
     }
     fft_.forward(work_);
     const size_t bins = fftSize_ / 2 + 1;
+    if (midSum_[bucket].empty()) {
+        midSum_[bucket].assign(bins, 0.0);
+        sideSum_[bucket].assign(bins, 0.0);
+    }
+    std::vector<double>& midBucket = midSum_[bucket];
+    std::vector<double>& sideBucket = sideSum_[bucket];
     for (size_t k = 0; k < bins; ++k) {
         const std::complex<double> zk = work_[k];
         const std::complex<double> zn = std::conj(work_[(fftSize_ - k) % fftSize_]);
         const std::complex<double> xm = (zk + zn) * 0.5;
         const std::complex<double> xs = (zk - zn) * std::complex<double>(0.0, -0.5);
-        midSum_[k] += std::norm(xm);
-        sideSum_[k] += std::norm(xs);
+        midBucket[k] += std::norm(xm);
+        sideBucket[k] += std::norm(xs);
     }
-    ++accepted_;
+    ++bucketFrames_[bucket];
 }
 
 AverageSpectrum SpectrumAccumulator::finish() {
-    if (accepted_ == 0) {
+    size_t total = 0;
+    for (size_t count : bucketFrames_) {
+        total += count;
+    }
+    if (total == 0) {
         throw MasteredError(silent_ > 0 ? "Audio is silent" : "Audio is too short for spectral analysis");
     }
+    // A frame counts when it is within 50 dB of the loudest frame, and never when it is below -120 dB.
+    // Normal material keeps the earlier fixed limit of -70 dB, quiet material is no longer mistaken for silence.
+    const double limitDb = std::min(kNormalGateDb, loudestDb_ - kRelativeGateDb);
+    const size_t bins = fftSize_ / 2 + 1;
     AverageSpectrum result;
     result.sampleRate = sampleRate_;
     result.fftSize = fftSize_;
-    result.frames = accepted_;
     result.hasSide = channels_ >= 2;
-    const double scale = 1.0 / (static_cast<double>(accepted_) * windowEnergy_);
-    result.mid.resize(midSum_.size());
-    result.side.resize(sideSum_.size());
-    for (size_t k = 0; k < midSum_.size(); ++k) {
-        result.mid[k] = midSum_[k] * scale;
-        result.side[k] = sideSum_[k] * scale;
+    result.mid.assign(bins, 0.0);
+    result.side.assign(bins, 0.0);
+    size_t accepted = 0;
+    for (size_t b = 0; b < kLevelBuckets; ++b) {
+        const double lowerDb = kBucketFloorDb + kBucketStepDb * static_cast<double>(b);
+        if (bucketFrames_[b] == 0 || lowerDb < limitDb - 1e-9) {
+            continue;
+        }
+        for (size_t k = 0; k < bins; ++k) {
+            result.mid[k] += midSum_[b][k];
+            result.side[k] += sideSum_[b][k];
+        }
+        accepted += bucketFrames_[b];
+    }
+    if (accepted == 0) {
+        throw MasteredError("Audio is silent");
+    }
+    result.frames = accepted;
+    const double scale = 1.0 / (static_cast<double>(accepted) * windowEnergy_);
+    for (size_t k = 0; k < bins; ++k) {
+        result.mid[k] *= scale;
+        result.side[k] *= scale;
     }
     return result;
 }

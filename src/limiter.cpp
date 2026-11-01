@@ -71,6 +71,15 @@ void TruePeakLimiter::process(AudioBlock& block, size_t frames) {
         smoothing_[smoothingPosition_] = envelope_;
         smoothingPosition_ = (smoothingPosition_ + 1) % smoothing_.size();
         const double gain = smoothingSum_ / static_cast<double>(smoothing_.size());
+        if (collect_) {
+            ++statFrames_;
+            if (gain < 0.9999) {
+                const double reduction = -20.0 * std::log10(std::max(gain, 1e-6));
+                ++statReduced_;
+                statSumDb_ += reduction;
+                statMaxDb_ = std::max(statMaxDb_, reduction);
+            }
+        }
 
         for (size_t ch = 0; ch < channels_; ++ch) {
             const double delayed = delay_[ch][delayPosition_];
@@ -79,6 +88,16 @@ void TruePeakLimiter::process(AudioBlock& block, size_t frames) {
         }
         delayPosition_ = (delayPosition_ + 1) % latency_;
     }
+}
+
+LimiterStats TruePeakLimiter::statistics() const {
+    LimiterStats stats;
+    if (statFrames_ > 0) {
+        stats.maxReductionDb = statMaxDb_;
+        stats.averageReductionDb = statSumDb_ / static_cast<double>(statFrames_);
+        stats.reducedFraction = static_cast<double>(statReduced_) / static_cast<double>(statFrames_);
+    }
+    return stats;
 }
 
 }
