@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -20,7 +21,7 @@ from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeaders
 from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key
 from .wav_info import WavError, inspect_wav
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024
@@ -33,6 +34,7 @@ media = MediaTools(settings.ffmpeg_path, settings.ffprobe_path)
 manager = JobManager(settings, media)
 signer = SessionSigner(settings.session_secret, settings.session_seconds) if settings.auth_enabled else None
 login_limiter = SlidingWindow(settings.login_attempts, LOGIN_WINDOW_SEC)
+presets = []
 placeholder_hash = hash_password(secrets.token_urlsafe(16)) if settings.auth_enabled else ""
 
 
@@ -41,8 +43,23 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=MAX_PASSWORD_BYTES)
 
 
+async def load_presets():
+    """Reads the platform presets from the engine so that the web page and the engine share one list."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(settings.engine_path), "--list-presets",
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+        data = json.loads(stdout.decode("utf-8", "replace"))
+    except (OSError, ValueError, asyncio.TimeoutError):
+        return []
+    return data if isinstance(data, list) else []
+
+
 @asynccontextmanager
 async def lifespan(_app):
+    presets[:] = await load_presets()
     await media.detect_preview_codec()
     await manager.start()
     try:
@@ -155,6 +172,7 @@ def build_engine_arguments(
     noise_shaping,
     mid_side,
     match_width,
+    mono_bass_hz=0.0,
 ):
     arguments = [
         "--target", f"{target_lufs:.3f}",
@@ -180,6 +198,8 @@ def build_engine_arguments(
         arguments.append("--no-mid-side")
     if not match_width:
         arguments.append("--no-width")
+    if mono_bass_hz > 0:
+        arguments += ["--mono-bass", f"{mono_bass_hz:.1f}"]
     return arguments
 
 
@@ -272,6 +292,7 @@ async def public_config():
         "formats": list(SOURCE_EXTENSIONS) if media.available else [".wav"],
         "preview": media.preview_codec is not None,
         "authRequired": signer is not None,
+        "presets": presets,
     }
 
 
@@ -292,12 +313,15 @@ async def create_job(
     noise_shaping: bool = Form(False),
     mid_side: bool = Form(True),
     match_width: bool = Form(True),
+    mono_bass_hz: float = Form(0.0, ge=0.0, le=500.0),
 ):
     if bit_depth not in BIT_DEPTHS:
         raise HTTPException(422, "bit_depth must be 0, 16, 24 or 32")
+    if 0.0 < mono_bass_hz < 20.0:
+        raise HTTPException(422, "mono_bass_hz must be 0 (off) or between 20 and 500")
     arguments = build_engine_arguments(
         target_lufs, aggressiveness, ceiling_db, bands, bit_depth, precision,
-        dynamics, soft_clip, dither, noise_shaping, mid_side, match_width,
+        dynamics, soft_clip, dither, noise_shaping, mid_side, match_width, mono_bass_hz,
     )
     client = identity(request)
     try:

@@ -38,7 +38,7 @@ class SecurityHeadersMiddleware:
 
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 PUBLIC_PATHS = {
-    "/login", "/login.js", "/style.css", "/api/health", "/api/login", "/api/logout", "/api/session",
+    "/login", "/login.js", "/style.css", "/favicon.svg", "/api/health", "/api/login", "/api/logout", "/api/session",
 }
 
 
