@@ -19,6 +19,12 @@ Everything runs as a streaming pipeline in fixed-size blocks, so memory use stay
 - WAV input: 16/24/32-bit PCM, 32/64-bit float, WAVE_FORMAT_EXTENSIBLE, RF64/BW64 files over 4 GB, up to 8 channels, odd-sized chunks, streamed headers
 - WAV output: 16/24-bit PCM, 32-bit float (format tag 3), extensible header above two channels, automatic RF64 beyond 4 GB
 - JSON report, ReaEQ band list and Equalizer APO config (including mid/side)
+- Platform presets (Spotify, YouTube, Apple Music, Amazon Music, Tidal, Deezer, SoundCloud, podcast, EBU R128, ATSC A/85, loud master) shared by the command line and the web page
+- Mono bass: the side signal is high-passed (fourth order) so low frequencies fold to mono cleanly
+- Extra measurements: sample peak, momentary and short-term maximum, peak-to-loudness ratio, DC offset, clipped samples, mono fold-down loss and low-band correlation
+- Limiter gain-reduction report (maximum, average, share of time)
+- Reference check: after rendering, the master's average spectrum is measured again and compared with the reference, so the report shows how much closer the tone got
+- Waveform data for the input and the master, an average-spectrum comparison, and a streaming-service table in the web page
 - C API shared library
 - Web app (FastAPI + a single static page): optional sign-in page, MP3, FLAC, M4A, OGG and AAC upload, a before/after player, per-visitor rate limits, persistent job storage, Docker image and Render blueprint
 
@@ -54,6 +60,9 @@ By default the mastered file is written next to the input as `<input>_mastered.w
 | `--output PATH` | `<input>_mastered.wav` | Mastered WAV path |
 | `--json PATH` | output with `.json` | Report path |
 | `--presets` | off | Write `.reaeq.txt` and `.apo.txt` EQ files |
+| `--preset NAME` | | Target and ceiling for a service; `--target` and `--ceiling` still override it |
+| `--list-presets` | | Print the presets as JSON and exit |
+| `--mono-bass HZ` | off | Make everything below HZ mono, 20 to 500 (about -24 dB of side signal one octave below HZ) |
 | `--target LUFS` | -14 | Loudness target, -60 to -1 |
 | `--aggressive N` | 0.85 | EQ and dynamics strength, 0 to 1 |
 | `--ceiling DB` | -1 | True-peak ceiling, -12 to 0 |
@@ -302,13 +311,26 @@ std::string json = mastered::MasteringEngine::exportJSON(result);
 
 ## Report
 
-The JSON report contains input, reference and output measurements, the makeup gain and number of loudness passes, the fitted mid and side bands with their target and response curves on a 1/12-octave grid, the stereo width adjustment, the dynamics settings with the measured per-band level spread of your track and the reference, and any warnings.
+The JSON report contains input, reference and output measurements, the makeup gain and number of loudness passes, the fitted mid and side bands with their target and response curves on a 1/12-octave grid, the stereo width adjustment, the dynamics settings with the measured per-band level spread of your track and the reference, and any warnings. Version 2.2 adds `limiter` (gain reduction), `spectrum` (1/3-octave shapes of the input, the reference and the master, plus a `match` block with the RMS difference to the reference before and after), `waveform` (800 peak and RMS columns for the input and the master), `monoBassHz`, and the extra measurements listed above.
+
+## Tests
+
+```
+pip install numpy scipy httpx
+python3 tests/run_tests.py build/mastered_cli    # engine: loudness, true peak, EQ, presets, mono bass, errors
+python3 tests/test_web.py build/mastered_cli     # web API
+```
+
+`run_tests.py` generates its own audio and, when ffmpeg is installed, checks loudness against ffmpeg's EBU R128 meter.
 
 ## Notes and limits
 
 - The command line reads and writes WAV only. Files over 4 GB are read and written as RF64.
 - Sample rates from 8 kHz to 192 kHz, 1 to 8 channels. Files must be at least one second long.
 - Reference and input may have different sample rates; the analysis range is limited to the lower Nyquist.
+- The tonal-match figure compares average spectra in 1/3-octave bands over 63 Hz to 12.5 kHz. It shows how close the tone is to the reference, not whether the result sounds better.
+- Bands where the input has almost no content (more than 50 dB below its average level, for example above the cut-off of a lossy file) are not boosted.
+- Platform targets are typical values and change over time; services also differ in whether they turn quiet tracks up.
 - Mid/side EQ is used for stereo files only. For other channel counts the mid EQ is applied to every channel.
 - True peak: the limiter detects with a 4x, 24-tap-per-phase oversampler. The reported output peak and the closed-loop check use an 8x, 64-tap-per-phase detector. Compared with a much longer reference filter it read within 0.04 dB on typical material and up to about 0.2 dB low on very heavily limited material. In testing, the output stayed at or below the ceiling in normal cases and was 0.05 dB above it in the most extreme case tried. Input and reference peaks in the report use the 4x detector.
 - `--fast-peak` (used by the web page's Fast precision) skips the accurate measurement and the closed-loop check, so the peak is only guaranteed to the 4x detector's accuracy.
