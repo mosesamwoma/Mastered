@@ -313,16 +313,6 @@ std::string json = mastered::MasteringEngine::exportJSON(result);
 
 The JSON report contains input, reference and output measurements, the makeup gain and number of loudness passes, the fitted mid and side bands with their target and response curves on a 1/12-octave grid, the stereo width adjustment, the dynamics settings with the measured per-band level spread of your track and the reference, and any warnings. Version 2.2 adds `limiter` (gain reduction), `spectrum` (1/3-octave shapes of the input, the reference and the master, plus a `match` block with the RMS difference to the reference before and after), `waveform` (800 peak and RMS columns for the input and the master), `monoBassHz`, and the extra measurements listed above.
 
-## Tests
-
-```
-pip install numpy scipy httpx
-python3 tests/run_tests.py build/mastered_cli    # engine: loudness, true peak, EQ, presets, mono bass, errors
-python3 tests/test_web.py build/mastered_cli     # web API
-```
-
-`run_tests.py` generates its own audio and, when ffmpeg is installed, checks loudness against ffmpeg's EBU R128 meter.
-
 ## Notes and limits
 
 - The command line reads and writes WAV only. Files over 4 GB are read and written as RF64.
@@ -332,7 +322,7 @@ python3 tests/test_web.py build/mastered_cli     # web API
 - Bands where the input has almost no content (more than 50 dB below its average level, for example above the cut-off of a lossy file) are not boosted.
 - Platform targets are typical values and change over time; services also differ in whether they turn quiet tracks up.
 - Mid/side EQ is used for stereo files only. For other channel counts the mid EQ is applied to every channel.
-- True peak: the limiter detects with a 4x, 24-tap-per-phase oversampler. The reported output peak and the closed-loop check use an 8x, 64-tap-per-phase detector. Compared with a much longer reference filter it read within 0.04 dB on typical material and up to about 0.2 dB low on very heavily limited material. In testing, the output stayed at or below the ceiling in normal cases and was 0.05 dB above it in the most extreme case tried. Input and reference peaks in the report use the 4x detector.
+- True peak: the limiter detects with a 4x, 24-tap-per-phase oversampler. The reported output peak and the closed-loop check use an 8x, 64-tap-per-phase detector. Compared with a much longer reference filter it read within 0.04 dB on typical material and up to about 0.2 dB low on very heavily limited material. Input and reference peaks in the report use the 4x detector.
 - `--fast-peak` (used by the web page's Fast precision) skips the accurate measurement and the closed-loop check, so the peak is only guaranteed to the 4x detector's accuracy.
 - If the ceiling prevents the loudness target from being reached, the closest result is written and a warning is reported.
 - Dynamics matching moves each band's level spread toward the reference; it is an approximation and a band is left alone when it already matches.

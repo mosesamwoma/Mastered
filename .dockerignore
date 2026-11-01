@@ -20,8 +20,7 @@ Makefile
 *.dylib
 *.dll
 *.exe
-# Test fixtures and generated audio
-test_audio/
+# Generated audio
 *.wav
 *.mp3
 *.flac
