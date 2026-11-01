@@ -20,7 +20,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --uid 10001 app
+    && useradd --create-home --uid 10001 app \
+    && mkdir /data \
+    && chown app:app /data
 WORKDIR /app
 COPY web/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
