@@ -18,6 +18,7 @@ struct ChainPlan {
     double sideGain = 1.0;
     DynamicsSettings dynamics;
     double gainDb = 0.0;
+    double monoBassHz = 0.0;
     bool softClip = false;
     double softClipKneeDb = 3.0;
     bool limiterEnabled = true;
@@ -32,6 +33,8 @@ public:
 
     size_t latency() const;
     void process(AudioBlock& block, size_t frames);
+    void collectLimiterStatistics(bool enabled);
+    LimiterStats limiterStatistics() const;
 
 private:
     ChainPlan plan_;
@@ -41,6 +44,7 @@ private:
     std::vector<std::vector<Biquad>> channelFilters_;
     std::vector<Biquad> midFilters_;
     std::vector<Biquad> sideFilters_;
+    std::vector<Biquad> sideHighPass_;
     std::unique_ptr<MultibandCompressor> compressor_;
     std::unique_ptr<SoftClipper> clipper_;
     std::unique_ptr<TruePeakLimiter> limiter_;

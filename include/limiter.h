@@ -12,12 +12,22 @@
 
 namespace mastered {
 
+struct LimiterStats {
+    double maxReductionDb = 0.0;
+    double averageReductionDb = 0.0;
+    double reducedFraction = 0.0;
+};
+
 class TruePeakLimiter {
 public:
     TruePeakLimiter(double sampleRate, size_t channels, double ceilingDb, double lookaheadMs, double releaseMs);
 
     size_t latency() const { return latency_; }
     void process(AudioBlock& block, size_t frames);
+
+    // Gain reduction statistics are only collected when requested, because they need a logarithm per sample.
+    void collectStatistics(bool enabled) { collect_ = enabled; }
+    LimiterStats statistics() const;
 
 private:
     size_t channels_;
@@ -39,6 +49,11 @@ private:
     std::vector<double> smoothing_;
     size_t smoothingPosition_ = 0;
     double smoothingSum_ = 0.0;
+    bool collect_ = false;
+    uint64_t statFrames_ = 0;
+    uint64_t statReduced_ = 0;
+    double statSumDb_ = 0.0;
+    double statMaxDb_ = 0.0;
 };
 
 }

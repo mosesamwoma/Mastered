@@ -14,6 +14,8 @@ struct FitOptions {
     size_t maxBands = 8;
     double maxGainDb = 12.0;
     bool perceptualWeighting = true;
+    // Above this frequency the fit is penalised for boosting at all (0 disables it). Used where the source has no content.
+    double noBoostAboveHz = 0.0;
 };
 
 struct FitResult {

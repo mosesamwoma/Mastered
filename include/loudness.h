@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace mastered {
@@ -31,6 +32,8 @@ double channelWeight(size_t index, size_t channels);
 struct LoudnessResult {
     double integratedLufs = -120.0;
     double loudnessRangeLu = 0.0;
+    double momentaryMaxLufs = -120.0;
+    double shortTermMaxLufs = -120.0;
 };
 
 class LoudnessMeter {
@@ -77,10 +80,20 @@ private:
 struct Measurements {
     double integratedLufs = -120.0;
     double loudnessRangeLu = 0.0;
+    double momentaryMaxLufs = -120.0;
+    double shortTermMaxLufs = -120.0;
     double truePeakDb = -200.0;
+    double samplePeakDb = -200.0;
+    double dcOffset = 0.0;
+    uint64_t clippedSamples = 0;
     double correlation = 1.0;
+    double lowCorrelation = 1.0;
+    double monoLossDb = 0.0;
     double sideToMidDb = -120.0;
     bool hasStereo = false;
+
+    // Peak to loudness ratio: how much dynamic headroom the true peak has over the average level.
+    double plrDb() const { return (truePeakDb > -150.0 && integratedLufs > -100.0) ? truePeakDb - integratedLufs : 0.0; }
 };
 
 class Meter {
@@ -100,6 +113,16 @@ private:
     double crossEnergy_ = 0.0;
     double midEnergy_ = 0.0;
     double sideEnergy_ = 0.0;
+    double samplePeak_ = 0.0;
+    uint64_t clipped_ = 0;
+    uint64_t frames_ = 0;
+    std::vector<double> sums_;
+    bool lowReady_ = false;
+    Biquad lowLeft_;
+    Biquad lowRight_;
+    double lowLeftEnergy_ = 0.0;
+    double lowRightEnergy_ = 0.0;
+    double lowCrossEnergy_ = 0.0;
 };
 
 }

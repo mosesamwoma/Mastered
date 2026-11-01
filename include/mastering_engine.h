@@ -4,6 +4,7 @@
 #include "eq_fitter.h"
 #include "loudness.h"
 #include "spectrum.h"
+#include "waveform.h"
 
 #include <array>
 #include <cstddef>
@@ -30,6 +31,7 @@ struct MasteringConfig {
     bool dynamicsMatch = true;
     double dynamicsRatio = 2.0;
     double dynamicsThresholdOffsetDb = 0.0;
+    double monoBassHz = 0.0;
     bool softClip = false;
     double softClipKneeDb = 3.0;
     bool accuratePeak = true;
@@ -66,6 +68,12 @@ struct Analysis {
     size_t referenceCount = 0;
     Measurements input;
     Measurements reference;
+    std::vector<double> shapeCentresHz;
+    std::vector<double> inputShapeDb;
+    std::vector<double> referenceShapeDb;
+    std::vector<size_t> shapeRange;
+    double shapeWidthOctaves = 1.0 / 3.0;
+    Waveform inputWaveform;
     std::vector<std::string> warnings;
 };
 
@@ -78,6 +86,12 @@ struct MasteringResult {
     double makeupGainDb = 0.0;
     int iterations = 0;
     bool targetReached = false;
+    Waveform outputWaveform;
+    LimiterStats limiter;
+    std::vector<double> outputShapeDb;
+    double matchBeforeDb = 0.0;
+    double matchAfterDb = 0.0;
+    bool matchMeasured = false;
     std::vector<std::string> warnings;
 };
 
