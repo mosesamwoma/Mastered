@@ -15,13 +15,15 @@ from starlette.concurrency import run_in_threadpool
 
 from .auth import COOKIE_NAME, MAX_PASSWORD_BYTES, SessionSigner, hash_password, verify_password
 from .config import load_settings
-from .jobs import JobManager, QueueFull, RateLimited, describe_duration
+from .exports import EXPORT_KEY, MAX_EXPORTS_PER_JOB, build_export, describe_formats, find_quality
+from .jobs import JobManager, QueueFull, RateLimited, describe_duration, download_name, track_stem
 from .media import SOURCE_EXTENSIONS, MediaError, MediaTools
+from .reports import report_text
 from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeadersMiddleware
 from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key
 from .wav_info import WavError, inspect_wav
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024
@@ -173,23 +175,36 @@ def build_engine_arguments(
     mid_side,
     match_width,
     mono_bass_hz=0.0,
+    auto_clip=True,
+    auto_mono_bass=True,
+    dual_mono=False,
+    bass_limiter=False,
 ):
     arguments = [
         "--target", f"{target_lufs:.3f}",
         "--aggressive", f"{aggressiveness:.4f}",
         "--ceiling", f"{ceiling_db:.3f}",
         "--bands", str(bands),
+        "--presets",
     ]
     if bit_depth:
         arguments += ["--bitdepth", str(bit_depth)]
     if precision == "fast":
-        arguments += ["--passes", "4", "--tolerance", "0.25", "--fast-peak"]
+        arguments += ["--passes", "6", "--tolerance", "0.1", "--fast-peak"]
     elif precision == "high":
-        arguments += ["--passes", "15", "--tolerance", "0.05"]
+        arguments += ["--passes", "20", "--tolerance", "0.01"]
     if dynamics:
         arguments.append("--dynamics")
     if soft_clip:
         arguments.append("--soft-clip")
+    if not auto_clip:
+        arguments.append("--no-auto-clip")
+    if not auto_mono_bass:
+        arguments.append("--no-auto-mono-bass")
+    if dual_mono:
+        arguments.append("--dual-mono")
+    if bass_limiter:
+        arguments.append("--bass-limiter")
     if not dither:
         arguments.append("--no-dither")
     if noise_shaping:
@@ -290,6 +305,7 @@ async def public_config():
         "resultMinutes": settings.job_ttl_sec // 60,
         "jobsPerHour": settings.jobs_per_hour_per_client,
         "formats": list(SOURCE_EXTENSIONS) if media.available else [".wav"],
+        "exports": describe_formats(media.encoders),
         "preview": media.preview_codec is not None,
         "authRequired": signer is not None,
         "presets": presets,
@@ -314,6 +330,10 @@ async def create_job(
     mid_side: bool = Form(True),
     match_width: bool = Form(True),
     mono_bass_hz: float = Form(0.0, ge=0.0, le=500.0),
+    auto_clip: bool = Form(True),
+    auto_mono_bass: bool = Form(True),
+    dual_mono: bool = Form(False),
+    bass_limiter: bool = Form(False),
 ):
     if bit_depth not in BIT_DEPTHS:
         raise HTTPException(422, "bit_depth must be 0, 16, 24 or 32")
@@ -322,6 +342,7 @@ async def create_job(
     arguments = build_engine_arguments(
         target_lufs, aggressiveness, ceiling_db, bands, bit_depth, precision,
         dynamics, soft_clip, dither, noise_shaping, mid_side, match_width, mono_bass_hz,
+        auto_clip, auto_mono_bass, dual_mono, bass_limiter,
     )
     client = identity(request)
     try:
@@ -368,6 +389,82 @@ async def job_audio(job_id: str, version: Literal["original", "mastered"], reque
     if row["status"] != "done" or not row["preview"] or not path.is_file():
         raise HTTPException(404, "No preview is available for this job")
     return FileResponse(path, media_type=media.preview_media_type)
+
+
+class ExportRequest(BaseModel):
+    format: str = Field(min_length=2, max_length=12, pattern=r"^[a-z0-9]+$")
+    quality: str = Field(min_length=2, max_length=16, pattern=r"^[a-z0-9]+$")
+
+
+def count_exports(directory):
+    return sum(1 for entry in directory.glob("export_*.json"))
+
+
+@app.post("/api/jobs/{job_id}/export")
+async def job_export(job_id: str, body: ExportRequest, request: Request):
+    row = await require_job(job_id, request)
+    directory = manager.job_directory(job_id)
+    if row["status"] != "done" or not (directory / "mastered.wav").is_file() or not row["report"]:
+        raise HTTPException(409, "The mastered file is not ready")
+    if find_quality(media.encoders, body.format, body.quality)[0] is None:
+        raise HTTPException(400, "This format or quality is not available on this server")
+    async with manager.export_gate:
+        # The job may have been removed or expired while this request waited for its turn.
+        row = await manager.row(job_id)
+        if row is None or row["cancel"] or not (directory / "mastered.wav").is_file():
+            raise HTTPException(404, "Job not found or expired")
+        if body.format != "wav" and not (directory / f"export_{body.format}_{body.quality}.json").is_file():
+            if await run_in_threadpool(count_exports, directory) >= MAX_EXPORTS_PER_JOB:
+                raise HTTPException(429, "This result already has the maximum number of exported files. Download one of them or master again.")
+        try:
+            info = await build_export(settings, directory, body.format, body.quality, media.encoders, row["report"], track_stem(row["track_name"]))
+        except MediaError as error:
+            raise HTTPException(500, f"Export failed: {error}.") from None
+        except OSError:
+            raise HTTPException(500, "Export failed: the file could not be written.") from None
+    name = download_name(row["track_name"], info["extension"])
+    url = f"/api/jobs/{job_id}/download" if info["format"] == "wav" else f"/api/jobs/{job_id}/export/{info['key']}"
+    return {**info, "name": name, "url": url}
+
+
+@app.get("/api/jobs/{job_id}/export/{key}")
+async def job_export_download(job_id: str, key: str, request: Request):
+    row = await require_job(job_id, request)
+    if not EXPORT_KEY.match(key) or row["status"] != "done":
+        raise HTTPException(404, "Export not found")
+    directory = manager.job_directory(job_id)
+    sidecar = directory / f"export_{key}.json"
+    try:
+        info = json.loads(await run_in_threadpool(sidecar.read_text, "utf-8"))
+    except (OSError, ValueError):
+        raise HTTPException(404, "Export not found") from None
+    path = directory / f"export_{key}.{info['extension']}"
+    if not path.is_file() or info.get("key") != key:
+        raise HTTPException(404, "Export not found")
+    return FileResponse(path, media_type=info["mediaType"], filename=download_name(row["track_name"], info["extension"]))
+
+
+@app.get("/api/jobs/{job_id}/report")
+async def job_report(job_id: str, request: Request, kind: Literal["txt", "json"] = "txt"):
+    row = await require_job(job_id, request)
+    if row["status"] != "done" or not row["report"]:
+        raise HTTPException(409, "The report is not ready")
+    stem = track_stem(row["track_name"])
+    if kind == "json":
+        body = json.dumps(row["report"], indent=2)
+        return Response(body, media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{stem}_mastered_report.json"'})
+    body = report_text(row["report"], row["track_name"][:120], download_name(row["track_name"]))
+    return Response(body, media_type="text/plain; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{stem}_mastered_report.txt"'})
+
+
+@app.get("/api/jobs/{job_id}/eq/{kind}")
+async def job_eq(job_id: str, kind: Literal["reaeq", "apo"], request: Request):
+    row = await require_job(job_id, request)
+    path = manager.job_directory(job_id) / f"mastered.{kind}.txt"
+    if row["status"] != "done" or not path.is_file():
+        raise HTTPException(404, "No EQ settings are available for this job")
+    suffix = "reaeq" if kind == "reaeq" else "equalizer_apo"
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{track_stem(row['track_name'])}_{suffix}.txt")
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
