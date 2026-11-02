@@ -120,9 +120,17 @@ MultibandCompressor::MultibandCompressor(const DynamicsSettings& settings, doubl
         attack_[b] = std::exp(-1.0 / (std::max(settings.bands[b].attackMs, 0.01) * 0.001 * sampleRate));
         release_[b] = std::exp(-1.0 / (std::max(settings.bands[b].releaseMs, 0.01) * 0.001 * sampleRate));
     }
+    // The level detector averages the squared signal with a fixed, symmetric window that spans several cycles of the
+    // lowest frequency in its band. Attack and release then act on the gain reduction, which moves slowly, instead of
+    // on the detector itself. Smoothing the detector asymmetrically makes the gain follow the waveform of bass notes
+    // and adds harmonic distortion; this arrangement does not.
+    constexpr double kDetectorMs[3] = {30.0, 10.0, 3.0};
+    for (size_t b = 0; b < 3; ++b) {
+        detector_[b] = std::exp(-1.0 / (kDetectorMs[b] * 0.001 * sampleRate));
+    }
 }
 
-double MultibandCompressor::gainFor(size_t band, double level) const {
+double MultibandCompressor::reductionDbFor(size_t band, double level) const {
     const CompressorBand& s = settings_.bands[band];
     const double levelDb = 20.0 * std::log10(std::max(level, 1e-9));
     const double over = levelDb - s.thresholdDb;
@@ -133,7 +141,7 @@ double MultibandCompressor::gainFor(size_t band, double level) const {
     } else if (over > 0.0) {
         reductionDb = over / s.ratio - over;
     }
-    return std::pow(10.0, reductionDb / 20.0);
+    return reductionDb;
 }
 
 void MultibandCompressor::process(AudioBlock& block, size_t frames) {
@@ -148,9 +156,11 @@ void MultibandCompressor::process(AudioBlock& block, size_t frames) {
         }
         double gain[3];
         for (size_t b = 0; b < 3; ++b) {
-            const double coefficient = level[b] > power_[b] ? attack_[b] : release_[b];
-            power_[b] = coefficient * power_[b] + (1.0 - coefficient) * level[b];
-            gain[b] = gainFor(b, std::sqrt(power_[b]));
+            power_[b] = detector_[b] * power_[b] + (1.0 - detector_[b]) * level[b];
+            const double target = reductionDbFor(b, std::sqrt(power_[b]));
+            const double coefficient = target < reductionDb_[b] ? attack_[b] : release_[b];
+            reductionDb_[b] = coefficient * reductionDb_[b] + (1.0 - coefficient) * target;
+            gain[b] = std::pow(10.0, reductionDb_[b] / 20.0);
         }
         for (size_t ch = 0; ch < channels_; ++ch) {
             block[ch][i] = bandSamples[ch][0] * gain[0] + bandSamples[ch][1] * gain[1] + bandSamples[ch][2] * gain[2];
