@@ -78,13 +78,18 @@ By default the mastered file is written next to the input as `<input>_mastered.w
 | `--no-perceptual` | | Disable perceptual error weighting in the EQ fit |
 | `--dynamics` | | Multiband compression matched to the reference |
 | `--dynamics-ratio N` | | Fixed ratio, 1 to 20 (implies `--dynamics`) |
-| `--soft-clip` | | Soft clipper before the limiter |
+| `--soft-clip` | | Always use the soft clipper before the limiter |
+| `--no-auto-clip` | | Do not switch the soft clipper on automatically when the limiter would have to remove more than about 3 dB |
+| `--bass-limiter` | | Experimental: limit the band below 140 Hz separately (off by default, see Notes) |
+| `--no-auto-mono-bass` | | Do not make the bass mono automatically when the low end is out of phase (correlation below 0.3) |
+| `--dual-mono` | | Measure single-channel files as dual mono (+3 LU) |
+| `--measure PATH` | | Measure a WAV file with the engine's meter, print JSON and exit |
 | `--fast-peak` | | Use the 4x peak detector and skip the closed-loop ceiling check (about a third faster) |
-| `--lookahead MS` | 3 | Limiter look-ahead, 0.5 to 20 |
+| `--lookahead MS` | 5 | Limiter look-ahead, 0.5 to 20 |
 | `--release MS` | 80 | Limiter release, 5 to 1000 |
 | `--fft N` | 8192 | FFT size, power of two 1024 to 65536 |
-| `--passes N` | 10 | Maximum loudness passes, 1 to 30 |
-| `--tolerance LU` | 0.1 | Loudness tolerance, 0.01 to 2 |
+| `--passes N` | 12 | Maximum loudness passes, 1 to 30 |
+| `--tolerance LU` | 0.02 | Loudness tolerance, 0.005 to 2 |
 | `--verbose` | | Print EQ bands and stereo/dynamics details |
 
 Exit codes: 0 success, 1 error, 2 usage.
@@ -98,7 +103,7 @@ Exit codes: 0 success, 1 error, 2 usage.
 
 ## Web app
 
-A small web page lets you upload a reference and your track, watch progress, see the measurements and EQ curves, listen to the original and the master, and download the mastered WAV.
+A small web page lets you upload a reference and your track, watch progress, see the measurements and EQ curves, listen to the original and the master, and download the mastered file as WAV, FLAC, AIFF, MP3, OGG Vorbis, Opus or AAC. Several tracks can be mastered one after another with the same reference and settings.
 
 ```
 Mastered/
@@ -183,7 +188,7 @@ Limits to know about:
 - WAV files that the engine can read are used as they are.
 - Everything else is inspected with `ffprobe` and converted with `ffmpeg` as the first step of the job. Only audio containers on an allow-list are accepted (MP3, FLAC, Ogg, MP4/M4A, AAC, WAV/AIFF, Matroska/WebM), and `ffmpeg` is run with a file-only protocol whitelist, so playlists or concat files that point elsewhere are rejected.
 - Lossless sources of 16 bits or less are decoded to 16-bit, everything else to 24-bit. The default output keeps that depth.
-- When the job finishes, 160 kbps MP3 (or AAC) previews of the original and the master are made for the player. The player plays both in sync and switches instantly. Match loudness lowers whichever version is louder so the comparison is fair.
+- When the job finishes, 160 kbps MP3 (or AAC) previews of the original and the master are made for the player. For tracks up to four minutes (two minutes on touch screens) both previews are decoded in the browser and played on one audio clock, so switching between them is sample-accurate; longer tracks use two media elements that are kept in step. Match loudness lowers whichever version is louder so the comparison is fair.
 - Converted inputs and temporary files are deleted as soon as they are no longer needed.
 
 ### Rate limits
@@ -253,26 +258,41 @@ All settings are environment variables with safe defaults.
 | `POST /api/logout` | Clears the session cookie |
 | `GET /api/session` | Whether sign-in is required and who is signed in |
 | `GET /api/config` | Limits, accepted formats, whether previews are available and whether sign-in is required |
-| `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `soft_clip`, `dither`, `noise_shaping`, `mid_side`, `match_width`; returns 202 with the job id |
+| `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `soft_clip`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `dither`, `noise_shaping`, `mid_side`, `match_width`, `mono_bass_hz`; returns 202 with the job id |
 | `GET /api/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`), progress, queue position, and when done the report, download link and preview links |
 | `GET /api/jobs/{id}/download` | Mastered WAV |
+| `POST /api/jobs/{id}/export` | JSON body `{"format": "mp3", "quality": "320"}`; encodes and checks the file, returns its name, URL, size and measured loudness and true peak. One export runs at a time, at most 12 files per job |
+| `GET /api/jobs/{id}/export/{key}` | A file made by the export call |
+| `GET /api/jobs/{id}/report?kind=txt\|json` | The mastering report |
+| `GET /api/jobs/{id}/eq/{reaeq\|apo}` | EQ settings for ReaEQ or Equalizer APO |
 | `GET /api/jobs/{id}/audio/original` and `/mastered` | Preview audio with range support |
 | `DELETE /api/jobs/{id}` | Cancel and delete a job |
+
+### Downloads in other formats
+
+The mastered WAV is the master; every other format is made from it with ffmpeg when you ask for it, and cached with the job until it expires. Which formats are offered depends on the encoders in the server's ffmpeg: FLAC and AIFF (lossless), MP3 (320, V0, 192, 128), OGG Vorbis (q9 to q3), Opus (192 to 96 kbps) and AAC in M4A (256 to 128 kbps).
+
+Lossy encoders move the true peak: an MP3, Opus or AAC file can come out above the ceiling that the master respected. Each lossy file is therefore decoded again and measured with the engine's own meter (`mastered_cli --measure`). If its true peak is above the ceiling, the level is lowered by the overshoot and the file is encoded again (up to five encodes). The result shows the loudness and peak of the file you actually download, and says so when the level had to be lowered or the ceiling could not be met.
+
+Also available for each result: a text or JSON report and, for the EQ, ReaEQ and Equalizer APO settings.
 
 ## Processing chain
 
 ```
 reader -> [mid/side split] -> EQ -> [side gain] -> [mid/side merge]
-       -> multiband compressor (optional) -> makeup gain
-       -> soft clipper (optional) -> true-peak limiter -> meter -> writer
+       -> multiband compressor (optional) -> temporary 32-bit float file
+temporary file -> makeup gain -> soft clipper (optional, automatic for heavy limiting)
+       -> true-peak limiter -> writer -> meter (on the written file)
 ```
 
 1. Every file is scanned once: averaged mid and side power spectra, integrated loudness, LRA, true peak, stereo correlation and side-to-mid ratio, and per-band level statistics.
-2. Band levels are level-matched using the median difference across 63 Hz to 12.5 kHz, scaled by the aggressiveness, and clamped to +/-12 dB.
+2. Band levels are level-matched using the median difference across 63 Hz to 12.5 kHz, scaled by the aggressiveness, and clamped to -12 dB for cuts, +9 dB for boosts and +6 dB for boosts below 160 Hz. Big low-frequency boosts raise the kick peaks before the limiter and make it work harder, which is what softens a beat.
 3. A greedy fitter adds one band at a time, tries peak, low-shelf and high-shelf for each, and refines all bands jointly.
 4. With dynamics matching, each band's compression ratio is derived from how much more spread out its 200 ms levels are in your track than in the reference. The compressor is then run on the track and the ratios are corrected up to three times until the measured spread matches the target.
-5. The first loudness pass measures the post-EQ, post-dynamics signal. Further passes run the full chain including the limiter and adjust makeup gain until the integrated loudness is within tolerance (0.1 LU by default, at most 10 passes).
-6. The final pass writes the file and measures its true peak with the accurate detector. If the reading is above the ceiling minus a 0.1 dB allowance, the limiter ceiling is lowered by the excess, the loudness is re-converged and the file is written again, up to four times.
+5. The EQ, mid/side and dynamics stages do not depend on the makeup gain, so their output is written once to a temporary 32-bit float file next to the output (removed when the run ends, also on errors). The first measurement of that signal gives the starting gain and the peak-to-ceiling distance. Further passes read the temporary file, apply gain, clipper and limiter and adjust the makeup gain until the integrated loudness is within tolerance (0.02 LU by default, at most 12 passes per search).
+6. If the makeup gain would force the limiter to remove more than about 3 dB, the soft clipper is switched on automatically (`--no-auto-clip` turns that off), so the limiter does not have to pull the whole mix down on every kick.
+7. The limiter has a fast and a slow release follower and uses the smaller gain of the two: a single transient is released quickly, sustained limiting recovers over the full release time. The default look-ahead is 5 ms.
+8. The finished file is measured again after rounding to the output bit depth. If its true peak is above the ceiling minus 0.02 dB, the limiter ceiling is lowered by the excess; if the limiter is working and the peak is more than 0.08 dB lower, the ceiling is raised again (at most 0.6 dB, twice). The loudness is re-converged after each change and the file is written again, up to five times. The reported loudness and true peak are those of the delivered file.
 
 ## C API
 
@@ -291,7 +311,7 @@ const char* json = mastered_result_json(e);
 mastered_destroy(e);
 ```
 
-Options: `target_lufs`, `aggressiveness`, `ceiling_db`, `max_bands`, `max_side_bands`, `smoothing`, `perceptual_weighting`, `auto_gain`, `mid_side`, `match_width`, `dynamics`, `dynamics_match`, `dynamics_ratio`, `dynamics_threshold_offset_db`, `soft_clip`, `soft_clip_knee_db`, `accurate_peak`, `lookahead_ms`, `release_ms`, `bit_depth`, `dither`, `noise_shaping`, `tolerance_lu`, `max_iterations`, `fft_size`.
+Options: `target_lufs`, `aggressiveness`, `ceiling_db`, `max_bands`, `max_side_bands`, `smoothing`, `perceptual_weighting`, `auto_gain`, `mid_side`, `match_width`, `dynamics`, `dynamics_match`, `dynamics_ratio`, `dynamics_threshold_offset_db`, `soft_clip`, `soft_clip_knee_db`, `accurate_peak`, `lookahead_ms`, `release_ms`, `bit_depth`, `dither`, `noise_shaping`, `tolerance_lu`, `max_iterations`, `fft_size`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`.
 
 Metrics: `input_lufs`, `input_true_peak_db`, `input_lra`, `reference_lufs`, `output_lufs`, `output_true_peak_db`, `output_lra`, `output_correlation`, `makeup_gain_db`, `iterations`, `target_reached`, `mid_band_count`, `side_band_count`.
 
@@ -328,3 +348,8 @@ The JSON report contains input, reference and output measurements, the makeup ga
 - Dynamics matching moves each band's level spread toward the reference; it is an approximation and a band is left alone when it already matches.
 - `--bitdepth 32` writes IEEE float. 32-bit integer PCM input is accepted and converted.
 - Bundled FFmpeg-based conversion is only as capable as the FFmpeg build installed on the server.
+- Meters and loudness: the integrated loudness follows ITU-R BS.1770-4 / EBU R128 with absolute and relative gating, and agrees with ffmpeg's `ebur128` filter to within about 0.05 LU. Other meters can differ in what they show: a single-channel file is measured as one channel (use `--dual-mono` for meters that count it twice), short-term and momentary readings are not the integrated value, and true-peak meters with 4x oversampling (including ffmpeg's) read a little lower than this engine's 8x detector.
+- Disk use: while a file is mastered, a temporary 32-bit float copy of the processed signal (4 bytes per sample per channel) is kept next to the output; a 5 minute stereo 44.1 kHz track needs about 106 MB for it, and it is removed when the run ends.
+- `--bass-limiter` is experimental and off by default. On a synthetic kick-and-bass test it moved loudness from the bass to the highs and did not reduce modulation of the highs, so the default chain relies on the automatic soft clipper and the two-follower release instead. Judge it by ear on your own material before using it.
+- The soft clipper that is switched on for heavy limiting trades limiter pumping for a little clipping distortion on the tallest peaks. If you prefer the limiter alone, use `--no-auto-clip` (the web page has the same switch under Advanced).
+- Lossy exports from the web app are checked after encoding, but a player's own decoder and sample-rate conversion can still add a little peak; leave some room in the ceiling if a platform is strict.
