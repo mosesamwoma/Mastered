@@ -38,6 +38,10 @@ bool setOption(mastered::MasteringConfig& c, const std::string& key, double v) {
     else if (key == "dynamics_threshold_offset_db") c.dynamicsThresholdOffsetDb = v;
     else if (key == "mono_bass_hz") c.monoBassHz = v;
     else if (key == "soft_clip") c.softClip = flag;
+    else if (key == "auto_clip") c.autoClip = flag;
+    else if (key == "auto_mono_bass") c.autoMonoBass = flag;
+    else if (key == "dual_mono") c.dualMono = flag;
+    else if (key == "bass_limiter") c.bassLimiter = flag;
     else if (key == "soft_clip_knee_db") c.softClipKneeDb = v;
     else if (key == "accurate_peak") c.accuratePeak = flag;
     else if (key == "lookahead_ms") c.limiterLookaheadMs = v;
@@ -107,7 +111,7 @@ int mastered_run(mastered_engine* engine, const char* input_path, const char* ou
     try {
         mastered::MasteringEngine core(engine->config);
         engine->result = core.run(engine->references, input_path, output_path);
-        engine->json = mastered::MasteringEngine::exportJSON(engine->result);
+        engine->json = mastered::MasteringEngine::exportJSON(engine->result, engine->config);
         engine->hasResult = true;
     } catch (const std::exception& e) {
         engine->error = e.what();
