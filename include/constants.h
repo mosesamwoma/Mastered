@@ -4,7 +4,7 @@
 #include <cstdint>
 
 #ifndef MASTERED_VERSION
-#define MASTERED_VERSION "2.2.0"
+#define MASTERED_VERSION "2.3.0"
 #endif
 
 namespace mastered {
@@ -16,6 +16,8 @@ constexpr uint32_t kMaxSampleRate = 192000;
 constexpr uint16_t kMaxChannels = 8;
 constexpr size_t kBlockFrames = 4096;
 constexpr double kSilenceLufs = -120.0;
-constexpr double kLimiterMarginDb = 0.3;
+// Headroom the limiter keeps below the requested ceiling. The closed-loop ceiling check in the engine then
+// trims the result so that the measured true peak lands just under the ceiling the caller asked for.
+constexpr double kLimiterMarginDb = 0.1;
 
 }

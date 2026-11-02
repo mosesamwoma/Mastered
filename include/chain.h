@@ -23,22 +23,43 @@ struct ChainPlan {
     double softClipKneeDb = 3.0;
     bool limiterEnabled = true;
     double ceilingDb = -1.0;
-    double lookaheadMs = 3.0;
+    double lookaheadMs = 5.0;
     double releaseMs = 80.0;
+    // The bass limiter works on the band below bassLimiterHz with its own, slower time constants and keeps that band a
+    // few dB under the ceiling, so that a kick does not make the limiter pull the whole mix down.
+    bool bassLimiter = false;
+    double bassLimiterHz = 140.0;
+    double bassCeilingOffsetDb = 3.0;
+};
+
+enum class ChainStage {
+    Full,  // EQ, dynamics, gain, clipper and limiters in one object
+    Pre,   // EQ, mid/side and dynamics only: everything that does not depend on the makeup gain
+    Post   // makeup gain, clipper and limiters only
 };
 
 class ProcessingChain {
 public:
-    ProcessingChain(const ChainPlan& plan, double sampleRate, size_t channels);
+    ProcessingChain(const ChainPlan& plan, double sampleRate, size_t channels, ChainStage stage = ChainStage::Full);
 
     size_t latency() const;
     void process(AudioBlock& block, size_t frames);
+    void processPre(AudioBlock& block, size_t frames);
+    void processPost(AudioBlock& block, size_t frames);
     void collectLimiterStatistics(bool enabled);
     LimiterStats limiterStatistics() const;
 
 private:
+    struct BassSplit {
+        Biquad lowA;
+        Biquad lowB;
+        Biquad highA;
+        Biquad highB;
+    };
+
     ChainPlan plan_;
     size_t channels_;
+    ChainStage stage_;
     bool useMidSide_;
     double gainLinear_;
     std::vector<std::vector<Biquad>> channelFilters_;
@@ -48,6 +69,12 @@ private:
     std::unique_ptr<MultibandCompressor> compressor_;
     std::unique_ptr<SoftClipper> clipper_;
     std::unique_ptr<TruePeakLimiter> limiter_;
+    std::unique_ptr<TruePeakLimiter> bassLimiter_;
+    std::vector<BassSplit> bassSplit_;
+    std::vector<std::vector<double>> bassDelay_;
+    size_t bassDelayPosition_ = 0;
+    AudioBlock bassLow_;
+    AudioBlock bassHigh_;
     std::vector<double> mid_;
     std::vector<double> side_;
 };

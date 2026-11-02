@@ -88,14 +88,16 @@ public:
     void process(AudioBlock& block, size_t frames);
 
 private:
-    double gainFor(size_t band, double level) const;
+    double reductionDbFor(size_t band, double level) const;
 
     DynamicsSettings settings_;
     size_t channels_;
     std::vector<ThreeBandSplitter> splitters_;
     std::array<double, 3> attack_{{0.0, 0.0, 0.0}};
     std::array<double, 3> release_{{0.0, 0.0, 0.0}};
+    std::array<double, 3> detector_{{0.0, 0.0, 0.0}};
     std::array<double, 3> power_{{0.0, 0.0, 0.0}};
+    std::array<double, 3> reductionDb_{{0.0, 0.0, 0.0}};
 };
 
 class SoftClipper {

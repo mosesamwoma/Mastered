@@ -35,7 +35,9 @@ private:
     size_t lookahead_;
     size_t latency_;
     double ceiling_;
-    double releaseCoefficient_;
+    double fastReleaseCoefficient_;
+    double slowReleaseCoefficient_;
+    double slowAttackCoefficient_;
     std::vector<std::vector<double>> history_;
     std::vector<size_t> hot_;
     size_t historyPosition_ = 0;
@@ -45,7 +47,8 @@ private:
     std::deque<std::pair<uint64_t, double>> minimumWindow_;
     uint64_t counter_ = 0;
     double previousPeak_ = 0.0;
-    double envelope_ = 1.0;
+    double fastEnvelope_ = 1.0;
+    double slowEnvelope_ = 1.0;
     std::vector<double> smoothing_;
     size_t smoothingPosition_ = 0;
     double smoothingSum_ = 0.0;
