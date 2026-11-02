@@ -21,7 +21,14 @@ TruePeakLimiter::TruePeakLimiter(double sampleRate, size_t channels, double ceil
     kernel_ = &standardKernel();
     latency_ = lookahead_ + kernel_->delay;
     ceiling_ = std::pow(10.0, (ceilingDb - kLimiterMarginDb) / 20.0);
-    releaseCoefficient_ = std::exp(-1.0 / (releaseMs * 0.001 * sampleRate));
+    // Program-dependent release. A fast follower recovers quickly after an isolated peak, while a slow follower
+    // tracks how deep and how long the limiting has been; the smaller of the two is used. A single kick therefore
+    // lets go quickly, whereas sustained limiting recovers over the full release time. The fast time is kept
+    // above one cycle of low bass so that the gain does not follow the waveform of a bass note.
+    const double fastReleaseMs = std::min(std::max(releaseMs * 0.4, 20.0), 120.0);
+    fastReleaseCoefficient_ = std::exp(-1.0 / (std::min(fastReleaseMs, releaseMs) * 0.001 * sampleRate));
+    slowReleaseCoefficient_ = std::exp(-1.0 / (releaseMs * 0.001 * sampleRate));
+    slowAttackCoefficient_ = std::exp(-1.0 / (std::max(releaseMs * 0.25, 5.0) * 0.001 * sampleRate));
     history_.assign(channels, std::vector<double>(2 * kernel_->tapsPerPhase, 0.0));
     hot_.assign(channels, 0);
     hotThreshold_ = ceiling_ / kernel_->bound * (1.0 - 1e-9);
@@ -62,13 +69,16 @@ void TruePeakLimiter::process(AudioBlock& block, size_t frames) {
         ++counter_;
         const double minimum = minimumWindow_.front().second;
 
-        if (minimum < envelope_) {
-            envelope_ = minimum;
+        if (minimum < fastEnvelope_) {
+            fastEnvelope_ = minimum;
         } else {
-            envelope_ = releaseCoefficient_ * envelope_ + (1.0 - releaseCoefficient_) * minimum;
+            fastEnvelope_ = fastReleaseCoefficient_ * fastEnvelope_ + (1.0 - fastReleaseCoefficient_) * minimum;
         }
-        smoothingSum_ += envelope_ - smoothing_[smoothingPosition_];
-        smoothing_[smoothingPosition_] = envelope_;
+        const double slowCoefficient = fastEnvelope_ < slowEnvelope_ ? slowAttackCoefficient_ : slowReleaseCoefficient_;
+        slowEnvelope_ = slowCoefficient * slowEnvelope_ + (1.0 - slowCoefficient) * fastEnvelope_;
+        const double envelope = std::min(fastEnvelope_, slowEnvelope_);
+        smoothingSum_ += envelope - smoothing_[smoothingPosition_];
+        smoothing_[smoothingPosition_] = envelope;
         smoothingPosition_ = (smoothingPosition_ + 1) % smoothing_.size();
         const double gain = smoothingSum_ / static_cast<double>(smoothing_.size());
         if (collect_) {
