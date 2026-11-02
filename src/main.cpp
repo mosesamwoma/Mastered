@@ -45,13 +45,18 @@ void printUsage() {
         "  --no-perceptual       Disable perceptual error weighting in the EQ fit\n"
         "  --dynamics            Enable multiband compression matched to the reference\n"
         "  --dynamics-ratio N    Fixed compression ratio, 1 to 20 (implies --dynamics)\n"
-        "  --soft-clip           Enable soft clipping before the limiter\n"
+        "  --soft-clip           Always use the soft clipper before the limiter\n"
+        "  --no-auto-clip        Do not switch the soft clipper on automatically for heavy limiting\n"
+        "  --bass-limiter        Experimental: limit the band below 140 Hz separately\n"
+        "  --no-auto-mono-bass   Do not make the bass mono automatically when it is out of phase\n"
+        "  --dual-mono           Measure single-channel files as dual mono (+3 LU)\n"
+        "  --measure PATH        Measure a WAV file (loudness and true peak) as JSON and exit\n"
         "  --fast-peak           Use the faster 4x peak detector and skip the ceiling check\n"
-        "  --lookahead MS        Limiter look-ahead, 0.5 to 20 (default 3)\n"
+        "  --lookahead MS        Limiter look-ahead, 0.5 to 20 (default 5)\n"
         "  --release MS          Limiter release, 5 to 1000 (default 80)\n"
         "  --fft N               FFT size, power of two 1024 to 65536 (default 8192)\n"
-        "  --passes N            Maximum loudness passes, 1 to 30 (default 10)\n"
-        "  --tolerance LU        Loudness tolerance, 0.01 to 2 (default 0.1)\n"
+        "  --passes N            Maximum loudness passes, 1 to 30 (default 12)\n"
+        "  --tolerance LU        Loudness tolerance, 0.005 to 2 (default 0.02)\n"
         "  --verbose             Print EQ bands and measurements\n"
         "  --help                Show this help\n";
 }
@@ -86,8 +91,8 @@ void writeTextFile(const std::filesystem::path& path, const std::string& content
 }
 
 void printMeasurements(const char* label, const mastered::Measurements& m) {
-    std::cout << "  " << std::left << std::setw(10) << label << std::right << std::fixed << std::setprecision(1)
-              << std::setw(7) << m.integratedLufs << " LUFS  " << std::setw(6) << m.truePeakDb << " dBTP  LRA "
+    std::cout << "  " << std::left << std::setw(10) << label << std::right << std::fixed << std::setprecision(2)
+              << std::setw(7) << m.integratedLufs << " LUFS  " << std::setw(6) << m.truePeakDb << " dBTP  LRA " << std::setprecision(1)
               << std::setw(4) << m.loudnessRangeLu << " LU";
     if (m.hasStereo) {
         std::cout << "  corr " << std::setprecision(2) << m.correlation << "  mono " << std::showpos << std::setprecision(1) << m.monoLossDb
@@ -118,6 +123,7 @@ int run(int argc, char** argv) {
     std::string jsonPath;
     bool presets = false;
     bool verbose = false;
+    std::string measurePath;
 
     // A preset is applied first so that explicit options always win, whatever their order.
     for (int i = 1; i < argc; ++i) {
@@ -196,6 +202,16 @@ int run(int argc, char** argv) {
             config.dynamicsRatio = parseNumber(arg, value());
         } else if (arg == "--soft-clip") {
             config.softClip = true;
+        } else if (arg == "--no-auto-clip") {
+            config.autoClip = false;
+        } else if (arg == "--bass-limiter") {
+            config.bassLimiter = true;
+        } else if (arg == "--no-auto-mono-bass") {
+            config.autoMonoBass = false;
+        } else if (arg == "--dual-mono") {
+            config.dualMono = true;
+        } else if (arg == "--measure") {
+            measurePath = value();
         } else if (arg == "--fast-peak") {
             config.accuratePeak = false;
         } else if (arg == "--lookahead") {
@@ -215,6 +231,12 @@ int run(int argc, char** argv) {
         } else {
             positional.push_back(arg);
         }
+    }
+    if (!measurePath.empty()) {
+        const mastered::Measurements measured =
+            mastered::MasteringEngine::measureFile(measurePath, config.dualMono, config.accuratePeak);
+        std::cout << "{\"measurements\": " << mastered::MasteringEngine::measurementsJsonText(measured) << "}\n";
+        return 0;
     }
     if (positional.size() != 2) {
         printUsage();
@@ -270,11 +292,14 @@ int run(int argc, char** argv) {
                       << " (low, mid, high)\n";
         }
     }
+    for (const std::string& note : result.notes) {
+        std::cout << "  Note: " << note << "\n";
+    }
     for (const std::string& warning : result.warnings) {
         std::cout << "  Warning: " << warning << "\n";
     }
 
-    writeTextFile(json, mastered::MasteringEngine::exportJSON(result));
+    writeTextFile(json, mastered::MasteringEngine::exportJSON(result, config));
     std::cout << "\nMastered audio: " << output.string() << "\nReport:         " << json.string() << "\n";
     if (presets) {
         const std::filesystem::path reaeq = std::filesystem::path(output).replace_extension(".reaeq.txt");
