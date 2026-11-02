@@ -74,6 +74,7 @@ class MediaTools:
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.preview_codec = None
+        self.encoders = frozenset()
 
     @property
     def available(self):
@@ -89,6 +90,7 @@ class MediaTools:
 
     async def detect_preview_codec(self):
         self.preview_codec = None
+        self.encoders = frozenset()
         if not self.available:
             return
         try:
@@ -98,6 +100,9 @@ class MediaTools:
         if code != 0:
             return
         listing = stdout.decode("utf-8", "replace")
+        self.encoders = frozenset(
+            match.group(1) for match in re.finditer(r"^\s*A\S*\s+(\S+)", listing, re.MULTILINE)
+        )
         if re.search(r"^\s*A\S*\s+libmp3lame\b", listing, re.MULTILINE):
             self.preview_codec = "mp3"
         elif re.search(r"^\s*A\S*\s+aac\b", listing, re.MULTILINE):
