@@ -147,7 +147,7 @@ double channelWeight(size_t index, size_t channels) {
     return 1.0;
 }
 
-LoudnessMeter::LoudnessMeter(double sampleRate, size_t channels)
+LoudnessMeter::LoudnessMeter(double sampleRate, size_t channels, bool dualMono)
     : channels_(channels),
       hop_(static_cast<size_t>(std::llround(sampleRate * 0.1))),
       filters_(channels),
@@ -161,6 +161,9 @@ LoudnessMeter::LoudnessMeter(double sampleRate, size_t channels)
         filters_[ch].shelf.setCoefficients(shelf);
         filters_[ch].highPass.setCoefficients(highPass);
         weights_[ch] = channelWeight(ch, channels);
+    }
+    if (dualMono && channels == 1) {
+        weights_[0] = 2.0;
     }
 }
 
@@ -297,10 +300,10 @@ constexpr double kClipLevel = 0.99995;
 
 }
 
-Meter::Meter(double sampleRate, size_t channels, PeakMode peakMode)
+Meter::Meter(double sampleRate, size_t channels, PeakMode peakMode, bool dualMono)
     : channels_(channels),
       peakMode_(peakMode),
-      loudness_(sampleRate, channels),
+      loudness_(sampleRate, channels, dualMono),
       truePeak_(channels, peakMode == PeakMode::Accurate ? accurateKernel() : standardKernel()),
       sums_(channels, 0.0) {
     if (channels >= 2 && kLowBandHz < sampleRate * 0.45) {
