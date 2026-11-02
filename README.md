@@ -1,6 +1,6 @@
 # Mastered
 
-Reference-based audio mastering engine written in C++17. It analyses one or more reference tracks, fits a parametric EQ to your track so its tonal balance matches, optionally matches dynamics and stereo width, then drives the result to a loudness target with a look-ahead true-peak limiter and writes a dithered WAV file.
+Reference-based audio mastering engine written in C++23. It analyses one or more reference tracks, fits a parametric EQ to your track so its tonal balance matches, optionally matches dynamics and stereo width, then drives the result to a loudness target with a look-ahead true-peak limiter and writes a dithered WAV file.
 
 Everything runs as a streaming pipeline in fixed-size blocks, so memory use stays flat regardless of file length.
 
@@ -34,7 +34,7 @@ Everything runs as a streaming pipeline in fixed-size blocks, so memory use stay
 ./build.sh
 ```
 
-Requires CMake 3.16+ and a C++17 compiler. Options:
+Requires CMake 3.20+ and a compiler with C++23 support (built and tested with GCC 12 and GCC 13; Clang 16+ and MSVC 2022 should work but were not tried). Options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |

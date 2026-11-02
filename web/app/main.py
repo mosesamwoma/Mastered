@@ -23,7 +23,7 @@ from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeaders
 from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key
 from .wav_info import WavError, inspect_wav
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024

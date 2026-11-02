@@ -1,7 +1,7 @@
-cmake_minimum_required(VERSION 3.16)
-project(MasteredEngine VERSION 2.3.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(MasteredEngine VERSION 2.3.1 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)

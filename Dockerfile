@@ -1,3 +1,4 @@
+# The engine is built as C++23: Debian bookworm provides GCC 12 and CMake 3.25, which are new enough.
 FROM debian:bookworm-slim AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake \
