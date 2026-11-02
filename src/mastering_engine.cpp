@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 
@@ -19,11 +22,22 @@ namespace {
 constexpr double kMinLevelHz = 63.0;
 constexpr double kMaxLevelHz = 12500.0;
 constexpr double kSideFloorDb = -45.0;
-constexpr double kMaxTargetDb = 12.0;
+constexpr double kMaxCutDb = 12.0;
+constexpr double kMaxBoostDb = 9.0;
+constexpr double kMaxBassBoostDb = 6.0;
+constexpr double kBassBoostHz = 160.0;
+constexpr double kAutoClipReductionDb = 3.0;
+constexpr double kAutoMonoBassHz = 120.0;
+constexpr double kHeavyAverageReductionDb = 2.0;
+constexpr double kHeavyMaxReductionDb = 8.0;
 constexpr double kMaxWidthDb = 3.0;
 constexpr double kMaxMakeupDb = 40.0;
-constexpr double kPeakSafetyDb = 0.1;
-constexpr int kMaxPeakTrims = 4;
+// The finished file is aimed at the ceiling minus this much, which covers rounding of the dithered output.
+constexpr double kPeakSafetyDb = 0.02;
+constexpr double kPeakWindowDb = 0.08;
+constexpr double kMaxCeilingRaiseDb = 0.6;
+constexpr int kMaxPeakTrims = 5;
+constexpr int kMaxCeilingRaises = 2;
 constexpr double kEmptyBandDb = -50.0;
 constexpr size_t kWaveformColumns = 800;
 
@@ -69,7 +83,7 @@ void validateConfig(const MasteringConfig& c) {
     }
     requireRange(c.limiterLookaheadMs, 0.5, 20.0, "limiterLookaheadMs");
     requireRange(c.limiterReleaseMs, 5.0, 1000.0, "limiterReleaseMs");
-    requireRange(c.loudnessToleranceLu, 0.01, 2.0, "loudnessToleranceLu");
+    requireRange(c.loudnessToleranceLu, 0.005, 2.0, "loudnessToleranceLu");
     requireRange(static_cast<double>(c.maxLoudnessIterations), 1.0, 30.0, "maxLoudnessIterations");
     if (c.bitDepth != 0 && c.bitDepth != 16 && c.bitDepth != 24 && c.bitDepth != 32) {
         throw MasteredError("Configuration value out of range: bitDepth must be 0, 16, 24 or 32");
@@ -79,7 +93,7 @@ void validateConfig(const MasteringConfig& c) {
     }
 }
 
-FileScan scanFile(const std::string& path, size_t fftSize) {
+FileScan scanFile(const std::string& path, size_t fftSize, bool dualMono) {
     WavReader reader(path);
     const uint64_t required = std::max<uint64_t>(reader.sampleRate(), fftSize);
     if (reader.frames() < required) {
@@ -92,7 +106,7 @@ FileScan scanFile(const std::string& path, size_t fftSize) {
     scan.isFloat = reader.isFloat();
     scan.frames = reader.frames();
     SpectrumAccumulator spectrum(scan.sampleRate, scan.channels, fftSize);
-    Meter meter(scan.sampleRate, scan.channels);
+    Meter meter(scan.sampleRate, scan.channels, PeakMode::Standard, dualMono);
     BandLevelMeter bands(scan.sampleRate, DynamicsSettings().lowCrossoverHz, DynamicsSettings().highCrossoverHz);
     WaveformBuilder waveform(scan.frames, kWaveformColumns);
     AudioBlock block;
@@ -187,17 +201,134 @@ std::vector<double> buildTarget(const AverageSpectrum& input, const std::vector<
             // Nothing is there to match (for example above the cut-off of a lossy file); boosting would only raise noise.
             value = std::min(value, 0.0);
         }
-        target[i] = std::min(std::max(value, -kMaxTargetDb), kMaxTargetDb);
+        // Boosts are capped lower than cuts, and lower still in the bass: a big low-frequency boost raises the kick peaks
+        // before the limiter and makes it work harder, which is what softens a beat.
+        const double maxBoost = centres[i] < kBassBoostHz ? kMaxBassBoostDb : kMaxBoostDb;
+        target[i] = std::min(std::max(value, -kMaxCutDb), maxBoost);
     }
     return target;
 }
 
-Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter* writer, PeakMode peakMode,
-                     WaveformBuilder* waveform = nullptr, LimiterStats* limiter = nullptr) {
+// Removes a temporary file when it goes out of scope, including when an exception unwinds the stack.
+class TempFile {
+public:
+    explicit TempFile(std::string path) : path_(std::move(path)) {}
+    TempFile(const TempFile&) = delete;
+    TempFile& operator=(const TempFile&) = delete;
+    ~TempFile() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+    const std::string& path() const { return path_; }
+
+private:
+    std::string path_;
+};
+
+// The EQ, mid/side and dynamics stages do not depend on the makeup gain, so their result is written once to a
+// temporary 32-bit float file. The loudness loop and the ceiling loop then only repeat the cheap gain, clipper and
+// limiter stages on that file.
+class CacheWriter {
+public:
+    CacheWriter(const std::string& path, size_t channels) : channels_(channels), file_(path, std::ios::binary | std::ios::trunc) {
+        if (!file_) {
+            throw MasteredError("Cannot create the temporary working file next to the output: " + path);
+        }
+    }
+
+    void write(const AudioBlock& block, size_t frames) {
+        buffer_.resize(frames * channels_);
+        for (size_t i = 0; i < frames; ++i) {
+            for (size_t ch = 0; ch < channels_; ++ch) {
+                buffer_[i * channels_ + ch] = static_cast<float>(block[ch][i]);
+            }
+        }
+        file_.write(reinterpret_cast<const char*>(buffer_.data()), static_cast<std::streamsize>(buffer_.size() * sizeof(float)));
+        if (!file_) {
+            throw MasteredError("Failed to write the temporary working file (is the disk full?)");
+        }
+    }
+
+    void close() {
+        file_.flush();
+        if (!file_) {
+            throw MasteredError("Failed to write the temporary working file (is the disk full?)");
+        }
+        file_.close();
+    }
+
+private:
+    size_t channels_;
+    std::ofstream file_;
+    std::vector<float> buffer_;
+};
+
+class CacheReader {
+public:
+    CacheReader(const std::string& path, size_t channels, uint64_t frames)
+        : channels_(channels), remaining_(frames), file_(path, std::ios::binary) {
+        if (!file_) {
+            throw MasteredError("Cannot read the temporary working file: " + path);
+        }
+    }
+
+    size_t read(AudioBlock& block, size_t maxFrames) {
+        const size_t want = static_cast<size_t>(std::min<uint64_t>(remaining_, maxFrames));
+        if (want == 0) {
+            return 0;
+        }
+        buffer_.resize(want * channels_);
+        file_.read(reinterpret_cast<char*>(buffer_.data()), static_cast<std::streamsize>(buffer_.size() * sizeof(float)));
+        if (static_cast<size_t>(file_.gcount()) != buffer_.size() * sizeof(float)) {
+            throw MasteredError("The temporary working file ended early");
+        }
+        block.resize(channels_);
+        for (size_t ch = 0; ch < channels_; ++ch) {
+            block[ch].resize(want);
+        }
+        for (size_t i = 0; i < want; ++i) {
+            for (size_t ch = 0; ch < channels_; ++ch) {
+                block[ch][i] = static_cast<double>(buffer_[i * channels_ + ch]);
+            }
+        }
+        remaining_ -= want;
+        return want;
+    }
+
+private:
+    size_t channels_;
+    uint64_t remaining_;
+    std::ifstream file_;
+    std::vector<float> buffer_;
+};
+
+// Runs the gain-independent stages and stores the result. The returned measurements describe that signal before any
+// makeup gain or limiting, which is what the starting gain and the clipper decision are based on.
+Measurements runPre(const std::string& input, const ChainPlan& plan, const std::string& cachePath, bool dualMono) {
     WavReader reader(input);
     const size_t channels = reader.channels();
-    ProcessingChain chain(plan, reader.sampleRate(), channels);
-    Meter meter(reader.sampleRate(), channels, peakMode);
+    ProcessingChain chain(plan, reader.sampleRate(), channels, ChainStage::Pre);
+    Meter meter(reader.sampleRate(), channels, PeakMode::Standard, dualMono);
+    CacheWriter cache(cachePath, channels);
+    AudioBlock block;
+    size_t n;
+    while ((n = reader.read(block, kBlockFrames)) > 0) {
+        chain.processPre(block, n);
+        meter.process(block, n);
+        cache.write(block, n);
+    }
+    cache.close();
+    return meter.finish();
+}
+
+// Applies makeup gain, clipper and limiters to the cached signal. The limiter latency is removed again so the output
+// lines up sample for sample with the input.
+Measurements runPost(const std::string& cachePath, const Analysis& analysis, const ChainPlan& plan, WavWriter* writer, PeakMode peakMode,
+                     bool dualMono, WaveformBuilder* waveform = nullptr, LimiterStats* limiter = nullptr) {
+    const size_t channels = analysis.channels;
+    CacheReader reader(cachePath, channels, analysis.frames);
+    ProcessingChain chain(plan, static_cast<double>(analysis.sampleRate), channels, ChainStage::Post);
+    Meter meter(static_cast<double>(analysis.sampleRate), channels, peakMode, dualMono);
     chain.collectLimiterStatistics(limiter != nullptr);
     size_t skip = chain.latency();
     AudioBlock block;
@@ -228,14 +359,14 @@ Measurements runPass(const std::string& input, const ChainPlan& plan, WavWriter*
 
     size_t n;
     while ((n = reader.read(block, kBlockFrames)) > 0) {
-        chain.process(block, n);
+        chain.processPost(block, n);
         emitBlock(block, n);
     }
     size_t pending = chain.latency();
     while (pending > 0) {
         const size_t count = std::min(pending, kBlockFrames);
         AudioBlock tail = makeBlock(channels, count);
-        chain.process(tail, count);
+        chain.processPost(tail, count);
         emitBlock(tail, count);
         pending -= count;
     }
@@ -300,11 +431,11 @@ std::string quote(const std::string& text) {
 
 std::string measurementsJson(const Measurements& m) {
     std::ostringstream out;
-    out << "{\"integratedLufs\": " << num(m.integratedLufs, 2)
+    out << "{\"integratedLufs\": " << num(m.integratedLufs, 3)
         << ", \"loudnessRangeLu\": " << num(m.loudnessRangeLu, 2)
         << ", \"momentaryMaxLufs\": " << num(m.momentaryMaxLufs, 2)
         << ", \"shortTermMaxLufs\": " << num(m.shortTermMaxLufs, 2)
-        << ", \"truePeakDb\": " << num(m.truePeakDb, 2)
+        << ", \"truePeakDb\": " << num(m.truePeakDb, 3)
         << ", \"samplePeakDb\": " << num(m.samplePeakDb, 2)
         << ", \"plrDb\": " << num(m.plrDb(), 2)
         << ", \"dcOffset\": " << num(m.dcOffset, 5)
@@ -418,13 +549,13 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         throw MasteredError("At least one reference track is required");
     }
     emit("Analysing input track", 0.0);
-    const FileScan in = scanFile(input, config_.fftSize);
+    const FileScan in = scanFile(input, config_.fftSize, config_.dualMono);
     std::vector<FileScan> refs;
     refs.reserve(references.size());
     for (size_t i = 0; i < references.size(); ++i) {
         emit("Analysing reference " + std::to_string(i + 1) + " of " + std::to_string(references.size()),
              30.0 * static_cast<double>(i + 1) / static_cast<double>(references.size() + 1));
-        refs.push_back(scanFile(references[i], config_.fftSize));
+        refs.push_back(scanFile(references[i], config_.fftSize, config_.dualMono));
     }
 
     Analysis analysis;
@@ -545,6 +676,12 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         } else {
             analysis.warnings.push_back("Mono bass only applies to stereo files and was skipped");
         }
+    } else if (config_.autoMonoBass && in.channels == 2 && in.measurements.hasStereo && in.measurements.lowCorrelation < 0.3) {
+        analysis.plan.monoBassHz = kAutoMonoBassHz;
+        std::ostringstream note;
+        note << "Mono bass was applied below " << static_cast<int>(kAutoMonoBassHz)
+             << " Hz because the low end was partly out of phase between left and right";
+        analysis.notes.push_back(note.str());
     }
 
     if (config_.dynamics) {
@@ -629,6 +766,7 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     analysis.plan.ceilingDb = config_.ceilingDb;
     analysis.plan.lookaheadMs = config_.limiterLookaheadMs;
     analysis.plan.releaseMs = config_.limiterReleaseMs;
+    analysis.plan.bassLimiter = config_.bassLimiter;
 
     if (in.measurements.truePeakDb > 0.0) {
         analysis.warnings.push_back("Input contains true peaks above 0 dBTP");
@@ -639,7 +777,7 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     if (in.measurements.dcOffset > 0.005) {
         analysis.warnings.push_back("Input has a DC offset; it wastes headroom and can be removed with a high-pass filter");
     }
-    if (in.measurements.hasStereo && in.measurements.lowCorrelation < 0.3 && config_.monoBassHz <= 0.0) {
+    if (in.measurements.hasStereo && in.measurements.lowCorrelation < 0.3 && analysis.plan.monoBassHz <= 0.0) {
         analysis.warnings.push_back("Low frequencies are partly out of phase between left and right; mono bass is recommended");
     }
     if (in.measurements.integratedLufs <= -100.0) {
@@ -662,8 +800,9 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
     result.inputPath = input;
     result.outputPath = output;
     result.warnings = analysis.warnings;
+    result.notes = analysis.notes;
 
-    const ChainPlan base = analysis.plan;
+    ChainPlan base = analysis.plan;
     const double peakTarget = config_.ceilingDb - kPeakSafetyDb;
     double trimDb = 0.0;
     double gain = 0.0;
@@ -675,12 +814,41 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         percent = std::max(percent, std::min(value, 99.0));
         emit(message, percent);
     };
+
+    advance("Preparing the tone and dynamics", 37.0);
+    const TempFile cache(output + ".stage.tmp");
+    const Measurements preMeasure = runPre(input, base, cache.path(), config_.dualMono);
+
+    if (config_.autoGain) {
+        advance("Measuring loudness", 40.0);
+        if (preMeasure.integratedLufs <= -100.0) {
+            throw MasteredError("Audio is too quiet to measure (below -70 LUFS), so it cannot be normalised to a loudness target; raise its level first");
+        }
+        startGain = std::min(std::max(config_.targetLufs - preMeasure.integratedLufs, -kMaxMakeupDb), kMaxMakeupDb);
+        gain = startGain;
+    }
+
+    // Decide whether the soft clipper is needed before the limiter: if the peaks sit far above the ceiling once the
+    // makeup gain is applied, the limiter alone would have to pull the whole mix down on every transient.
+    const double neededReductionDb = preMeasure.truePeakDb + gain - config_.ceilingDb;
+    if (config_.autoGain && config_.autoClip && !base.softClip && neededReductionDb > kAutoClipReductionDb) {
+        base.softClip = true;
+        std::ostringstream note;
+        note << std::fixed << std::setprecision(1) << "The soft clipper was switched on because the peaks are about " << neededReductionDb
+             << " dB above the ceiling at this loudness; it takes the tallest peaks so the limiter works less";
+        result.notes.push_back(note.str());
+    }
+    result.analysis.plan.softClip = base.softClip;
+
     auto planFor = [&](double gainDb) {
         ChainPlan plan = base;
         plan.gainDb = gainDb;
         plan.ceilingDb = base.ceilingDb - trimDb;
         return plan;
     };
+    // How much the loudness changes per dB of makeup gain. It is 1 without limiting and smaller when the limiter takes
+    // part of the extra level, and it is carried from one search to the next so later searches need fewer passes.
+    double slopeEstimate = 1.0;
     auto converge = [&](double initialGain) {
         double current = initialGain;
         double bestGain = initialGain;
@@ -688,8 +856,8 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         double previousGain = 0.0;
         double previousLufs = 0.0;
         for (int i = 1; i <= config_.maxLoudnessIterations; ++i) {
-            advance("Matching loudness (pass " + std::to_string(iterations + 1) + ")", percent + 2.0);
-            const Measurements m = runPass(input, planFor(current), nullptr, PeakMode::Off);
+            advance("Matching loudness (pass " + std::to_string(iterations + 1) + ")", percent + 1.5);
+            const Measurements m = runPost(cache.path(), analysis, planFor(current), nullptr, PeakMode::Off, config_.dualMono);
             ++iterations;
             const double error = config_.targetLufs - m.integratedLufs;
             if (std::fabs(error) < std::fabs(bestError)) {
@@ -699,9 +867,10 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
             if (std::fabs(error) <= config_.loudnessToleranceLu) {
                 break;
             }
-            double slope = 1.0;
-            if (i > 1 && std::fabs(current - previousGain) > 1e-6) {
+            double slope = slopeEstimate;
+            if (i > 1 && std::fabs(current - previousGain) > 1e-3) {
                 slope = std::min(std::max((m.integratedLufs - previousLufs) / (current - previousGain), 0.15), 1.0);
+                slopeEstimate = slope;
             }
             previousGain = current;
             previousLufs = m.integratedLufs;
@@ -714,19 +883,6 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         return bestGain;
     };
 
-    if (config_.autoGain) {
-        advance("Measuring loudness", 38.0);
-        ChainPlan pre = base;
-        pre.limiterEnabled = false;
-        pre.gainDb = 0.0;
-        const Measurements preMeasure = runPass(input, pre, nullptr, PeakMode::Off);
-        if (preMeasure.integratedLufs <= -100.0) {
-            throw MasteredError("Audio is too quiet to measure (below -70 LUFS), so it cannot be normalised to a loudness target; raise its level first");
-        }
-        startGain = std::min(std::max(config_.targetLufs - preMeasure.integratedLufs, -kMaxMakeupDb), kMaxMakeupDb);
-        gain = startGain;
-    }
-
     uint16_t depth = config_.bitDepth;
     if (depth == 0) {
         depth = analysis.sourceFloat ? 32 : analysis.sourceBitDepth;
@@ -735,26 +891,45 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         depth = 32;
     }
 
+    // The file that was written is measured again after rounding to the output bit depth, so the reported loudness and
+    // true peak are those of the delivered file. The ceiling loop first lowers the limiter ceiling when the measured
+    // peak is above the target and, while the limiter is working, raises it again when the peak lands well below it.
+    Measurements delivered;
+    int raises = 0;
     for (int attempt = 0;; ++attempt) {
         if (config_.autoGain) {
             gain = converge(attempt == 0 ? startGain : gain);
         }
-        advance(attempt == 0 ? "Writing mastered audio" : "Adjusting the peak ceiling", percent + 3.0);
-        WavWriter writer(output, analysis.sampleRate, analysis.channels, depth, config_.dither, config_.noiseShaping);
-        WaveformBuilder waveform(analysis.frames, kWaveformColumns);
+        advance(attempt == 0 ? "Writing mastered audio" : "Adjusting the peak ceiling", percent + 2.0);
         LimiterStats limiterStats;
-        const Measurements measured = runPass(input, planFor(gain), &writer, config_.accuratePeak ? PeakMode::Accurate : PeakMode::Standard,
-                                              &waveform, &limiterStats);
-        const double over = measured.truePeakDb - peakTarget;
-        if (!config_.accuratePeak || over <= 0.005 || attempt >= kMaxPeakTrims) {
+        WaveformBuilder waveform(analysis.frames, kWaveformColumns);
+        {
+            WavWriter writer(output, analysis.sampleRate, analysis.channels, depth, config_.dither, config_.noiseShaping);
+            runPost(cache.path(), analysis, planFor(gain), &writer, PeakMode::Off, config_.dualMono, &waveform, &limiterStats);
             writer.finalize();
-            result.output = measured;
+        }
+        delivered = MasteringEngine::measureFile(output, config_.dualMono, config_.accuratePeak);
+        const double over = delivered.truePeakDb - peakTarget;
+        bool again = false;
+        if (config_.accuratePeak && attempt < kMaxPeakTrims) {
+            if (over > 0.005) {
+                trimDb += over + 0.01;
+                again = true;
+            } else if (over < -kPeakWindowDb && limiterStats.maxReductionDb > 0.05 && raises < kMaxCeilingRaises &&
+                       trimDb + over >= -kMaxCeilingRaiseDb) {
+                trimDb += over + 0.01;
+                ++raises;
+                again = true;
+            }
+        }
+        if (!again) {
+            result.output = delivered;
             result.outputWaveform = waveform.finish();
             result.limiter = limiterStats;
             break;
         }
-        trimDb += over + 0.02;
     }
+    result.ceilingTrimDb = trimDb;
 
     ChainPlan finalPlan = planFor(gain);
     result.analysis.plan = finalPlan;
@@ -766,7 +941,7 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         result.targetReached = std::fabs(finalError) <= std::max(config_.loudnessToleranceLu, 0.05) * 1.5;
         if (!result.targetReached) {
             std::ostringstream message;
-            message << "Loudness target not reached: measured " << std::fixed << std::setprecision(1) << result.output.integratedLufs
+            message << "Loudness target not reached: measured " << std::fixed << std::setprecision(2) << result.output.integratedLufs
                     << " LUFS against a target of " << config_.targetLufs << " LUFS; the true-peak ceiling limits the achievable loudness";
             result.warnings.push_back(message.str());
         }
@@ -775,6 +950,12 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         std::ostringstream message;
         message << "True peak of " << std::fixed << std::setprecision(2) << result.output.truePeakDb
                 << " dBTP is above the ceiling of " << config_.ceilingDb << " dBTP";
+        result.warnings.push_back(message.str());
+    }
+    if (config_.autoGain && (result.limiter.averageReductionDb > kHeavyAverageReductionDb || result.limiter.maxReductionDb > kHeavyMaxReductionDb)) {
+        std::ostringstream message;
+        message << "Heavy limiting: " << std::fixed << std::setprecision(1) << result.limiter.averageReductionDb << " dB on average and up to "
+                << result.limiter.maxReductionDb << " dB. At this loudness drums can lose punch; a lower loudness target or a higher ceiling keeps the beat more open";
         result.warnings.push_back(message.str());
     }
     if (!analysis.shapeCentresHz.empty()) {
@@ -801,23 +982,41 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
     return result;
 }
 
+Measurements MasteringEngine::measureFile(const std::string& path, bool dualMono, bool accuratePeak) {
+    WavReader reader(path);
+    Meter meter(reader.sampleRate(), reader.channels(), accuratePeak ? PeakMode::Accurate : PeakMode::Standard, dualMono);
+    AudioBlock block;
+    size_t n;
+    while ((n = reader.read(block, kBlockFrames)) > 0) {
+        meter.process(block, n);
+    }
+    return meter.finish();
+}
+
+std::string MasteringEngine::measurementsJsonText(const Measurements& measurements) {
+    return measurementsJson(measurements);
+}
+
 MasteringResult MasteringEngine::run(const std::vector<std::string>& references, const std::string& input, const std::string& output) {
     const Analysis analysis = analyze(references, input);
     return render(analysis, input, output);
 }
 
-std::string MasteringEngine::exportJSON(const MasteringResult& result) {
+std::string MasteringEngine::exportJSON(const MasteringResult& result, const MasteringConfig& config) {
     const Analysis& a = result.analysis;
     std::ostringstream out;
     out << "{\n";
     out << "  \"version\": " << quote(kVersion) << ",\n";
+    out << "  \"settings\": {\"targetLufs\": " << num(config.targetLufs, 2) << ", \"ceilingDb\": " << num(config.ceilingDb, 2)
+        << ", \"toleranceLu\": " << num(config.loudnessToleranceLu, 3) << ", \"dualMono\": " << (config.dualMono ? "true" : "false")
+        << ", \"lookaheadMs\": " << num(config.limiterLookaheadMs, 1) << ", \"releaseMs\": " << num(config.limiterReleaseMs, 0) << "},\n";
     out << "  \"input\": {\"path\": " << quote(result.inputPath) << ", \"sampleRate\": " << a.sampleRate << ", \"channels\": " << a.channels
         << ", \"frames\": " << a.frames << ", \"measurements\": " << measurementsJson(a.input) << "},\n";
     out << "  \"references\": {\"count\": " << a.referenceCount << ", \"measurements\": " << measurementsJson(a.reference) << "},\n";
     out << "  \"output\": {\"path\": " << quote(result.outputPath) << ", \"bitDepth\": " << result.outputBitDepth
         << ", \"measurements\": " << measurementsJson(result.output) << "},\n";
     out << "  \"gain\": {\"makeupDb\": " << num(result.makeupGainDb, 2) << ", \"iterations\": " << result.iterations
-        << ", \"targetReached\": " << (result.targetReached ? "true" : "false") << "},\n";
+        << ", \"targetReached\": " << (result.targetReached ? "true" : "false") << ", \"ceilingTrimDb\": " << num(result.ceilingTrimDb, 3) << "},\n";
     out << "  \"mid\": " << curveJson(a.mid) << ",\n";
     out << "  \"side\": " << curveJson(a.side) << ",\n";
     out << "  \"width\": {\"sideGainDb\": " << num(a.sideGainDb, 2) << ", \"midSide\": " << (a.plan.midSide ? "true" : "false") << "},\n";
@@ -838,7 +1037,8 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result) {
     out << "]}},\n";
     out << "  \"limiter\": {\"maxReductionDb\": " << num(result.limiter.maxReductionDb, 2)
         << ", \"averageReductionDb\": " << num(result.limiter.averageReductionDb, 3)
-        << ", \"reducedFraction\": " << num(result.limiter.reducedFraction, 4) << "},\n";
+        << ", \"reducedFraction\": " << num(result.limiter.reducedFraction, 4)
+        << ", \"softClip\": " << (a.plan.softClip ? "true" : "false") << ", \"bassLimiter\": " << (a.plan.bassLimiter ? "true" : "false") << "},\n";
     out << "  \"monoBassHz\": " << num(a.plan.monoBassHz, 1) << ",\n";
     out << "  \"spectrum\": {\"frequencies\": " << numberArray(a.shapeCentresHz, 1) << ", \"input\": " << numberArray(a.inputShapeDb, 2)
         << ", \"reference\": " << numberArray(a.referenceShapeDb, 2) << ", \"output\": " << numberArray(result.outputShapeDb, 2)
@@ -846,6 +1046,11 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result) {
         << ", \"afterDb\": " << num(result.matchAfterDb, 2) << "}},\n";
     out << "  \"waveform\": {\"columns\": " << a.inputWaveform.peak.size() << ", \"input\": " << waveformJson(a.inputWaveform)
         << ", \"output\": " << waveformJson(result.outputWaveform) << "},\n";
+    out << "  \"notes\": [";
+    for (size_t i = 0; i < result.notes.size(); ++i) {
+        out << (i > 0 ? ", " : "") << quote(result.notes[i]);
+    }
+    out << "],\n";
     out << "  \"warnings\": [";
     for (size_t i = 0; i < result.warnings.size(); ++i) {
         out << (i > 0 ? ", " : "") << quote(result.warnings[i]);
