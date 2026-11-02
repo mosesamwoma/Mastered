@@ -431,6 +431,7 @@ progress {
   font-size: 1.45rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 
 .stat .sub {
@@ -649,5 +650,187 @@ label.inline {
 @media (prefers-reduced-motion: reduce) {
   .dropzone {
     transition: none;
+  }
+}
+
+/* ---- Version 2.3 additions ---- */
+
+.skip-link {
+  position: absolute;
+  left: 0.5rem;
+  top: -4rem;
+  z-index: 10;
+  padding: 0.5rem 0.9rem;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.skip-link:focus {
+  top: 0.5rem;
+}
+
+.summary {
+  margin-top: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+.summary:empty {
+  display: none;
+}
+
+.saved-settings {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  align-items: end;
+}
+
+.saved-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.notes {
+  margin: 1rem 0 0;
+  padding: 0.7rem 1rem 0.7rem 2rem;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.export-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.export-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-size: 0.92rem;
+}
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1rem 0 0;
+}
+
+.links .button {
+  padding: 0.45rem 0.8rem;
+  font-size: 0.92rem;
+}
+
+#export-button {
+  margin-top: 0.25rem;
+}
+
+select:disabled {
+  opacity: 0.6;
+}
+
+.chip:disabled {
+  text-decoration: line-through;
+}
+
+#batch-list {
+  margin-top: 0.25rem;
+}
+
+.dropzone .drop-name {
+  max-height: 6.5rem;
+  overflow-y: auto;
+}
+
+@media (pointer: coarse) {
+  button,
+  .button,
+  select,
+  input[type="number"],
+  input[type="text"] {
+    min-height: 2.75rem;
+  }
+
+  input[type="checkbox"] {
+    width: 1.35rem;
+    height: 1.35rem;
+  }
+
+  .checks label {
+    min-height: 2.75rem;
+  }
+
+  .player-row input[type="range"] {
+    min-height: 2.5rem;
+  }
+}
+
+@media (max-width: 640px) {
+  .site-header {
+    padding-top: 1.25rem;
+  }
+
+  .site-header h1 {
+    font-size: 1.5rem;
+  }
+
+  form#job-form {
+    padding: 0.25rem 0.9rem 1rem;
+  }
+
+  .panel {
+    padding: 1rem;
+  }
+
+  .stats {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .player-row {
+    gap: 0.5rem;
+  }
+
+  .segmented button {
+    flex: 1;
+  }
+
+  .segmented {
+    width: 100%;
+  }
+
+  .export-list li .button,
+  #export-button,
+  #download {
+    width: 100%;
+  }
+
+  .links .button {
+    flex: 1 1 45%;
+  }
+}
+
+@media (max-width: 380px) {
+  .stats {
+    grid-template-columns: 1fr;
   }
 }
