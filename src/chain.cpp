@@ -3,6 +3,7 @@
 #include "constants.h"
 #include "error.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace mastered {
@@ -20,43 +21,68 @@ std::vector<Biquad> makeFilters(const std::vector<EQBand>& bands, double sampleR
 
 }
 
-ProcessingChain::ProcessingChain(const ChainPlan& plan, double sampleRate, size_t channels)
+ProcessingChain::ProcessingChain(const ChainPlan& plan, double sampleRate, size_t channels, ChainStage stage)
     : plan_(plan),
       channels_(channels),
+      stage_(stage),
       useMidSide_((plan.midSide || plan.monoBassHz > 0.0) && channels == 2),
       gainLinear_(std::pow(10.0, plan.gainDb / 20.0)) {
     if (channels == 0 || channels > kMaxChannels) {
         throw MasteredError("Unsupported channel count");
     }
-    if (useMidSide_) {
-        midFilters_ = makeFilters(plan.midBands, sampleRate);
-        // When mid/side is only switched on for bass mono, the side signal gets the same EQ as the mid signal,
-        // which is identical to filtering left and right directly.
-        sideFilters_ = makeFilters(plan.midSide ? plan.sideBands : plan.midBands, sampleRate);
-        if (plan.monoBassHz > 0.0) {
-            // A fourth-order high-pass on the side signal makes everything below the corner frequency mono.
-            const BiquadCoefficients highPass = designButterworth(true, plan.monoBassHz, sampleRate);
-            sideHighPass_.assign(2, Biquad(highPass));
+    if (stage != ChainStage::Post) {
+        if (useMidSide_) {
+            midFilters_ = makeFilters(plan.midBands, sampleRate);
+            // When mid/side is only switched on for bass mono, the side signal gets the same EQ as the mid signal,
+            // which is identical to filtering left and right directly.
+            sideFilters_ = makeFilters(plan.midSide ? plan.sideBands : plan.midBands, sampleRate);
+            if (plan.monoBassHz > 0.0) {
+                // A fourth-order high-pass on the side signal makes everything below the corner frequency mono.
+                const BiquadCoefficients highPass = designButterworth(true, plan.monoBassHz, sampleRate);
+                sideHighPass_.assign(2, Biquad(highPass));
+            }
+        } else {
+            for (size_t ch = 0; ch < channels; ++ch) {
+                channelFilters_.push_back(makeFilters(plan.midBands, sampleRate));
+            }
         }
-    } else {
-        for (size_t ch = 0; ch < channels; ++ch) {
-            channelFilters_.push_back(makeFilters(plan.midBands, sampleRate));
+        if (plan.dynamics.enabled) {
+            compressor_ = std::make_unique<MultibandCompressor>(plan.dynamics, sampleRate, channels);
         }
     }
-    if (plan.dynamics.enabled) {
-        compressor_ = std::make_unique<MultibandCompressor>(plan.dynamics, sampleRate, channels);
-    }
-    if (plan.limiterEnabled) {
+    if (stage != ChainStage::Pre && plan.limiterEnabled) {
         const double ceilingLinear = std::pow(10.0, (plan.ceilingDb - kLimiterMarginDb) / 20.0);
         if (plan.softClip) {
             clipper_ = std::make_unique<SoftClipper>(ceilingLinear, plan.softClipKneeDb);
+        }
+        if (plan.bassLimiter && plan.bassLimiterHz * 2.0 < sampleRate * 0.45) {
+            const BiquadCoefficients lowPass = designButterworth(false, plan.bassLimiterHz, sampleRate);
+            const BiquadCoefficients highPass = designButterworth(true, plan.bassLimiterHz, sampleRate);
+            bassSplit_.resize(channels);
+            for (BassSplit& split : bassSplit_) {
+                split.lowA.setCoefficients(lowPass);
+                split.lowB.setCoefficients(lowPass);
+                split.highA.setCoefficients(highPass);
+                split.highB.setCoefficients(highPass);
+            }
+            const double bassRelease = std::min(std::max(plan.releaseMs * 2.0, 150.0), 1000.0);
+            bassLimiter_ = std::make_unique<TruePeakLimiter>(sampleRate, channels, plan.ceilingDb - plan.bassCeilingOffsetDb,
+                                                             std::max(plan.lookaheadMs * 2.0, 8.0), bassRelease);
+            bassDelay_.assign(channels, std::vector<double>(bassLimiter_->latency(), 0.0));
         }
         limiter_ = std::make_unique<TruePeakLimiter>(sampleRate, channels, plan.ceilingDb, plan.lookaheadMs, plan.releaseMs);
     }
 }
 
 size_t ProcessingChain::latency() const {
-    return limiter_ ? limiter_->latency() : 0;
+    size_t total = 0;
+    if (bassLimiter_) {
+        total += bassLimiter_->latency();
+    }
+    if (limiter_) {
+        total += limiter_->latency();
+    }
+    return total;
 }
 
 void ProcessingChain::collectLimiterStatistics(bool enabled) {
@@ -70,6 +96,14 @@ LimiterStats ProcessingChain::limiterStatistics() const {
 }
 
 void ProcessingChain::process(AudioBlock& block, size_t frames) {
+    processPre(block, frames);
+    processPost(block, frames);
+}
+
+void ProcessingChain::processPre(AudioBlock& block, size_t frames) {
+    if (stage_ == ChainStage::Post) {
+        throw MasteredError("Internal error: the processing chain was built for the post stage only");
+    }
     if (useMidSide_) {
         mid_.resize(frames);
         side_.resize(frames);
@@ -102,6 +136,12 @@ void ProcessingChain::process(AudioBlock& block, size_t frames) {
     if (compressor_) {
         compressor_->process(block, frames);
     }
+}
+
+void ProcessingChain::processPost(AudioBlock& block, size_t frames) {
+    if (stage_ == ChainStage::Pre) {
+        throw MasteredError("Internal error: the processing chain was built for the pre stage only");
+    }
     if (gainLinear_ != 1.0) {
         for (size_t ch = 0; ch < channels_; ++ch) {
             for (size_t i = 0; i < frames; ++i) {
@@ -114,6 +154,30 @@ void ProcessingChain::process(AudioBlock& block, size_t frames) {
             for (size_t i = 0; i < frames; ++i) {
                 block[ch][i] = clipper_->apply(block[ch][i]);
             }
+        }
+    }
+    if (bassLimiter_) {
+        bassLow_.resize(channels_);
+        bassHigh_.resize(channels_);
+        for (size_t ch = 0; ch < channels_; ++ch) {
+            bassLow_[ch].resize(frames);
+            bassHigh_[ch].resize(frames);
+            BassSplit& split = bassSplit_[ch];
+            for (size_t i = 0; i < frames; ++i) {
+                const double x = block[ch][i];
+                bassLow_[ch][i] = split.lowB.process(split.lowA.process(x));
+                bassHigh_[ch][i] = split.highB.process(split.highA.process(x));
+            }
+        }
+        bassLimiter_->process(bassLow_, frames);
+        const size_t delayLength = bassDelay_[0].size();
+        for (size_t i = 0; i < frames; ++i) {
+            for (size_t ch = 0; ch < channels_; ++ch) {
+                const double delayedHigh = bassDelay_[ch][bassDelayPosition_];
+                bassDelay_[ch][bassDelayPosition_] = bassHigh_[ch][i];
+                block[ch][i] = bassLow_[ch][i] + delayedHigh;
+            }
+            bassDelayPosition_ = (bassDelayPosition_ + 1) % delayLength;
         }
     }
     if (limiter_) {
