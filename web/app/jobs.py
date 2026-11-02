@@ -44,10 +44,14 @@ def describe_duration(seconds):
     return f"{seconds / 3600:.0f} hours"
 
 
-def download_name(original):
+def track_stem(original):
     stem = Path(original.replace("\\", "/")).stem
     cleaned = re.sub(r"[^A-Za-z0-9 ._-]", "", stem).strip(" .")[:80]
-    return f"{cleaned or 'track'}_mastered.wav"
+    return cleaned or "track"
+
+
+def download_name(original, extension="wav"):
+    return f"{track_stem(original)}_mastered.{extension}"
 
 
 class JobManager:
@@ -61,6 +65,8 @@ class JobManager:
         self.last_progress = {}
         self.wake = asyncio.Event()
         self.tasks = []
+        # Exports run one at a time: encoding and checking a file is CPU heavy and a free server has little to spare.
+        self.export_gate = asyncio.Semaphore(1)
 
     def job_directory(self, job_id):
         return self.settings.work_dir / job_id
@@ -133,6 +139,13 @@ class JobManager:
             data["report"] = row["report"]
             data["downloadUrl"] = f"/api/jobs/{row['id']}/download"
             data["downloadName"] = download_name(row["track_name"])
+            data["reportUrl"] = f"/api/jobs/{row['id']}/report"
+            directory = self.job_directory(row["id"])
+            data["eq"] = {
+                kind: f"/api/jobs/{row['id']}/eq/{kind}"
+                for kind in ("reaeq", "apo")
+                if (directory / f"mastered.{kind}.txt").is_file()
+            }
             data["preview"] = None
             if row["preview"]:
                 data["preview"] = {
