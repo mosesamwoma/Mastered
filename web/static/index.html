@@ -10,6 +10,7 @@
 <script src="app.js" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#job-form">Skip to the form</a>
 <header class="site-header">
   <div class="brand">
     <img class="logo" src="/favicon.svg" alt="" width="40" height="40">
@@ -36,18 +37,19 @@
             <span class="drop-name" id="reference-name">Drop a finished track here or click to choose</span>
             <span class="drop-hint">A release whose sound you like.</span>
           </label>
-          <input id="reference" name="reference" type="file" class="file-input" accept=".wav,audio/wav,audio/x-wav">
+          <input id="reference" name="reference" type="file" class="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,audio/*">
         </div>
         <div class="field">
           <label class="dropzone" id="drop-track" for="track">
             <span class="drop-title">Your track</span>
             <span class="drop-name" id="track-name">Drop your mix here or click to choose</span>
-            <span class="drop-hint">The mix you want to master.</span>
+            <span class="drop-hint">The mix you want to master. Choose several to master them one after another.</span>
           </label>
-          <input id="track" name="track" type="file" class="file-input" accept=".wav,audio/wav,audio/x-wav">
+          <input id="track" name="track" type="file" class="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,audio/*" multiple>
         </div>
       </div>
       <p id="formats-hint" class="hint"></p>
+      <p id="ready-hint" class="hint" role="status"></p>
     </section>
 
     <section class="step" aria-labelledby="step-target">
@@ -89,6 +91,26 @@
       </div>
     </section>
 
+    <details class="step" id="saved-details">
+      <summary>My saved settings</summary>
+      <p class="hint">Keep your favourite combinations in this browser and bring them back with one click.</p>
+      <div class="saved-settings">
+        <div class="field">
+          <label for="saved-select">Saved</label>
+          <select id="saved-select"><option value="">Choose a saved setting…</option></select>
+        </div>
+        <div class="field">
+          <label for="saved-name">Name</label>
+          <input id="saved-name" type="text" maxlength="40" autocomplete="off" placeholder="For example: Club master">
+        </div>
+        <div class="saved-buttons">
+          <button id="saved-save" type="button">Save current</button>
+          <button id="saved-delete" type="button">Delete</button>
+        </div>
+      </div>
+      <p id="saved-note" class="hint" role="status"></p>
+    </details>
+
     <details class="step">
       <summary>Advanced</summary>
       <div class="grid two">
@@ -97,29 +119,35 @@
           <input id="bands" name="bands" type="number" min="0" max="32" step="1" value="8">
         </div>
         <div class="field">
-          <label for="bit-depth">Output format</label>
+          <label for="bit-depth">WAV bit depth</label>
           <select id="bit-depth" name="bit_depth">
             <option value="0">Same as your track</option>
             <option value="16">16-bit</option>
             <option value="24">24-bit</option>
             <option value="32">32-bit float</option>
           </select>
+          <small>MP3, OGG, FLAC and more are available to download after mastering.</small>
         </div>
         <div class="field">
           <label for="precision">Loudness precision</label>
           <select id="precision" name="precision">
-            <option value="fast">Fast (about 0.25 LU)</option>
-            <option value="normal" selected>Normal (about 0.1 LU)</option>
-            <option value="high">High (about 0.05 LU, slower)</option>
+            <option value="fast">Fast (within about 0.1 LU)</option>
+            <option value="normal" selected>Normal (within 0.02 LU)</option>
+            <option value="high">High (within 0.01 LU, slower)</option>
           </select>
         </div>
       </div>
       <div class="checks">
         <label><input type="checkbox" id="dither" checked> Dither (16 and 24-bit)</label>
         <label><input type="checkbox" id="noise-shaping"> Noise shaping</label>
+        <label><input type="checkbox" id="auto-clip" checked> Switch the soft clipper on automatically when the limiter would work hard</label>
+        <label><input type="checkbox" id="auto-mono-bass" checked> Make the bass mono automatically when it is out of phase</label>
+        <label><input type="checkbox" id="dual-mono"> Measure mono files as dual mono (+3 LU)</label>
+        <label><input type="checkbox" id="bass-limiter"> Limit the bass separately (experimental)</label>
       </div>
     </details>
 
+    <aside id="plan-summary" class="summary" aria-live="polite"></aside>
     <p id="form-message" class="form-error" role="alert" hidden></p>
     <button id="submit" type="submit" class="primary wide" disabled>Master my track</button>
   </form>
@@ -127,8 +155,10 @@
   <section id="progress-panel" class="panel" hidden aria-live="polite">
     <h2 id="progress-title">Working</h2>
     <ol id="progress-steps" class="steps-list"></ol>
+    <p id="batch-status" class="hint" hidden></p>
     <progress id="progress-bar" max="100" value="0"></progress>
     <p id="progress-message"></p>
+    <p id="progress-eta" class="hint"></p>
     <p class="hint">Mastering runs on a small free server, so longer songs can take a few minutes. You can leave this page open.</p>
     <button id="cancel" type="button">Cancel</button>
   </section>
@@ -140,6 +170,10 @@
   </section>
 
   <section id="result-panel" class="result" hidden>
+    <div id="batch-bar" class="panel" hidden>
+      <h3>Your tracks</h3>
+      <div id="batch-list" class="chips" role="group" aria-label="Choose which master to view"></div>
+    </div>
     <div class="panel hero">
       <div>
         <h2>Your master is ready</h2>
@@ -149,10 +183,36 @@
     </div>
 
     <div id="stats" class="stats"></div>
+    <ul id="notes" class="notes" hidden></ul>
     <ul id="warnings" class="warnings" hidden></ul>
+
+    <div class="panel" id="export-panel">
+      <h3>Download in another format</h3>
+      <div class="grid two">
+        <div class="field">
+          <label for="export-format">Format</label>
+          <select id="export-format"></select>
+        </div>
+        <div class="field">
+          <label for="export-quality">Quality</label>
+          <select id="export-quality"></select>
+        </div>
+      </div>
+      <p id="export-description" class="hint"></p>
+      <button id="export-button" type="button" class="primary">Prepare and download</button>
+      <p id="export-status" class="hint" role="status"></p>
+      <ul id="export-list" class="export-list"></ul>
+      <p class="links">
+        <a id="report-txt" class="button" href="#" download>Report (.txt)</a>
+        <a id="report-json" class="button" href="#" download>Report (.json)</a>
+        <a id="eq-reaeq" class="button" href="#" download hidden>EQ for ReaEQ</a>
+        <a id="eq-apo" class="button" href="#" download hidden>EQ for Equalizer APO</a>
+      </p>
+    </div>
 
     <div class="panel" id="player" hidden>
       <h3>Compare</h3>
+      <p id="player-mode" class="hint"></p>
       <div id="player-media"></div>
       <div class="wave-wrap">
         <canvas id="wave" class="wave" height="120" role="img" aria-label="Waveform of the selected version. Click to seek."></canvas>
@@ -201,6 +261,13 @@
     <div class="panel">
       <h3>Tone compared with the reference</h3>
       <div id="spectrum"></div>
+      <div class="table-wrap" id="tone-table-wrap" hidden>
+        <table>
+          <thead><tr><th scope="col">Region</th><th scope="col">Your track vs reference</th><th scope="col">Master vs reference</th></tr></thead>
+          <tbody id="tone-regions"></tbody>
+        </table>
+      </div>
+      <p class="hint">Differences in the average level of each region, with the overall level taken out. Closer to 0 dB means closer to the reference.</p>
     </div>
 
     <div class="panel">
