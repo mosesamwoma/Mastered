@@ -30,7 +30,9 @@ class SecurityHeadersMiddleware:
 
         request_headers = dict(scope.get("headers", []))
         secure = scope.get("scheme") == "https" or request_headers.get(b"x-forwarded-proto", b"").split(b",")[0].strip().lower() == b"https"
-        api = scope.get("path", "").startswith("/api/")
+        path = scope.get("path", "")
+        api = path.startswith("/api/")
+        media = "/audio/" in path or "/export/" in path or path.endswith("/download")
 
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
@@ -42,7 +44,13 @@ class SecurityHeadersMiddleware:
                 if secure and HSTS[0] not in existing:
                     headers.append(HSTS)
                 if b"cache-control" not in existing:
-                    headers.append((b"cache-control", b"no-store" if api else b"no-cache"))
+                    if not api:
+                        policy = b"no-cache"
+                    elif media:
+                        policy = b"private, no-cache"
+                    else:
+                        policy = b"no-store"
+                    headers.append((b"cache-control", policy))
                 message = {**message, "headers": headers}
             await send(message)
 
