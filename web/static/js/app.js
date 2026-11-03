@@ -11,6 +11,7 @@ const SETTINGS_KEY = 'masteredSettings';
 const MAX_SAVED_SETTINGS = 12;
 const MAX_BATCH_TRACKS = 5;
 const SEEK_STEP_SECONDS = 5;
+const PREVIEW_LOAD_TIMEOUT_MS = 30000;
 const BUFFER_PLAYER_MAX_SECONDS = 240;
 const BUFFER_PLAYER_MAX_SECONDS_TOUCH = 120;
 const ETA_MIN_ELAPSED_MS = 12000;
@@ -1446,6 +1447,22 @@ function handleMediaError() {
   }
 }
 
+function withTimeout(promise, milliseconds) {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error('The preview took too long to load')), milliseconds);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 async function createBufferImpl(job, Context) {
   let context = null;
   try {
@@ -1463,7 +1480,7 @@ async function createBufferImpl(job, Context) {
         }
       });
     };
-    const loaded = await Promise.all([decode(job.preview.original), decode(job.preview.mastered)]);
+    const loaded = await withTimeout(Promise.all([decode(job.preview.original), decode(job.preview.mastered)]), PREVIEW_LOAD_TIMEOUT_MS);
     let buffers = { original: loaded[0], mastered: loaded[1] };
     const length = buffers.mastered.duration;
     const gains = {};
