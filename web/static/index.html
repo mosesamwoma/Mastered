@@ -7,7 +7,7 @@
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Mastered</title>
 <link rel="stylesheet" href="style.css">
-<script src="app.js" defer></script>
+<script type="module" src="js/app.js"></script>
 </head>
 <body>
 <a class="skip-link" href="#job-form">Skip to the form</a>
@@ -72,6 +72,7 @@
       <h2 id="step-sound"><span class="num">3</span>Sound</h2>
       <div class="chips" role="group" aria-label="Style">
         <button type="button" class="chip" data-style="gentle" aria-pressed="false">Gentle</button>
+        <button type="button" class="chip" data-style="transparent" aria-pressed="false">Transparent</button>
         <button type="button" class="chip" data-style="balanced" aria-pressed="true">Balanced</button>
         <button type="button" class="chip" data-style="punchy" aria-pressed="false">Dense</button>
       </div>
@@ -143,6 +144,7 @@
         <label><input type="checkbox" id="auto-clip" checked> Switch the soft clipper on automatically when the limiter would work hard</label>
         <label><input type="checkbox" id="auto-mono-bass" checked> Make the bass mono automatically when it is out of phase</label>
         <label><input type="checkbox" id="dual-mono"> Measure mono files as dual mono (+3 LU)</label>
+        <label><input type="checkbox" id="transparent"> Transparent mode: small EQ moves, no compression, no width change</label>
         <label><input type="checkbox" id="bass-limiter"> Limit the bass separately (experimental)</label>
       </div>
     </details>
@@ -183,6 +185,7 @@
     </div>
 
     <div id="stats" class="stats"></div>
+    <ul id="changes" class="notes" hidden></ul>
     <ul id="notes" class="notes" hidden></ul>
     <ul id="warnings" class="warnings" hidden></ul>
 
@@ -199,6 +202,10 @@
         </div>
       </div>
       <p id="export-description" class="hint"></p>
+      <div class="checks">
+        <label><input type="checkbox" id="export-48k"> Deliver at 48 kHz (video and broadcast)</label>
+        <label><input type="checkbox" id="export-tags"> Keep title, artist and album from the source file</label>
+      </div>
       <button id="export-button" type="button" class="primary">Prepare and download</button>
       <p id="export-status" class="hint" role="status"></p>
       <ul id="export-list" class="export-list"></ul>
