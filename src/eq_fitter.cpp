@@ -168,8 +168,6 @@ private:
     std::vector<double> sin2_;
 };
 
-// Replaces two peaking bands of the same sign that sit close together by a single band, when that costs
-// almost nothing in fit quality. Returns true when at least one pair was merged.
 bool mergeNeighbours(std::vector<EQBand>& bands, const Fitter& fitter) {
     constexpr double kMergeOctaves = 0.5;
     constexpr double kAllowedCostIncrease = 0.05;
@@ -262,8 +260,6 @@ FitResult fitEQ(const std::vector<double>& centresHz, const std::vector<double>&
         return std::any_of(bands.begin(), bands.end(), [type](const EQBand& b) { return b.type == type; });
     };
 
-    // Adding bands one at a time can leave a pair of bands that do the work of one. Merging them frees
-    // a band for something else, so the two steps run twice.
     for (int round = 0; round < 2; ++round) {
         while (bands.size() < options.maxBands) {
             const std::vector<double> response = fitter.response(bands);
@@ -297,7 +293,6 @@ FitResult fitEQ(const std::vector<double>& centresHz, const std::vector<double>&
             std::vector<EQBand> bestTrial;
             double bestCost = std::numeric_limits<double>::infinity();
             for (BandType type : types) {
-                // One shelf of each kind is enough; a second one next to it only repeats the first.
                 if (type != BandType::Peak && hasType(type)) {
                     continue;
                 }

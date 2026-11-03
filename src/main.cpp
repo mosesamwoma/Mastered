@@ -57,6 +57,9 @@ void printUsage() {
         "  --fft N               FFT size, power of two 1024 to 65536 (default 8192)\n"
         "  --passes N            Maximum loudness passes, 1 to 30 (default 12)\n"
         "  --tolerance LU        Loudness tolerance, 0.005 to 2 (default 0.02)\n"
+        "  --transparent         Gentle mode: small EQ moves, no compression, no width change\n"
+        "  --max-boost DB        Largest EQ boost, 0 to 12 (default 9)\n"
+        "  --max-cut DB          Largest EQ cut, 0 to 18 (default 12)\n"
         "  --verbose             Print EQ bands and measurements\n"
         "  --help                Show this help\n";
 }
@@ -125,7 +128,6 @@ int run(int argc, char** argv) {
     bool verbose = false;
     std::string measurePath;
 
-    // A preset is applied first so that explicit options always win, whatever their order.
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--list-presets") {
@@ -224,6 +226,18 @@ int run(int argc, char** argv) {
             config.maxLoudnessIterations = static_cast<int>(parseCount(arg, value(), 1, 30));
         } else if (arg == "--tolerance") {
             config.loudnessToleranceLu = parseNumber(arg, value());
+        } else if (arg == "--transparent") {
+            config.maxBoostDb = 3.0;
+            config.maxCutDb = 4.0;
+            config.maxEQBands = std::min<size_t>(config.maxEQBands, 5);
+            config.maxSideBands = std::min<size_t>(config.maxSideBands, 2);
+            config.matchWidth = false;
+            config.dynamics = false;
+            config.autoClip = false;
+        } else if (arg == "--max-boost") {
+            config.maxBoostDb = parseNumber(arg, value());
+        } else if (arg == "--max-cut") {
+            config.maxCutDb = parseNumber(arg, value());
         } else if (arg == "--verbose") {
             verbose = true;
         } else if (arg.size() > 1 && arg[0] == '-' && arg != "-") {

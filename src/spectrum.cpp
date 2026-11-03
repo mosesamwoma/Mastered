@@ -101,8 +101,6 @@ AverageSpectrum SpectrumAccumulator::finish() {
     if (total == 0) {
         throw MasteredError(silent_ > 0 ? "Audio is silent" : "Audio is too short for spectral analysis");
     }
-    // A frame counts when it is within 50 dB of the loudest frame, and never when it is below -120 dB.
-    // Normal material keeps the earlier fixed limit of -70 dB, quiet material is no longer mistaken for silence.
     const double limitDb = std::min(kNormalGateDb, loudestDb_ - kRelativeGateDb);
     const size_t bins = fftSize_ / 2 + 1;
     AverageSpectrum result;

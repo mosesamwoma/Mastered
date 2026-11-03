@@ -120,10 +120,6 @@ MultibandCompressor::MultibandCompressor(const DynamicsSettings& settings, doubl
         attack_[b] = std::exp(-1.0 / (std::max(settings.bands[b].attackMs, 0.01) * 0.001 * sampleRate));
         release_[b] = std::exp(-1.0 / (std::max(settings.bands[b].releaseMs, 0.01) * 0.001 * sampleRate));
     }
-    // The level detector averages the squared signal with a fixed, symmetric window that spans several cycles of the
-    // lowest frequency in its band. Attack and release then act on the gain reduction, which moves slowly, instead of
-    // on the detector itself. Smoothing the detector asymmetrically makes the gain follow the waveform of bass notes
-    // and adds harmonic distortion; this arrangement does not.
     constexpr double kDetectorMs[3] = {30.0, 10.0, 3.0};
     for (size_t b = 0; b < 3; ++b) {
         detector_[b] = std::exp(-1.0 / (kDetectorMs[b] * 0.001 * sampleRate));

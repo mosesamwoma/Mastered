@@ -21,10 +21,6 @@ TruePeakLimiter::TruePeakLimiter(double sampleRate, size_t channels, double ceil
     kernel_ = &standardKernel();
     latency_ = lookahead_ + kernel_->delay;
     ceiling_ = std::pow(10.0, (ceilingDb - kLimiterMarginDb) / 20.0);
-    // Program-dependent release. A fast follower recovers quickly after an isolated peak, while a slow follower
-    // tracks how deep and how long the limiting has been; the smaller of the two is used. A single kick therefore
-    // lets go quickly, whereas sustained limiting recovers over the full release time. The fast time is kept
-    // above one cycle of low bass so that the gain does not follow the waveform of a bass note.
     const double fastReleaseMs = std::min(std::max(releaseMs * 0.4, 20.0), 120.0);
     fastReleaseCoefficient_ = std::exp(-1.0 / (std::min(fastReleaseMs, releaseMs) * 0.001 * sampleRate));
     slowReleaseCoefficient_ = std::exp(-1.0 / (releaseMs * 0.001 * sampleRate));

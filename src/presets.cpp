@@ -7,9 +7,6 @@ namespace mastered {
 
 namespace {
 
-// Typical delivery and normalisation targets. Services change their rules from time to time and
-// some sources disagree, so a ceiling is always chosen on the safe side. These are guidance
-// values, not guarantees about how a service will treat a file.
 const Preset kPresets[] = {
     {"spotify", "Spotify", "Streaming", -14.0, -1.0, "Normalises to about -14 LUFS"},
     {"youtube", "YouTube", "Streaming", -14.0, -1.0, "Turns loud uploads down to about -14 LUFS"},

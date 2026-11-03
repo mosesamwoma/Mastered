@@ -33,11 +33,8 @@ ProcessingChain::ProcessingChain(const ChainPlan& plan, double sampleRate, size_
     if (stage != ChainStage::Post) {
         if (useMidSide_) {
             midFilters_ = makeFilters(plan.midBands, sampleRate);
-            // When mid/side is only switched on for bass mono, the side signal gets the same EQ as the mid signal,
-            // which is identical to filtering left and right directly.
             sideFilters_ = makeFilters(plan.midSide ? plan.sideBands : plan.midBands, sampleRate);
             if (plan.monoBassHz > 0.0) {
-                // A fourth-order high-pass on the side signal makes everything below the corner frequency mono.
                 const BiquadCoefficients highPass = designButterworth(true, plan.monoBassHz, sampleRate);
                 sideHighPass_.assign(2, Biquad(highPass));
             }
