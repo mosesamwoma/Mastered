@@ -90,6 +90,8 @@ By default the mastered file is written next to the input as `<input>_mastered.w
 | `--fft N` | 8192 | FFT size, power of two 1024 to 65536 |
 | `--passes N` | 12 | Maximum loudness passes, 1 to 30 |
 | `--tolerance LU` | 0.02 | Loudness tolerance, 0.005 to 2 |
+| `--transparent` | off | Gentle mode: EQ boosts up to 3 dB and cuts up to 4 dB, at most 5 mid and 2 side bands, no compression, no width change |
+| `--max-boost` / `--max-cut` | 9 / 12 | Largest EQ boost (0 to 12 dB) and cut (0 to 18 dB) |
 | `--verbose` | | Print EQ bands and stereo/dynamics details |
 
 Exit codes: 0 success, 1 error, 2 usage.
@@ -229,7 +231,14 @@ All settings are environment variables with safe defaults.
 | `JOBS_PER_HOUR_PER_CLIENT` | 6 | Jobs per visitor per hour |
 | `API_REQUESTS_PER_MINUTE` | 240 | API requests per visitor per minute, per process |
 | `UPLOAD_ATTEMPTS_PER_HOUR` | 30 | Upload attempts per visitor per hour, per process |
-| `CLIENT_IP_HEADER` | empty (Docker: `cf-connecting-ip`) | Header that carries the visitor address |
+| `CLIENT_IP_HEADER` | empty | Header that carries the visitor address. Set it only when a trusted proxy always sets it (`cf-connecting-ip`, or `x-forwarded-for`) |
+| `TRUSTED_PROXY_HOPS` | 1 | With `x-forwarded-for`, how many trusted proxies are in front; the address is read that many entries from the right |
+| `APP_ENV` | empty | `production` refuses to start without sign-in unless `ALLOW_PUBLIC=true`, and refuses `COOKIE_SECURE=never` |
+| `ALLOW_PUBLIC` | false in production | Run an open service without sign-in on purpose |
+| `ADMIN_USERS`, `ADMIN_TOKEN` | empty | Signed-in users (from `AUTH_USERS`) or a bearer token of 24+ characters that may read `/api/metrics` and `/api/admin/jobs`; both endpoints are off when neither is set |
+| `MAX_DECODED_MB` | 1024 | Largest size an uploaded compressed file may have once decoded |
+| `MIN_FREE_MB` | 512 | New jobs are refused while less disk space is free |
+| `ENGINE_MEMORY_MB` | 2048 | Memory cap for each mastering process; it stops with a clear error instead of exhausting the server |
 | `AUTH_USERS` | empty | `name:hash` entries that enable sign-in; see Sign-in |
 | `SESSION_SECRET` | empty | Signing key for sessions, at least 32 characters, required with `AUTH_USERS` |
 | `SESSION_HOURS` | 12 | How long a sign-in lasts |
@@ -239,6 +248,14 @@ All settings are environment variables with safe defaults.
 | `JOB_TIMEOUT_SEC` | 1800 | A mastering run longer than this is stopped |
 | `CONVERT_TIMEOUT_SEC` | 300 | Time allowed to convert one uploaded file |
 | `PORT` | 10000 | Port used by the Docker image |
+
+### Operations
+
+- Logs are JSON lines on standard output. Every request gets an `x-request-id`; job ids are shortened in logs. Job stages (queue wait, conversion, mastering, preview) are written to the log, to the report (`timing`) and to the metrics.
+- Failed jobs carry an error category: `conversion`, `engine`, `timeout`, `worker_lost`, `restart` or `internal`.
+- The mastering process runs with a memory cap and a CPU limit; ffmpeg runs with a CPU limit.
+- Uploaded compressed files are checked against known audio signatures and a decoded-size limit before they are converted, and a conversion that comes out much shorter than the source is rejected as truncated.
+- The database schema is versioned (`PRAGMA user_version`); older job databases are upgraded when the server starts.
 
 ### How it works
 
@@ -253,7 +270,11 @@ All settings are environment variables with safe defaults.
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /api/health` | Health check |
+| `GET /api/health` | Liveness check |
+| `GET /api/ready` | Readiness: engine, ffmpeg, writable storage, database, free disk and worker; HTTP 503 when degraded |
+| `GET /api/metrics` | Prometheus text metrics (administrators only) |
+| `GET /api/admin/jobs` | Recent jobs with status, age, error category and stuck flag (administrators only) |
+| `GET /api/jobs` | Your own queued, running and finished jobs, so a sign-in on another device can pick up where you left off (signed-in users only) |
 | `POST /api/login` | JSON `username` and `password`; sets the session cookie |
 | `POST /api/logout` | Clears the session cookie |
 | `GET /api/session` | Whether sign-in is required and who is signed in |
@@ -261,7 +282,7 @@ All settings are environment variables with safe defaults.
 | `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `soft_clip`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `dither`, `noise_shaping`, `mid_side`, `match_width`, `mono_bass_hz`; returns 202 with the job id |
 | `GET /api/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`), progress, queue position, and when done the report, download link and preview links |
 | `GET /api/jobs/{id}/download` | Mastered WAV |
-| `POST /api/jobs/{id}/export` | JSON body `{"format": "mp3", "quality": "320"}`; encodes and checks the file, returns its name, URL, size and measured loudness and true peak. One export runs at a time, at most 12 files per job |
+| `POST /api/jobs/{id}/export` | JSON body `{"format": "mp3", "quality": "320", "rate": 48000, "metadata": true}` (`rate` is 0 to keep the sample rate or 48000; `metadata` keeps title, artist and album from the source file); encodes and checks the file, returns its name, URL, size and measured loudness and true peak. One export runs at a time, at most 12 files per job |
 | `GET /api/jobs/{id}/export/{key}` | A file made by the export call |
 | `GET /api/jobs/{id}/report?kind=txt\|json` | The mastering report |
 | `GET /api/jobs/{id}/eq/{reaeq\|apo}` | EQ settings for ReaEQ or Equalizer APO |
