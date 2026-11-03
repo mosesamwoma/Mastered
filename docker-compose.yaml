@@ -8,22 +8,42 @@ services:
       - "10000:10000"
     environment:
       PORT: "10000"
+      APP_ENV: production
       WORK_DIR: /data
+      AUTH_USERS: ${AUTH_USERS:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      ADMIN_USERS: ${ADMIN_USERS:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      ALLOW_PUBLIC: ${ALLOW_PUBLIC:-false}
+      CLIENT_IP_HEADER: ${CLIENT_IP_HEADER:-}
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
       MAX_FILE_MB: "60"
       MAX_DURATION_SEC: "420"
       MAX_PENDING_JOBS: "2"
       JOB_TTL_MINUTES: "20"
       JOB_TIMEOUT_SEC: "1800"
+      ENGINE_MEMORY_MB: "2048"
+      MIN_FREE_MB: "512"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 3g
+    cpus: 2.0
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/api/health', timeout=2)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/api/ready', timeout=3)"
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     restart: unless-stopped
     volumes:
       - mastered-data:/data

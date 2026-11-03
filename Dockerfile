@@ -1,4 +1,3 @@
-# The engine is built as C++23: Debian bookworm provides GCC 12 and CMake 3.25, which are new enough.
 FROM debian:bookworm-slim AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake \
@@ -17,11 +16,12 @@ FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=10000 \
-    CLIENT_IP_HEADER=cf-connecting-ip
+    APP_ENV=production \
+    WORK_DIR=/data
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --uid 10001 app \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
     && mkdir /data \
     && chown app:app /data
 WORKDIR /app
@@ -32,4 +32,6 @@ COPY web/static ./static
 COPY --from=build /src/build/mastered_cli /usr/local/bin/mastered_cli
 USER app
 EXPOSE 10000
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --timeout-keep-alive 30"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '10000') + '/api/ready', timeout=3)"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --timeout-keep-alive 30 --no-access-log --no-server-header"]
