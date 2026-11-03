@@ -2,17 +2,19 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import time
 import uuid
 from pathlib import Path
 
-from .media import MediaError, MediaInfo, kill_group
+from .media import MediaError, MediaInfo, kill_group, make_limits
+from .observability import log_event, metrics
 from .store import JobStore
 from .wav_info import WavError, inspect_wav
 
-LOG = logging.getLogger("uvicorn.error")
+LOG = logging.getLogger("mastered")
 PROGRESS_LINE = re.compile(r"^\[\s*(\d+(?:\.\d+)?)%\]\s*(.*)$")
 JOB_DIRECTORY = re.compile(r"^[0-9a-f]{32}$")
 STDERR_LIMIT = 65536
@@ -26,6 +28,10 @@ ENGINE_PROGRESS_END = 96.0
 
 
 class QueueFull(Exception):
+    pass
+
+
+class DiskLow(Exception):
     pass
 
 
@@ -65,8 +71,9 @@ class JobManager:
         self.last_progress = {}
         self.wake = asyncio.Event()
         self.tasks = []
-        # Exports run one at a time: encoding and checking a file is CPU heavy and a free server has little to spare.
         self.export_gate = asyncio.Semaphore(1)
+        self.failure_category = "engine"
+        self.started_at = time.time()
 
     def job_directory(self, job_id):
         return self.settings.work_dir / job_id
@@ -75,7 +82,8 @@ class JobManager:
         return await asyncio.to_thread(function, *arguments, **keywords)
 
     async def start(self):
-        self.settings.work_dir.mkdir(parents=True, exist_ok=True)
+        os.umask(0o077)
+        self.settings.work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.store = await asyncio.to_thread(JobStore, self.settings.database_path)
         self.tasks = [asyncio.create_task(self.work()), asyncio.create_task(self.sweep())]
 
@@ -87,10 +95,19 @@ class JobManager:
             kill_group(process)
         if self.store is not None:
             for job_id in self.store.running_for_worker(self.worker_id):
-                self.store.mark_failed(job_id, "The server restarted while this job was running", only_status="running")
+                self.store.mark_failed(job_id, "The server restarted while this job was running", only_status="running", category="restart")
             self.store.close()
 
+    def free_megabytes(self):
+        try:
+            return shutil.disk_usage(self.settings.work_dir).free / (1024 * 1024)
+        except OSError:
+            return 0.0
+
     async def reserve(self, track_name, cli_args, client):
+        if self.settings.min_free_mb and await asyncio.to_thread(self.free_megabytes) < self.settings.min_free_mb:
+            metrics.count("jobs_rejected", {"reason": "disk"})
+            raise DiskLow()
         job_id = uuid.uuid4().hex
         settings = self.settings
         status, retry = await self.database(
@@ -98,6 +115,7 @@ class JobManager:
             settings.max_pending_jobs, settings.pending_per_client, settings.jobs_per_hour_per_client,
         )
         if status == "busy":
+            metrics.count("jobs_rejected", {"reason": "busy"})
             raise QueueFull()
         if status == "client_busy":
             raise RateLimited("You already have a job in progress. Please wait for it to finish.", 30)
@@ -121,6 +139,10 @@ class JobManager:
         await self.database(self.store.update, job_id, status="queued", message="Waiting in the queue")
         self.wake.set()
 
+    async def list_for(self, client, limit=5):
+        rows = await self.database(self.store.recent_for, client, limit)
+        return rows
+
     async def row(self, job_id):
         return await self.database(self.store.get, job_id)
 
@@ -135,6 +157,7 @@ class JobManager:
             data["position"] = await self.database(self.store.queue_position, row["id"])
         if row["status"] == "failed":
             data["error"] = row["error"]
+            data["errorCategory"] = row.get("category") or "engine"
         if row["status"] == "done":
             data["report"] = row["report"]
             data["downloadUrl"] = f"/api/jobs/{row['id']}/download"
@@ -201,8 +224,8 @@ class JobManager:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOG.exception("Job %s failed unexpectedly", row["id"])
-                await self.fail(row["id"], "The mastering engine failed unexpectedly")
+                LOG.exception("Job %s failed unexpectedly", row["id"][:8])
+                await self.fail(row["id"], "The mastering engine failed unexpectedly", "internal")
 
     async def sweep(self):
         while True:
@@ -219,9 +242,16 @@ class JobManager:
         for row in await self.database(self.store.stale_running, now - HEARTBEAT_TIMEOUT_SEC):
             if row["cancel"]:
                 await self.discard(row["id"])
-            elif await self.database(self.store.mark_failed, row["id"], "The worker stopped unexpectedly", "running"):
+            elif await self.database(self.store.mark_failed, row["id"], "The worker stopped unexpectedly", "running", "worker_lost"):
+                metrics.count("jobs", {"outcome": "failed", "category": "worker_lost"})
                 await self.clear_files(row["id"])
         await asyncio.to_thread(self.remove_orphan_directories)
+        metrics.gauge("disk_free_megabytes", await asyncio.to_thread(self.free_megabytes))
+        counts = await self.database(self.store.counts)
+        for name in ("queued", "running", "done", "failed", "uploading"):
+            metrics.gauge(f"jobs_{name}", counts.get(name, 0))
+        if self.settings.min_free_mb and self.free_megabytes() < self.settings.min_free_mb:
+            log_event("low disk space", free_mb=round(self.free_megabytes()), required_mb=self.settings.min_free_mb)
 
     def remove_orphan_directories(self):
         known = self.store.all_ids()
@@ -245,9 +275,11 @@ class JobManager:
 
         await asyncio.to_thread(remove)
 
-    async def fail(self, job_id, message):
-        await self.database(self.store.mark_failed, job_id, message)
+    async def fail(self, job_id, message, category="engine"):
+        await self.database(self.store.mark_failed, job_id, message, None, category)
         await self.clear_files(job_id)
+        metrics.count("jobs", {"outcome": "failed", "category": category})
+        log_event("job failed", job=job_id[:8], category=category, reason=message[:200])
 
     async def progress(self, job_id, value, message, force=False):
         now = time.monotonic()
@@ -308,10 +340,13 @@ class JobManager:
                 converted_info = await asyncio.to_thread(inspect_wav, wav)
                 if converted_info.duration > self.settings.max_duration_sec + 1.0:
                     raise MediaError("the audio is longer than the allowed length")
+                shortfall = info.duration - converted_info.duration
+                if shortfall > max(2.0, 0.05 * info.duration):
+                    raise MediaError("the file appears to be truncated or damaged")
             except (MediaError, WavError) as error:
                 if self.is_cancelled(job_id):
                     return None
-                await self.fail(job_id, f"The {label} file could not be converted: {error}")
+                await self.fail(job_id, f"The {label} file could not be converted: {error}", "conversion")
                 return None
             raw.unlink(missing_ok=True)
             converted = True
@@ -336,6 +371,7 @@ class JobManager:
                 stderr=asyncio.subprocess.PIPE,
                 limit=1 << 20,
                 start_new_session=True,
+                preexec_fn=make_limits(self.settings.engine_memory_mb * 1024 * 1024, self.settings.job_timeout_sec + 60),
             )
         except OSError:
             return "The mastering engine could not be started"
@@ -357,8 +393,10 @@ class JobManager:
         if self.is_cancelled(job_id):
             return None
         if timed_out:
+            self.failure_category = "timeout"
             return f"Mastering took longer than {describe_duration(self.settings.job_timeout_sec)} and was stopped"
         if process.returncode != 0:
+            self.failure_category = "engine"
             return self.engine_error(stderr, job_id)
         return ""
 
@@ -388,6 +426,8 @@ class JobManager:
 
     def engine_error(self, stderr, job_id):
         lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        if "bad_alloc" in stderr or "std::length_error" in stderr:
+            return "The audio is too large to master within the memory limit of this server"
         for line in reversed(lines):
             if line.startswith("Error:"):
                 return self.clean_message(line[len("Error:"):], job_id) or "The mastering engine reported an error"
@@ -409,33 +449,53 @@ class JobManager:
 
     async def execute(self, row):
         job_id = row["id"]
+        started = time.time()
         converted = await self.convert_sources(row)
         if converted is None:
             return
+        convert_done = time.time()
         base = CONVERT_PROGRESS if converted else 0.0
+        self.failure_category = "engine"
         failure = await self.run_engine(row, base)
         if failure is None:
             return
         if failure:
-            await self.fail(job_id, failure)
+            await self.fail(job_id, failure, self.failure_category)
             return
+        engine_done = time.time()
         directory = self.job_directory(job_id)
         try:
             report = json.loads(await asyncio.to_thread((directory / "report.json").read_text, "utf-8"))
             if not (directory / "mastered.wav").is_file():
                 raise FileNotFoundError
         except (OSError, ValueError):
-            await self.fail(job_id, "The mastering engine finished without producing a result")
+            await self.fail(job_id, "The mastering engine finished without producing a result", "engine")
             return
         report["input"]["path"] = row["track_name"][:120]
         report["output"]["path"] = download_name(row["track_name"])
+        report["conversion"] = {
+            label: list((row["sources"].get(label) or {}).get("notes") or []) for label in ("reference", "track")
+        }
         await self.progress(job_id, 97.0, "Preparing the preview", force=True)
         preview = await self.make_previews(job_id)
         if self.is_cancelled(job_id):
             return
+        finished = time.time()
+        timing = {
+            "queueSec": round(max(0.0, (row["started"] or started) - row["created"]), 2),
+            "convertSec": round(convert_done - started, 2),
+            "engineSec": round(engine_done - convert_done, 2),
+            "previewSec": round(finished - engine_done, 2),
+            "totalSec": round(finished - started, 2),
+        }
+        report["timing"] = timing
+        for name, value in (("queue", timing["queueSec"]), ("convert", timing["convertSec"]), ("engine", timing["engineSec"]), ("preview", timing["previewSec"])):
+            metrics.observe("job_stage", value, {"stage": name})
+        metrics.count("jobs", {"outcome": "done", "category": "ok"})
+        log_event("job done", job=job_id[:8], **timing)
         for name in ("reference.wav", "track.wav", "report.json"):
             (directory / name).unlink(missing_ok=True)
         await self.database(
             self.store.update, job_id, status="done", progress=100.0, message="Done",
-            finished=time.time(), report=report, preview=preview,
+            finished=finished, report=report, preview=preview, timings=timing,
         )

@@ -1,8 +1,10 @@
 import asyncio
+import hmac
 import json
 import os
 import re
 import secrets
+import time
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -13,17 +15,18 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from .auth import COOKIE_NAME, MAX_PASSWORD_BYTES, SessionSigner, hash_password, verify_password
+from .auth import COOKIE_NAME, MAX_PASSWORD_BYTES, SessionSigner, hash_password, session_token, verify_password
 from .config import load_settings
-from .exports import EXPORT_KEY, MAX_EXPORTS_PER_JOB, build_export, describe_formats, find_quality
-from .jobs import JobManager, QueueFull, RateLimited, describe_duration, download_name, track_stem
-from .media import SOURCE_EXTENSIONS, MediaError, MediaTools
+from .exports import DELIVERY_RATES, EXPORT_KEY, MAX_EXPORTS_PER_JOB, build_export, describe_formats, find_quality
+from .jobs import DiskLow, JobManager, QueueFull, RateLimited, describe_duration, download_name, track_stem
+from .media import SOURCE_EXTENSIONS, MediaError, MediaTools, describe_conversion, has_audio_signature
+from .observability import RequestLogMiddleware, metrics, setup_logging
 from .reports import report_text
 from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeadersMiddleware
 from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key
 from .wav_info import WavError, inspect_wav
 
-VERSION = "2.3.1"
+VERSION = "2.4.0"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024
@@ -31,11 +34,13 @@ BIT_DEPTHS = (0, 16, 24, 32)
 LOGIN_WINDOW_SEC = 900.0
 LOGIN_BODY_BYTES = 4096
 
+setup_logging()
 settings = load_settings()
 media = MediaTools(settings.ffmpeg_path, settings.ffprobe_path)
 manager = JobManager(settings, media)
 signer = SessionSigner(settings.session_secret, settings.session_seconds) if settings.auth_enabled else None
 login_limiter = SlidingWindow(settings.login_attempts, LOGIN_WINDOW_SEC)
+user_limiter = SlidingWindow(settings.login_attempts * 3, LOGIN_WINDOW_SEC)
 presets = []
 placeholder_hash = hash_password(secrets.token_urlsafe(16)) if settings.auth_enabled else ""
 
@@ -46,7 +51,6 @@ class LoginRequest(BaseModel):
 
 
 async def load_presets():
-    """Reads the platform presets from the engine so that the web page and the engine share one list."""
     try:
         process = await asyncio.create_subprocess_exec(
             str(settings.engine_path), "--list-presets",
@@ -89,14 +93,20 @@ app.add_middleware(
     requests_per_minute=settings.api_requests_per_minute,
     uploads_per_hour=settings.upload_attempts_per_hour,
     header=settings.client_ip_header,
+    hops=settings.trusted_proxy_hops,
 )
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestLogMiddleware, header=settings.client_ip_header, hops=settings.trusted_proxy_hops)
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_failed(_request, error):
     details = [{"loc": list(item["loc"]), "msg": item["msg"], "type": item["type"]} for item in error.errors()]
     return JSONResponse({"detail": details}, status_code=422)
+
+
+def client_of(scope):
+    return client_key(scope, settings.client_ip_header, settings.trusted_proxy_hops)
 
 
 def copy_limited(source, destination, limit):
@@ -128,17 +138,24 @@ async def classify_upload(raw, wav, label):
     else:
         check_duration(info.duration, label)
         await run_in_threadpool(os.replace, raw, wav)
-        return {"convert": False}
+        notes = []
+        if info.truncated:
+            notes.append("The file ends earlier than its header says; only the audio that is present was used")
+        return {"convert": False, "notes": notes, "tags": {}}
     if not media.available:
         raise HTTPException(
             400,
             f"The {label} file is not a usable WAV file ({wav_problem}). Only WAV files are supported on this server.",
         )
+    if not await run_in_threadpool(has_audio_signature, raw):
+        raise HTTPException(400, f"The {label} file is not a recognised audio file.")
     try:
         probe = await media.probe(raw)
     except MediaError as error:
         raise HTTPException(400, f"The {label} file is not a supported audio file: {error}.") from None
     check_duration(probe.duration, label)
+    if probe.decoded_bytes() > settings.max_decoded_mb * 1024 * 1024:
+        raise HTTPException(413, f"The {label} file is too large once it is decoded")
     return {
         "convert": True,
         "codec": probe.codec,
@@ -146,6 +163,8 @@ async def classify_upload(raw, wav, label):
         "sample_rate": probe.sample_rate,
         "bits": probe.bits,
         "duration": probe.duration,
+        "notes": describe_conversion(probe),
+        "tags": probe.tags,
     }
 
 
@@ -179,6 +198,7 @@ def build_engine_arguments(
     auto_mono_bass=True,
     dual_mono=False,
     bass_limiter=False,
+    transparent=False,
 ):
     arguments = [
         "--target", f"{target_lufs:.3f}",
@@ -215,12 +235,14 @@ def build_engine_arguments(
         arguments.append("--no-width")
     if mono_bass_hz > 0:
         arguments += ["--mono-bass", f"{mono_bass_hz:.1f}"]
+    if transparent:
+        arguments.append("--transparent")
     return arguments
 
 
 def identity(request):
     user = request.scope.get("mastered_user")
-    return f"user:{user}" if user else client_key(request.scope, settings.client_ip_header)
+    return f"user:{user}" if user else client_of(request.scope)
 
 
 def secure_cookie(request):
@@ -247,8 +269,9 @@ async def require_job(job_id, request):
 async def login(request: Request, body: LoginRequest):
     if signer is None:
         raise HTTPException(404, "Sign-in is not enabled on this server.")
-    key = client_key(request.scope, settings.client_ip_header)
-    wait = login_limiter.retry_after(key)
+    key = client_of(request.scope)
+    account = body.username.lower()
+    wait = max(login_limiter.retry_after(key), user_limiter.retry_after(account))
     if wait > 0:
         raise HTTPException(
             429,
@@ -259,8 +282,12 @@ async def login(request: Request, body: LoginRequest):
     valid = await asyncio.to_thread(verify_password, body.password, stored or placeholder_hash)
     if stored is None or not valid:
         login_limiter.hit(key)
+        user_limiter.hit(account)
+        metrics.count("logins", {"result": "failed"})
         raise HTTPException(401, "Incorrect username or password.")
     login_limiter.clear(key)
+    user_limiter.clear(account)
+    metrics.count("logins", {"result": "ok"})
     response = JSONResponse({"user": body.username}, headers={"Cache-Control": "no-store"})
     response.set_cookie(
         COOKIE_NAME, signer.issue(body.username, stored), max_age=settings.session_seconds, **cookie_options(request)
@@ -270,6 +297,8 @@ async def login(request: Request, body: LoginRequest):
 
 @app.post("/api/logout", status_code=204)
 async def logout(request: Request):
+    if signer is not None:
+        signer.revoke(session_token(request.scope.get("headers", [])))
     response = Response(status_code=204)
     response.set_cookie(COOKIE_NAME, "", max_age=0, **cookie_options(request))
     return response
@@ -293,6 +322,95 @@ async def login_page(request: Request):
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+async def storage_writable():
+    def probe():
+        target = settings.work_dir / f".probe_{secrets.token_hex(4)}"
+        try:
+            target.write_bytes(b"ok")
+            return True
+        except OSError:
+            return False
+        finally:
+            target.unlink(missing_ok=True)
+
+    return await asyncio.to_thread(probe)
+
+
+@app.get("/api/ready")
+async def ready():
+    try:
+        database = bool(manager.store is not None and await asyncio.to_thread(manager.store.check))
+    except Exception:
+        database = False
+    free = await asyncio.to_thread(manager.free_megabytes)
+    checks = {
+        "engine": settings.engine_path.is_file(),
+        "ffmpeg": media.available,
+        "storage": await storage_writable(),
+        "database": database,
+        "disk": free >= settings.min_free_mb,
+        "worker": all(not task.done() for task in manager.tasks) and bool(manager.tasks),
+    }
+    healthy = checks["engine"] and checks["storage"] and checks["database"] and checks["disk"] and checks["worker"]
+    return JSONResponse(
+        {"status": "ok" if healthy else "degraded", "checks": checks},
+        status_code=200 if healthy else 503,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def admin_allowed(request):
+    header = request.headers.get("authorization", "")
+    if settings.admin_token and header.lower().startswith("bearer "):
+        if hmac.compare_digest(header[7:].strip().encode("utf-8"), settings.admin_token.encode("utf-8")):
+            return True
+    user = request.scope.get("mastered_user")
+    return bool(user and user in settings.admin_users)
+
+
+def require_admin(request):
+    if not settings.admin_token and not settings.admin_users:
+        raise HTTPException(404, "Not found")
+    if not admin_allowed(request):
+        raise HTTPException(403, "Administrator access is required")
+
+
+@app.get("/api/metrics")
+async def metrics_text(request: Request):
+    require_admin(request)
+    return Response(metrics.render(), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/api/admin/jobs")
+async def admin_jobs(request: Request, limit: int = 50):
+    require_admin(request)
+    limit = min(max(limit, 1), 200)
+    rows = await manager.database(manager.store.recent, limit)
+    now = time.time()
+    jobs = []
+    for row in rows:
+        active = row["status"] in ("uploading", "queued", "running")
+        stuck = row["status"] == "running" and (row["heartbeat"] or 0) < now - 120
+        jobs.append(
+            {
+                "id": row["id"][:8],
+                "status": row["status"],
+                "ageSec": round(now - row["created"]),
+                "progress": round(row["progress"], 1),
+                "message": row["message"],
+                "error": row["error"],
+                "category": row["category"],
+                "cancelling": bool(row["cancel"]),
+                "stuck": stuck,
+                "active": active,
+                "track": track_stem(row["track_name"]),
+            }
+        )
+    counts = await manager.database(manager.store.counts)
+    free = await asyncio.to_thread(manager.free_megabytes)
+    return {"counts": counts, "freeMb": round(free), "uptimeSec": round(now - manager.started_at), "jobs": jobs}
 
 
 @app.get("/api/config")
@@ -334,6 +452,7 @@ async def create_job(
     auto_mono_bass: bool = Form(True),
     dual_mono: bool = Form(False),
     bass_limiter: bool = Form(False),
+    transparent: bool = Form(False),
 ):
     if bit_depth not in BIT_DEPTHS:
         raise HTTPException(422, "bit_depth must be 0, 16, 24 or 32")
@@ -342,7 +461,7 @@ async def create_job(
     arguments = build_engine_arguments(
         target_lufs, aggressiveness, ceiling_db, bands, bit_depth, precision,
         dynamics, soft_clip, dither, noise_shaping, mid_side, match_width, mono_bass_hz,
-        auto_clip, auto_mono_bass, dual_mono, bass_limiter,
+        auto_clip, auto_mono_bass, dual_mono, bass_limiter, transparent,
     )
     client = identity(request)
     try:
@@ -353,6 +472,8 @@ async def create_job(
         ) from None
     except RateLimited as error:
         raise HTTPException(429, error.message, headers={"Retry-After": str(error.retry_after)}) from None
+    except DiskLow:
+        raise HTTPException(503, "The server is out of storage space. Please try again later.", headers={"Retry-After": "120"}) from None
     directory = manager.job_directory(job_id)
     try:
         sources = {
@@ -366,6 +487,19 @@ async def create_job(
     await manager.enqueue(job_id)
     view = await manager.view(await manager.row(job_id))
     return JSONResponse({"id": job_id, "status": view["status"], "position": view.get("position", 0)}, status_code=202)
+
+
+@app.get("/api/jobs")
+async def job_list(request: Request):
+    if signer is None:
+        return {"jobs": []}
+    rows = await manager.list_for(identity(request))
+    return {
+        "jobs": [
+            {"id": row["id"], "status": row["status"], "progress": round(row["progress"], 1), "track": track_stem(row["track_name"])}
+            for row in rows
+        ]
+    }
 
 
 @app.get("/api/jobs/{job_id}")
@@ -394,6 +528,8 @@ async def job_audio(job_id: str, version: Literal["original", "mastered"], reque
 class ExportRequest(BaseModel):
     format: str = Field(min_length=2, max_length=12, pattern=r"^[a-z0-9]+$")
     quality: str = Field(min_length=2, max_length=16, pattern=r"^[a-z0-9]+$")
+    rate: int = Field(default=0)
+    metadata: bool = False
 
 
 def count_exports(directory):
@@ -406,24 +542,34 @@ async def job_export(job_id: str, body: ExportRequest, request: Request):
     directory = manager.job_directory(job_id)
     if row["status"] != "done" or not (directory / "mastered.wav").is_file() or not row["report"]:
         raise HTTPException(409, "The mastered file is not ready")
+    if body.rate not in DELIVERY_RATES:
+        raise HTTPException(422, "rate must be 0 (keep the sample rate) or 48000")
     if find_quality(media.encoders, body.format, body.quality)[0] is None:
         raise HTTPException(400, "This format or quality is not available on this server")
+    if body.rate and not media.available:
+        raise HTTPException(400, "Resampling is not available on this server")
+    tags = None
+    if body.metadata:
+        tags = ((row["sources"] or {}).get("track") or {}).get("tags") or None
+    suffix = ("_48k" if body.rate else "") + ("_tags" if tags and not (body.format == "wav" and not body.rate) else "")
     async with manager.export_gate:
-        # The job may have been removed or expired while this request waited for its turn.
         row = await manager.row(job_id)
         if row is None or row["cancel"] or not (directory / "mastered.wav").is_file():
             raise HTTPException(404, "Job not found or expired")
-        if body.format != "wav" and not (directory / f"export_{body.format}_{body.quality}.json").is_file():
+        if (body.format != "wav" or body.rate) and not (directory / f"export_{body.format}_{body.quality}{suffix}.json").is_file():
             if await run_in_threadpool(count_exports, directory) >= MAX_EXPORTS_PER_JOB:
                 raise HTTPException(429, "This result already has the maximum number of exported files. Download one of them or master again.")
         try:
-            info = await build_export(settings, directory, body.format, body.quality, media.encoders, row["report"], track_stem(row["track_name"]))
+            started = time.monotonic()
+            info = await build_export(settings, directory, body.format, body.quality, media.encoders, row["report"], track_stem(row["track_name"]), body.rate, tags)
+            metrics.observe("export", time.monotonic() - started, {"format": body.format})
+            metrics.count("exports", {"format": body.format})
         except MediaError as error:
             raise HTTPException(500, f"Export failed: {error}.") from None
         except OSError:
             raise HTTPException(500, "Export failed: the file could not be written.") from None
     name = download_name(row["track_name"], info["extension"])
-    url = f"/api/jobs/{job_id}/download" if info["format"] == "wav" else f"/api/jobs/{job_id}/export/{info['key']}"
+    url = f"/api/jobs/{job_id}/download" if info["key"] == "wav_master" else f"/api/jobs/{job_id}/export/{info['key']}"
     return {**info, "name": name, "url": url}
 
 

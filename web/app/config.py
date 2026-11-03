@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -73,6 +74,13 @@ class Settings:
     session_seconds: int
     cookie_secure: str
     login_attempts: int
+    trusted_proxy_hops: int
+    max_decoded_mb: int
+    min_free_mb: int
+    engine_memory_mb: int
+    admin_token: str
+    admin_users: frozenset
+    production: bool
 
     @property
     def auth_enabled(self):
@@ -98,8 +106,37 @@ def load_auth():
     return users, secret.encode("utf-8"), mode
 
 
+def read_flag(name, default):
+    raw = (os.environ.get(name) or "").strip().lower()
+    if raw == "":
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} must be true or false")
+
+
+def load_admin(users):
+    token = (os.environ.get("ADMIN_TOKEN") or "").strip()
+    if token and len(token) < 24:
+        raise ConfigError("ADMIN_TOKEN must be at least 24 characters long")
+    names = frozenset(name.strip() for name in re.split(r"[,\s]+", os.environ.get("ADMIN_USERS") or "") if name.strip())
+    unknown = names - set(users)
+    if unknown:
+        raise ConfigError(f"ADMIN_USERS lists users that are not in AUTH_USERS: {', '.join(sorted(unknown))}")
+    return token, names
+
+
 def load_settings():
     users, secret, cookie_mode = load_auth()
+    admin_token, admin_users = load_admin(users)
+    production = (os.environ.get("APP_ENV") or "").strip().lower() == "production"
+    if production:
+        if not users and not read_flag("ALLOW_PUBLIC", False):
+            raise ConfigError("Production mode requires sign-in: set AUTH_USERS and SESSION_SECRET, or set ALLOW_PUBLIC=true to run an open service on purpose")
+        if cookie_mode == "never":
+            raise ConfigError("COOKIE_SECURE=never is not allowed in production mode")
     work_dir = Path(os.environ.get("WORK_DIR") or Path(tempfile.gettempdir()) / "mastered_jobs")
     max_file_mb = read_number("MAX_FILE_MB", 60.0, 0.1, 2048.0, float)
     return Settings(
@@ -125,4 +162,11 @@ def load_settings():
         session_seconds=int(read_number("SESSION_HOURS", 12.0, 0.1, 720.0, float) * 3600),
         cookie_secure=cookie_mode,
         login_attempts=read_number("LOGIN_ATTEMPTS", 8, 1, 100, int),
+        trusted_proxy_hops=read_number("TRUSTED_PROXY_HOPS", 1, 1, 10, int),
+        max_decoded_mb=read_number("MAX_DECODED_MB", 1024, 16, 16384, int),
+        min_free_mb=read_number("MIN_FREE_MB", 512, 0, 1048576, int),
+        engine_memory_mb=read_number("ENGINE_MEMORY_MB", 2048, 256, 65536, int),
+        admin_token=admin_token,
+        admin_users=admin_users,
+        production=production,
     )

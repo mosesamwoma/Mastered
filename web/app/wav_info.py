@@ -19,6 +19,7 @@ class WavInfo:
     sample_rate: int
     bits: int
     frames: int
+    truncated: bool = False
 
     @property
     def duration(self):
@@ -102,4 +103,5 @@ def inspect_wav(path: Path) -> WavInfo:
     frames = min(declared, available) // block_align
     if frames == 0:
         raise WavError("file contains no audio")
-    return WavInfo(channels=channels, sample_rate=sample_rate, bits=bits, frames=frames)
+    truncated = declared != UNKNOWN_SIZE and declared > available + block_align
+    return WavInfo(channels=channels, sample_rate=sample_rate, bits=bits, frames=frames, truncated=truncated)

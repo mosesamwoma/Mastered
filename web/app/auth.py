@@ -86,10 +86,28 @@ def generation(stored):
     return hashlib.sha256(stored.encode("utf-8")).hexdigest()[:12]
 
 
+MAX_REVOKED = 20000
+
+
 class SessionSigner:
     def __init__(self, secret, lifetime_seconds):
         self.secret = secret
         self.lifetime = lifetime_seconds
+        self.revoked = {}
+
+    @staticmethod
+    def fingerprint(token):
+        return hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()
+
+    def revoke(self, token, now=None):
+        now = time.time() if now is None else now
+        if not token:
+            return
+        for key in [key for key, expires in self.revoked.items() if expires <= now]:
+            del self.revoked[key]
+        if len(self.revoked) >= MAX_REVOKED:
+            self.revoked.pop(next(iter(self.revoked)))
+        self.revoked[self.fingerprint(token)] = now + self.lifetime + 60
 
     def sign(self, body):
         return encode(hmac.new(self.secret, f"{TOKEN_VERSION}.{body}".encode("ascii"), hashlib.sha256).digest())
@@ -105,7 +123,9 @@ class SessionSigner:
     def read(self, token, users, now=None):
         now = time.time() if now is None else now
         parts = token.split(".") if token else []
-        if len(parts) != 3 or parts[0] != TOKEN_VERSION:
+        if len(parts) != 3 or parts[0] != TOKEN_VERSION or len(token) > 1024:
+            return None
+        if self.fingerprint(token) in self.revoked:
             return None
         if not hmac.compare_digest(self.sign(parts[1]), parts[2]):
             return None

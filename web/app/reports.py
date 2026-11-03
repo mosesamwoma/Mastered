@@ -1,4 +1,3 @@
-"""Plain-text version of the mastering report, for people who want to keep or share the numbers."""
 
 
 def number(value, digits=2, unit=""):
@@ -62,6 +61,19 @@ def report_text(report, track_name, output_name):
         lines.append(
             f"  Tonal match       {number(match.get('beforeDb'), 2)} dB -> {number(match.get('afterDb'), 2)} dB RMS difference to the reference"
         )
+    changes = report.get("changes") or {}
+    if changes:
+        lines += [
+            "",
+            "What changed",
+            f"  Loudness          {float(changes.get('loudnessChangeLu', 0.0)):+.2f} LU",
+            f"  True peak         {float(changes.get('truePeakChangeDb', 0.0)):+.2f} dB",
+            f"  Makeup gain       {float(changes.get('makeupGainDb', 0.0)):+.2f} dB",
+            f"  EQ                up to {float(changes.get('midBoostDb', 0.0)):+.2f} dB / {float(changes.get('midCutDb', 0.0)):+.2f} dB in {changes.get('bands', 0)} bands",
+            f"  Stereo width      {float(changes.get('widthChangeDb', 0.0)):+.2f} dB",
+            f"  Limiter           up to {number(changes.get('limiterMaxReductionDb'), 1)} dB",
+            f"  Compression       {'on' if changes.get('dynamicsApplied') else 'off'}",
+        ]
     lines += ["", "EQ"]
     lines += band_lines("Mid" if report.get("width", {}).get("midSide") else "Stereo", report.get("mid", {}).get("bands", []))
     if report.get("width", {}).get("midSide"):
@@ -69,7 +81,10 @@ def report_text(report, track_name, output_name):
         lines.append(f"  Side gain {float(report.get('width', {}).get('sideGainDb', 0.0)):+.2f} dB")
     if report.get("monoBassHz"):
         lines.append(f"  Mono bass below {number(report.get('monoBassHz'), 0)} Hz")
-    notes = report.get("notes") or []
+    conversion = report.get("conversion") or {}
+    notes = list(report.get("notes") or [])
+    for label in ("reference", "track"):
+        notes += [f"{label.capitalize()} file: {text}" for text in conversion.get(label) or []]
     warnings = report.get("warnings") or []
     if notes:
         lines += ["", "Notes"] + [f"  {text}" for text in notes]

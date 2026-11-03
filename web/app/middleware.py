@@ -9,9 +9,14 @@ SECURITY_HEADERS = [
     (
         b"content-security-policy",
         b"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-        b"connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        b"connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     ),
+    (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"),
+    (b"cross-origin-opener-policy", b"same-origin"),
+    (b"cross-origin-resource-policy", b"same-origin"),
+    (b"x-permitted-cross-domain-policies", b"none"),
 ]
+HSTS = (b"strict-transport-security", b"max-age=31536000; includeSubDomains")
 
 
 class SecurityHeadersMiddleware:
@@ -23,6 +28,10 @@ class SecurityHeadersMiddleware:
             await self.app(scope, receive, send)
             return
 
+        request_headers = dict(scope.get("headers", []))
+        secure = scope.get("scheme") == "https" or request_headers.get(b"x-forwarded-proto", b"").split(b",")[0].strip().lower() == b"https"
+        api = scope.get("path", "").startswith("/api/")
+
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
                 existing = {name.lower() for name, _ in message.get("headers", [])}
@@ -30,6 +39,10 @@ class SecurityHeadersMiddleware:
                 for name, value in SECURITY_HEADERS:
                     if name not in existing:
                         headers.append((name, value))
+                if secure and HSTS[0] not in existing:
+                    headers.append(HSTS)
+                if b"cache-control" not in existing:
+                    headers.append((b"cache-control", b"no-store" if api else b"no-cache"))
                 message = {**message, "headers": headers}
             await send(message)
 
@@ -38,8 +51,9 @@ class SecurityHeadersMiddleware:
 
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 PUBLIC_PATHS = {
-    "/login", "/login.js", "/style.css", "/favicon.svg", "/api/health", "/api/login", "/api/logout", "/api/session",
+    "/login", "/login.js", "/style.css", "/favicon.svg", "/api/health", "/api/ready", "/api/login", "/api/logout", "/api/session",
 }
+SELF_AUTHENTICATED_PREFIXES = ("/api/admin/", "/api/metrics")
 
 
 class BodyTooLarge(Exception):
@@ -140,7 +154,7 @@ class AuthMiddleware:
         if scope["method"] not in SAFE_METHODS and not self.same_origin(headers):
             await self.reply(send, 403, b'{"detail":"Cross-site request blocked."}')
             return
-        if path in PUBLIC_PATHS or scope["mastered_user"] is not None:
+        if path in PUBLIC_PATHS or path.startswith(SELF_AUTHENTICATED_PREFIXES) or scope["mastered_user"] is not None:
             await self.app(scope, receive, send)
             return
         if path.startswith("/api/") or scope["method"] not in SAFE_METHODS:
@@ -150,6 +164,9 @@ class AuthMiddleware:
 
     def same_origin(self, headers):
         values = {name: value for name, value in headers}
+        fetch_site = values.get(b"sec-fetch-site")
+        if fetch_site is not None and fetch_site.decode("latin-1").lower() not in ("same-origin", "none"):
+            return False
         origin = values.get(b"origin")
         if origin is None:
             return True

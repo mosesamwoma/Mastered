@@ -1,10 +1,3 @@
-"""Download formats and the encode-and-check loop for lossy exports.
-
-The mastered WAV is the master. Every other format is made from it with ffmpeg. Lossy encoders move the true peak (an
-MP3 or AAC file can come out above the ceiling the master respected) and can shift loudness slightly, so each lossy
-file is decoded again and measured with the mastering engine's own meter. If the peak is over the ceiling the gain is
-lowered by the overshoot and the file is encoded again.
-"""
 
 import asyncio
 import json
@@ -20,6 +13,8 @@ MAX_ATTEMPTS = 5
 PEAK_AIM_DB = 0.1
 EXPORT_KEY = re.compile(r"^[a-z0-9_]{3,40}$")
 MAX_EXPORTS_PER_JOB = 12
+DELIVERY_RATES = (0, 48000)
+PCM_BY_BITS = {16: "pcm_s16le", 24: "pcm_s24le", 32: "pcm_f32le"}
 
 
 @dataclass(frozen=True)
@@ -94,7 +89,6 @@ FORMAT_ORDER = ("wav", "flac", "aiff", "mp3", "ogg", "opus", "m4a")
 
 
 def available_formats(encoders):
-    """Formats that this server can produce, given the set of ffmpeg encoder names it found (empty without ffmpeg)."""
     result = []
     for key in FORMAT_ORDER:
         fmt = FORMATS[key]
@@ -130,20 +124,34 @@ def find_quality(encoders, format_id, quality_id):
     return None, None
 
 
-def encode_arguments(ffmpeg, source, destination, fmt, quality, gain_db, channels, sample_rate, title):
+def encode_arguments(ffmpeg, source, destination, fmt, quality, gain_db, channels, sample_rate, title, rate=0, tags=None, bits=24):
     arguments = [str(ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(source), "-map", "0:a:0", "-vn", "-map_metadata", "-1"]
+    sixteen = fmt.id == "wav" and bits == 16 or "pcm_s16be" in quality.arguments
+    filters = []
     if abs(gain_db) > 0.0005:
-        arguments += ["-af", f"volume={gain_db:.4f}dB"]
-    if fmt.id == "opus":
+        filters.append(f"volume={gain_db:.4f}dB")
+    if sixteen:
+        filters.append("aresample=dither_method=triangular")
+    if filters:
+        arguments += ["-af", ",".join(filters)]
+    if rate:
+        arguments += ["-ar", str(rate)]
+    elif fmt.id == "opus":
         arguments += ["-ar", "48000"]
     elif fmt.id in ("mp3", "m4a") and sample_rate > 48000:
         arguments += ["-ar", "48000"]
     if fmt.id in ("mp3", "m4a") and channels > 2:
         arguments += ["-ac", "2"]
+    if fmt.id == "wav":
+        arguments += ["-c:a", PCM_BY_BITS.get(bits, "pcm_s24le"), "-f", "wav"]
     arguments += list(quality.arguments)
     arguments += list(fmt.container)
-    if title:
-        arguments += ["-metadata", f"title={title}"]
+    metadata = dict(tags or {})
+    if title and "title" not in metadata:
+        metadata["title"] = title
+    for name in ("title", "artist", "album"):
+        if metadata.get(name):
+            arguments += ["-metadata", f"{name}={metadata[name]}"]
     arguments += ["-y", str(destination)]
     return arguments
 
@@ -161,8 +169,6 @@ async def run_checked(arguments, timeout, failure):
 
 
 async def measure_file(engine, ffmpeg, path, work_directory, dual_mono):
-    """Decodes any audio file to 32-bit float WAV and measures it with the engine, so that the numbers match the meter
-    used for the master itself."""
     decoded = work_directory / f"measure_{path.stem}.wav"
     try:
         await run_checked(
@@ -181,8 +187,7 @@ async def measure_file(engine, ffmpeg, path, work_directory, dual_mono):
         decoded.unlink(missing_ok=True)
 
 
-async def build_export(settings, directory: Path, format_id, quality_id, encoders, report, title):
-    """Creates (or reuses) one export file and returns its description."""
+async def build_export(settings, directory: Path, format_id, quality_id, encoders, report, title, rate=0, tags=None):
     fmt, quality = find_quality(encoders, format_id, quality_id)
     if fmt is None:
         raise MediaError("this format is not available")
@@ -195,14 +200,19 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
     channels = int(report.get("input", {}).get("channels", 2) or 2)
     sample_rate = int(report.get("input", {}).get("sampleRate", 44100) or 44100)
     mastered_measurements = report["output"]["measurements"]
-    key = export_key(fmt.id, quality.id)
+    if fmt.id == "wav" and not rate:
+        tags = None
+    bits = int(report.get("output", {}).get("bitDepth", 24) or 24)
+    needs_check = fmt.lossy or bool(rate)
+    key = export_key(fmt.id, quality.id) + ("_48k" if rate else "") + ("_tags" if tags else "")
 
     def describe(path, measured, gain_db, attempts):
         return {
             "key": key,
             "format": fmt.id,
             "quality": quality.id,
-            "label": f"{fmt.label} {quality.label}" if len(fmt.qualities) > 1 else fmt.label,
+            "label": (f"{fmt.label} {quality.label}" if len(fmt.qualities) > 1 else fmt.label) + (" 48 kHz" if rate else ""),
+            "rate": rate,
             "extension": fmt.extension,
             "mediaType": fmt.media_type,
             "lossy": fmt.lossy,
@@ -218,7 +228,7 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
             },
         }
 
-    if fmt.id == "wav":
+    if fmt.id == "wav" and not rate:
         return describe(master, mastered_measurements, 0.0, 0)
 
     destination = directory / f"export_{key}.{fmt.extension}"
@@ -237,9 +247,9 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
     try:
         while attempts < MAX_ATTEMPTS:
             attempts += 1
-            arguments = encode_arguments(settings.ffmpeg_path, master, destination, fmt, quality, gain_db, channels, sample_rate, title)
+            arguments = encode_arguments(settings.ffmpeg_path, master, destination, fmt, quality, gain_db, channels, sample_rate, title, rate, tags, bits)
             await run_checked(arguments, ENCODE_TIMEOUT_SEC, "the file could not be encoded")
-            if not fmt.lossy:
+            if not needs_check:
                 break
             measured = await measure_file(settings.engine_path, settings.ffmpeg_path, destination, directory, dual_mono)
             peak = float(measured["truePeakDb"])
@@ -248,8 +258,6 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
             step = peak - (ceiling - PEAK_AIM_DB) + 0.01
             history.append((gain_db, peak))
             if len(history) >= 2:
-                # Some encoders produce a peak that does not follow the gain (for example a spike in the first frame).
-                # When the last gain change lowered the peak by less than half as much, take bigger steps.
                 lowered = history[-2][0] - history[-1][0]
                 moved = history[-2][1] - history[-1][1]
                 if lowered > 0 and moved < 0.5 * lowered:

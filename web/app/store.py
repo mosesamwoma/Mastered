@@ -3,10 +3,11 @@ import sqlite3
 import threading
 import time
 
-JSON_FIELDS = ("cli_args", "sources", "report")
+JSON_FIELDS = ("cli_args", "sources", "report", "timings")
+SCHEMA_VERSION = 2
 UPDATABLE = {
     "status", "progress", "message", "error", "started", "finished", "report",
-    "sources", "worker", "heartbeat", "cancel", "preview",
+    "sources", "worker", "heartbeat", "cancel", "preview", "category", "timings",
 }
 PENDING_STATUSES = ("uploading", "queued", "running")
 
@@ -29,7 +30,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     worker TEXT,
     heartbeat REAL,
     cancel INTEGER NOT NULL DEFAULT 0,
-    preview INTEGER NOT NULL DEFAULT 0
+    preview INTEGER NOT NULL DEFAULT 0,
+    category TEXT NOT NULL DEFAULT '',
+    timings TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status, created);
 CREATE INDEX IF NOT EXISTS jobs_client ON jobs (client, created);
@@ -41,7 +44,7 @@ def decode(row):
         return None
     record = dict(row)
     for name in JSON_FIELDS:
-        record[name] = json.loads(record[name]) if record[name] is not None else None
+        record[name] = json.loads(record[name]) if record.get(name) is not None else None
     record["cancel"] = bool(record["cancel"])
     record["preview"] = bool(record["preview"])
     return record
@@ -56,6 +59,45 @@ class JobStore:
         self.connection.execute("PRAGMA synchronous=NORMAL")
         self.connection.execute("PRAGMA busy_timeout=15000")
         self.connection.executescript(SCHEMA)
+        self.migrate()
+
+    def migrate(self):
+        version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        if version >= SCHEMA_VERSION:
+            return
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(jobs)")}
+        if "category" not in columns:
+            self.connection.execute("ALTER TABLE jobs ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        if "timings" not in columns:
+            self.connection.execute("ALTER TABLE jobs ADD COLUMN timings TEXT")
+        self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def check(self):
+        with self.lock:
+            return self.connection.execute("SELECT 1").fetchone()[0] == 1
+
+    def counts(self):
+        with self.lock:
+            rows = self.connection.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def recent_for(self, client, limit):
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT id, status, progress, track_name FROM jobs WHERE client = ? AND cancel = 0 "
+                "AND status IN ('queued', 'running', 'done') ORDER BY created DESC LIMIT ?",
+                (client, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent(self, limit):
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT id, status, created, started, finished, heartbeat, progress, message, error, category, cancel, track_name "
+                "FROM jobs ORDER BY created DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self):
         with self.lock:
@@ -129,10 +171,10 @@ class JobStore:
             )
         return cursor.rowcount > 0
 
-    def mark_failed(self, job_id, message, only_status=None):
+    def mark_failed(self, job_id, message, only_status=None, category="engine"):
         now = time.time()
-        sql = "UPDATE jobs SET status = 'failed', error = ?, message = 'Failed', finished = ?, updated = ? WHERE id = ?"
-        params = [message, now, now, job_id]
+        sql = "UPDATE jobs SET status = 'failed', error = ?, category = ?, message = 'Failed', finished = ?, updated = ? WHERE id = ?"
+        params = [message, category, now, now, job_id]
         if only_status:
             sql += " AND status = ?"
             params.append(only_status)

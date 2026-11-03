@@ -5,14 +5,18 @@ from collections import OrderedDict, deque
 MAX_TRACKED_CLIENTS = 20000
 
 
-def client_key(scope, header):
+def client_key(scope, header, hops=1):
     headers = {name.lower(): value for name, value in scope.get("headers", [])}
     candidate = None
     if header:
         raw = headers.get(header.encode("latin-1"))
         if raw:
             text = raw.decode("latin-1").strip()
-            candidate = text.split(",")[0].strip() if header == "x-forwarded-for" else text
+            if header == "x-forwarded-for":
+                parts = [part.strip() for part in text.split(",") if part.strip()]
+                candidate = parts[-hops] if 0 < hops <= len(parts) else None
+            else:
+                candidate = text
     if not candidate:
         client = scope.get("client")
         candidate = client[0] if client else "unknown"
@@ -65,18 +69,19 @@ class SlidingWindow:
 
 
 class RateLimitMiddleware:
-    def __init__(self, app, requests_per_minute, uploads_per_hour, header):
+    def __init__(self, app, requests_per_minute, uploads_per_hour, header, hops=1):
         self.app = app
         self.header = header
+        self.hops = hops
         self.requests = SlidingWindow(requests_per_minute, 60.0)
         self.uploads = SlidingWindow(uploads_per_hour, 3600.0)
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
-        if scope["type"] != "http" or not path.startswith("/api/") or path == "/api/health":
+        if scope["type"] != "http" or not path.startswith("/api/") or path in ("/api/health", "/api/ready"):
             await self.app(scope, receive, send)
             return
-        key = client_key(scope, self.header)
+        key = client_key(scope, self.header, self.hops)
         allowed, retry = self.requests.hit(key)
         if allowed and scope["method"] == "POST" and path == "/api/jobs":
             allowed, retry = self.uploads.hit(key)
