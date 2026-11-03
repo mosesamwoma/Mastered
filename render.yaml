@@ -4,8 +4,12 @@ services:
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /api/health
+    healthCheckPath: /api/ready
     envVars:
+      - key: APP_ENV
+        value: production
+      - key: ALLOW_PUBLIC
+        value: "true"
       - key: CLIENT_IP_HEADER
         value: cf-connecting-ip
       - key: SESSION_SECRET
