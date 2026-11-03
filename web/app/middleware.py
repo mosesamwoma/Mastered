@@ -46,6 +46,8 @@ class SecurityHeadersMiddleware:
                 if b"cache-control" not in existing:
                     if not api:
                         policy = b"no-cache"
+                    elif "/audio/" in path:
+                        policy = b"private, max-age=900"
                     elif media:
                         policy = b"private, no-cache"
                     else:

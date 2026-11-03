@@ -11,7 +11,7 @@ const SETTINGS_KEY = 'masteredSettings';
 const MAX_SAVED_SETTINGS = 12;
 const MAX_BATCH_TRACKS = 5;
 const SEEK_STEP_SECONDS = 5;
-const PREVIEW_LOAD_TIMEOUT_MS = 15000;
+const PREVIEW_STALL_TIMEOUT_MS = 25000;
 const BUFFER_PLAYER_MAX_SECONDS = 240;
 const BUFFER_PLAYER_MAX_SECONDS_TOUCH = 120;
 const ETA_MIN_ELAPSED_MS = 12000;
@@ -1447,16 +1447,53 @@ function handleMediaError() {
   }
 }
 
-function withTimeout(promise, milliseconds) {
+async function downloadBytes(url, onProgress) {
+  const response = await request(url);
+  if (response === null || !response.ok) {
+    throw new Error('The preview could not be loaded');
+  }
+  const total = Number(response.headers.get('content-length')) || 0;
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const data = await response.arrayBuffer();
+    onProgress(data.byteLength, data.byteLength);
+    return data;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const part = await reader.read();
+    if (part.done) {
+      break;
+    }
+    chunks.push(part.value);
+    loaded += part.value.byteLength;
+    onProgress(loaded, total);
+  }
+  const bytes = new Uint8Array(loaded);
+  let offset = 0;
+  chunks.forEach((chunk) => {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  });
+  return bytes.buffer;
+}
+
+function watchStall(work, state, milliseconds) {
   return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(() => reject(new Error('The preview took too long to load')), milliseconds);
-    promise.then(
+    const timer = window.setInterval(() => {
+      if (Date.now() - state.lastProgress > milliseconds) {
+        window.clearInterval(timer);
+        reject(new Error('The preview stopped loading'));
+      }
+    }, 1000);
+    work.then(
       (value) => {
-        window.clearTimeout(timer);
+        window.clearInterval(timer);
         resolve(value);
       },
       (error) => {
-        window.clearTimeout(timer);
+        window.clearInterval(timer);
         reject(error);
       }
     );
@@ -1467,12 +1504,19 @@ async function createBufferImpl(job, Context) {
   let context = null;
   try {
     context = new Context();
-    const decode = async (url) => {
-      const response = await request(url);
-      if (response === null || !response.ok) {
-        throw new Error('The preview could not be loaded');
+    const progress = { lastProgress: Date.now(), loaded: [0, 0], total: [0, 0] };
+    const report = (index) => (loaded, total) => {
+      progress.lastProgress = Date.now();
+      progress.loaded[index] = loaded;
+      progress.total[index] = total || Math.max(progress.total[index], loaded);
+      const sum = progress.total[0] + progress.total[1];
+      if (sum > 0 && player && player.impl === null) {
+        playerMode.textContent = 'Loading both versions… ' + Math.min(99, Math.round(((progress.loaded[0] + progress.loaded[1]) / sum) * 100)) + '%';
       }
-      const data = await response.arrayBuffer();
+    };
+    const decode = async (url, index) => {
+      const data = await downloadBytes(url, report(index));
+      progress.lastProgress = Date.now();
       return new Promise((resolve, reject) => {
         const pending = context.decodeAudioData(data, resolve, reject);
         if (pending && typeof pending.then === 'function') {
@@ -1480,7 +1524,7 @@ async function createBufferImpl(job, Context) {
         }
       });
     };
-    const loaded = await withTimeout(Promise.all([decode(job.preview.original), decode(job.preview.mastered)]), PREVIEW_LOAD_TIMEOUT_MS);
+    const loaded = await watchStall(Promise.all([decode(job.preview.original, 0), decode(job.preview.mastered, 1)]), progress, PREVIEW_STALL_TIMEOUT_MS);
     let buffers = { original: loaded[0], mastered: loaded[1] };
     const length = buffers.mastered.duration;
     const gains = {};
@@ -1638,7 +1682,7 @@ function createElementImpl(job) {
     }
   };
   mastered.addEventListener('timeupdate', () => {
-    if (impl.playing && Math.abs(original.currentTime - mastered.currentTime) > 0.1) {
+    if (impl.playing && Math.abs(original.currentTime - mastered.currentTime) > 0.3 && !mastered.seeking && !original.seeking) {
       original.currentTime = mastered.currentTime;
     }
   });
