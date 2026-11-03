@@ -37,8 +37,6 @@ private:
     std::vector<double> midPending_;
     std::vector<double> sidePending_;
     std::vector<std::complex<double>> work_;
-    // Spectra are summed per 10 dB band of frame level, so that quiet frames can be left out afterwards
-    // relative to the loudest frame instead of against a fixed level.
     static constexpr size_t kLevelBuckets = 14;
     std::vector<std::vector<double>> midSum_;
     std::vector<std::vector<double>> sideSum_;

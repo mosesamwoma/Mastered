@@ -38,8 +38,6 @@ struct LoudnessResult {
 
 class LoudnessMeter {
 public:
-    // With dualMono a single-channel signal is measured as if it were played from both front speakers (+3.01 LU),
-    // which is how some meters treat mono files; BS.1770 itself measures one channel as one channel.
     LoudnessMeter(double sampleRate, size_t channels, bool dualMono = false);
 
     void process(const AudioBlock& block, size_t frames);
@@ -94,7 +92,6 @@ struct Measurements {
     double sideToMidDb = -120.0;
     bool hasStereo = false;
 
-    // Peak to loudness ratio: how much dynamic headroom the true peak has over the average level.
     double plrDb() const { return (truePeakDb > -150.0 && integratedLufs > -100.0) ? truePeakDb - integratedLufs : 0.0; }
 };
 

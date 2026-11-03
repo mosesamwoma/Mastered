@@ -25,17 +25,15 @@ struct ChainPlan {
     double ceilingDb = -1.0;
     double lookaheadMs = 5.0;
     double releaseMs = 80.0;
-    // The bass limiter works on the band below bassLimiterHz with its own, slower time constants and keeps that band a
-    // few dB under the ceiling, so that a kick does not make the limiter pull the whole mix down.
     bool bassLimiter = false;
     double bassLimiterHz = 140.0;
     double bassCeilingOffsetDb = 3.0;
 };
 
 enum class ChainStage {
-    Full,  // EQ, dynamics, gain, clipper and limiters in one object
-    Pre,   // EQ, mid/side and dynamics only: everything that does not depend on the makeup gain
-    Post   // makeup gain, clipper and limiters only
+    Full,
+    Pre,
+    Post
 };
 
 class ProcessingChain {

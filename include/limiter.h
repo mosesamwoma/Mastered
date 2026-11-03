@@ -25,7 +25,6 @@ public:
     size_t latency() const { return latency_; }
     void process(AudioBlock& block, size_t frames);
 
-    // Gain reduction statistics are only collected when requested, because they need a logarithm per sample.
     void collectStatistics(bool enabled) { collect_ = enabled; }
     LimiterStats statistics() const;
 

@@ -42,17 +42,13 @@ struct MasteringConfig {
     bool noiseShaping = false;
     double loudnessToleranceLu = 0.02;
     int maxLoudnessIterations = 12;
-    // When the makeup gain would force the limiter to remove more than about 3 dB, a soft clipper takes the tallest
-    // peaks first so that the limiter does not have to pull the whole mix down on every kick.
     bool autoClip = true;
-    // Turns on mono bass automatically when the low end of the input is clearly out of phase between left and right.
     bool autoMonoBass = true;
-    // Measure single-channel files as dual mono (+3 LU), as some meters do.
     bool dualMono = false;
-    // Experimental: limit the band below about 140 Hz separately. In measurements it shifted loudness from the bass to
-    // the highs and did not reduce modulation of the highs, so it is off unless asked for.
     bool bassLimiter = false;
     size_t fftSize = 8192;
+    double maxBoostDb = 9.0;
+    double maxCutDb = 12.0;
 };
 
 struct CurveFit {
@@ -104,6 +100,7 @@ struct MasteringResult {
     double matchAfterDb = 0.0;
     bool matchMeasured = false;
     double ceilingTrimDb = 0.0;
+    uint64_t framesWritten = 0;
     std::vector<std::string> warnings;
     std::vector<std::string> notes;
 };
@@ -122,7 +119,6 @@ public:
     MasteringResult render(const Analysis& analysis, const std::string& input, const std::string& output);
     MasteringResult run(const std::vector<std::string>& references, const std::string& input, const std::string& output);
 
-    // Measures a finished file with the same meter that the engine uses, for example to check a decoded MP3.
     static Measurements measureFile(const std::string& path, bool dualMono = false, bool accuratePeak = true);
     static std::string measurementsJsonText(const Measurements& measurements);
 

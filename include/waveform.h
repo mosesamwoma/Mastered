@@ -9,12 +9,10 @@
 namespace mastered {
 
 struct Waveform {
-    // One value per column: the largest absolute sample and the RMS level, both linear.
     std::vector<float> peak;
     std::vector<float> rms;
 };
 
-// Condenses a stream of audio blocks into a fixed number of columns for drawing.
 class WaveformBuilder {
 public:
     WaveformBuilder(uint64_t totalFrames, size_t columns);

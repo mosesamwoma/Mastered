@@ -48,6 +48,7 @@ public:
 
     void write(const AudioBlock& block, size_t frames);
     void finalize();
+    uint64_t framesWritten() const { return framesWritten_; }
 
 private:
     size_t headerSize() const;
