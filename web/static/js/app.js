@@ -11,7 +11,7 @@ const SETTINGS_KEY = 'masteredSettings';
 const MAX_SAVED_SETTINGS = 12;
 const MAX_BATCH_TRACKS = 5;
 const SEEK_STEP_SECONDS = 5;
-const PREVIEW_LOAD_TIMEOUT_MS = 30000;
+const PREVIEW_LOAD_TIMEOUT_MS = 15000;
 const BUFFER_PLAYER_MAX_SECONDS = 240;
 const BUFFER_PLAYER_MAX_SECONDS_TOUCH = 120;
 const ETA_MIN_ELAPSED_MS = 12000;
@@ -1732,12 +1732,14 @@ async function setupPlayer(job, report) {
   const longest = coarse ? BUFFER_PLAYER_MAX_SECONDS_TOUCH : BUFFER_PLAYER_MAX_SECONDS;
   let impl = null;
   let mode = '';
+  let fallbackReason = '';
   if (Context && seconds > 0 && seconds <= longest) {
     try {
       impl = await createBufferImpl(job, Context);
       mode = 'Sample-accurate A/B: both versions are loaded and play on one clock, so switching never skips or drifts.';
     } catch (error) {
       impl = null;
+      fallbackReason = error && error.message ? error.message : 'unknown error';
     }
     if (token !== playerToken) {
       if (impl) {
@@ -1749,6 +1751,9 @@ async function setupPlayer(job, report) {
   if (impl === null) {
     impl = createElementImpl(job);
     mode = seconds > longest ? 'Standard A/B: this track is long, so two streams are kept in step.' : 'Standard A/B: two streams are kept in step.';
+    if (fallbackReason) {
+      mode += ' (The sample-accurate player could not start: ' + fallbackReason + '.)';
+    }
   }
   impl.onEnded = handleEnded;
   player.impl = impl;
