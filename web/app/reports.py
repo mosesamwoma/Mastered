@@ -45,10 +45,11 @@ def report_text(report, track_name, output_name):
         f"  Loudness target   {number(settings.get('targetLufs'), 2)} LUFS (tolerance {number(settings.get('toleranceLu'), 3)} LU)",
         f"  True-peak ceiling {number(settings.get('ceilingDb'), 2)} dBTP",
         f"  Limiter           look-ahead {number(settings.get('lookaheadMs'), 1)} ms, release {number(settings.get('releaseMs'), 0)} ms",
+        f"  Peak detector     {'strict 8x' if settings.get('strictPeak') else 'standard 4x (matches DAW meters)'}",
         "",
         "Measurements",
         measurement_row("Input", report.get("input", {}).get("measurements", {})),
-        measurement_row("Reference", report.get("references", {}).get("measurements", {})),
+        *([measurement_row("Reference", report.get("references", {}).get("measurements", {}))] if report.get("references", {}).get("count") else []),
         measurement_row("Output", report.get("output", {}).get("measurements", {})),
         "",
         "Processing",
@@ -57,6 +58,10 @@ def report_text(report, track_name, output_name):
         f"  Limiter           up to {number(limiter.get('maxReductionDb'), 1)} dB, {number(limiter.get('averageReductionDb'), 2)} dB on average",
         f"  Soft clipper      {'on' if limiter.get('softClip') else 'off'}",
     ]
+    quality = report.get("quality") or {}
+    if quality:
+        lines.append(f"  Quality grade     {quality.get('grade', '?')} ({quality.get('score', 0)}/100)")
+        lines += [f"    - {reason}" for reason in quality.get("reasons") or []]
     if match.get("measured"):
         lines.append(
             f"  Tonal match       {number(match.get('beforeDb'), 2)} dB -> {number(match.get('afterDb'), 2)} dB RMS difference to the reference"
@@ -83,8 +88,9 @@ def report_text(report, track_name, output_name):
         lines.append(f"  Mono bass below {number(report.get('monoBassHz'), 0)} Hz")
     conversion = report.get("conversion") or {}
     notes = list(report.get("notes") or [])
-    for label in ("reference", "track"):
-        notes += [f"{label.capitalize()} file: {text}" for text in conversion.get(label) or []]
+    for label in [key for key in sorted(conversion) if key != "track"] + ["track"]:
+        shown = label.capitalize() if label == "track" else ("Reference" if label == "reference" else f"Reference {label[len('reference'):]}")
+        notes += [f"{shown} file: {text}" for text in conversion.get(label) or []]
     warnings = report.get("warnings") or []
     if notes:
         lines += ["", "Notes"] + [f"  {text}" for text in notes]
