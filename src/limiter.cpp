@@ -9,7 +9,7 @@
 
 namespace mastered {
 
-TruePeakLimiter::TruePeakLimiter(double sampleRate, size_t channels, double ceilingDb, double lookaheadMs, double releaseMs)
+TruePeakLimiter::TruePeakLimiter(double sampleRate, size_t channels, double ceilingDb, double lookaheadMs, double releaseMs, const OversamplingKernel& kernel)
     : channels_(channels) {
     if (channels == 0 || channels > kMaxChannels) {
         throw MasteredError("Unsupported channel count for limiter");
@@ -18,11 +18,18 @@ TruePeakLimiter::TruePeakLimiter(double sampleRate, size_t channels, double ceil
         throw MasteredError("Invalid limiter settings");
     }
     lookahead_ = std::max<size_t>(8, static_cast<size_t>(std::llround(lookaheadMs * 0.001 * sampleRate)));
-    kernel_ = &standardKernel();
+    kernel_ = &kernel;
     latency_ = lookahead_ + kernel_->delay;
     ceiling_ = std::pow(10.0, (ceilingDb - kLimiterMarginDb) / 20.0);
     const double fastReleaseMs = std::min(std::max(releaseMs * 0.4, 20.0), 120.0);
-    fastReleaseCoefficient_ = std::exp(-1.0 / (std::min(fastReleaseMs, releaseMs) * 0.001 * sampleRate));
+    const double baseFastMs = std::min(fastReleaseMs, releaseMs);
+    for (size_t k = 0; k < kDepthSteps; ++k) {
+        const double scaled = baseFastMs * (1.0 + 0.3 * static_cast<double>(k));
+        fastReleaseByDepth_[k] = std::exp(-1.0 / (scaled * 0.001 * sampleRate));
+    }
+    for (size_t k = 0; k + 1 < kDepthSteps; ++k) {
+        depthThreshold_[k] = std::pow(10.0, -static_cast<double>(k + 1) / 20.0);
+    }
     slowReleaseCoefficient_ = std::exp(-1.0 / (releaseMs * 0.001 * sampleRate));
     slowAttackCoefficient_ = std::exp(-1.0 / (std::max(releaseMs * 0.25, 5.0) * 0.001 * sampleRate));
     history_.assign(channels, std::vector<double>(2 * kernel_->tapsPerPhase, 0.0));
@@ -68,7 +75,12 @@ void TruePeakLimiter::process(AudioBlock& block, size_t frames) {
         if (minimum < fastEnvelope_) {
             fastEnvelope_ = minimum;
         } else {
-            fastEnvelope_ = fastReleaseCoefficient_ * fastEnvelope_ + (1.0 - fastReleaseCoefficient_) * minimum;
+            size_t depth = 0;
+            while (depth + 1 < kDepthSteps && fastEnvelope_ < depthThreshold_[depth]) {
+                ++depth;
+            }
+            const double release = fastReleaseByDepth_[depth];
+            fastEnvelope_ = release * fastEnvelope_ + (1.0 - release) * minimum;
         }
         const double slowCoefficient = fastEnvelope_ < slowEnvelope_ ? slowAttackCoefficient_ : slowReleaseCoefficient_;
         slowEnvelope_ = slowCoefficient * slowEnvelope_ + (1.0 - slowCoefficient) * fastEnvelope_;
