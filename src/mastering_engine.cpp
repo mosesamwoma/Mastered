@@ -24,7 +24,14 @@ constexpr double kMaxLevelHz = 12500.0;
 constexpr double kSideFloorDb = -45.0;
 constexpr double kBassBoostFraction = 2.0 / 3.0;
 constexpr double kBassBoostHz = 160.0;
-constexpr double kAutoClipReductionDb = 3.0;
+constexpr double kAutoClipReductionDb = 4.0;
+constexpr double kSaturationSlope = 0.2;
+constexpr double kKneeToleranceLu = 0.25;
+constexpr int kMaxKneeRefinements = 3;
+constexpr double kGenreAggressivenessScale = 0.6;
+constexpr double kGenreMaxBoostDb = 4.0;
+constexpr double kGenreMaxCutDb = 5.0;
+constexpr double kAutoSubsonicHz = 20.0;
 constexpr double kAutoMonoBassHz = 120.0;
 constexpr double kHeavyAverageReductionDb = 2.0;
 constexpr double kHeavyMaxReductionDb = 8.0;
@@ -86,6 +93,13 @@ void validateConfig(const MasteringConfig& c) {
     requireRange(static_cast<double>(c.maxLoudnessIterations), 1.0, 30.0, "maxLoudnessIterations");
     if (c.bitDepth != 0 && c.bitDepth != 16 && c.bitDepth != 24 && c.bitDepth != 32) {
         throw MasteredError("Configuration value out of range: bitDepth must be 0, 16, 24 or 32");
+    }
+    if (!c.genre.empty() && findGenre(c.genre) == nullptr) {
+        throw MasteredError("Configuration value out of range: genre is not a known target curve");
+    }
+    requireFinite(c.subsonicHz, "subsonicHz");
+    if (c.subsonicHz != 0.0 && (c.subsonicHz < 10.0 || c.subsonicHz > 60.0)) {
+        throw MasteredError("Configuration value out of range: subsonicHz must be 0 (off) or between 10 and 60");
     }
     if (c.fftSize < 1024 || c.fftSize > 65536 || (c.fftSize & (c.fftSize - 1)) != 0) {
         throw MasteredError("Configuration value out of range: fftSize must be a power of two between 1024 and 65536");
@@ -171,10 +185,8 @@ CurveFit fitCurve(const std::vector<double>& centres, const std::vector<double>&
     return curve;
 }
 
-std::vector<double> buildTarget(const AverageSpectrum& input, const std::vector<const AverageSpectrum*>& references, bool side,
-                                const std::vector<double>& centres, double width, const std::vector<size_t>& range, double aggressiveness, double maxCutDb,
-                                double maxBoostDb) {
-    const std::vector<double> inputShape = shapeOf(bandLevelsDb(input, side, centres, width), range);
+std::vector<double> referenceShapeOf(const std::vector<const AverageSpectrum*>& references, bool side, const std::vector<double>& centres, double width,
+                                     const std::vector<size_t>& range) {
     std::vector<double> referenceShape(centres.size(), 0.0);
     for (const AverageSpectrum* reference : references) {
         const std::vector<double> shape = shapeOf(bandLevelsDb(*reference, side, centres, width), range);
@@ -182,6 +194,12 @@ std::vector<double> buildTarget(const AverageSpectrum& input, const std::vector<
             referenceShape[i] += shape[i] / static_cast<double>(references.size());
         }
     }
+    return referenceShape;
+}
+
+std::vector<double> buildTarget(const AverageSpectrum& input, const std::vector<double>& referenceShape, bool side, const std::vector<double>& centres,
+                                double width, const std::vector<size_t>& range, double aggressiveness, double maxCutDb, double maxBoostDb) {
+    const std::vector<double> inputShape = shapeOf(bandLevelsDb(input, side, centres, width), range);
     std::vector<double> difference(centres.size());
     for (size_t i = 0; i < difference.size(); ++i) {
         difference[i] = referenceShape[i] - inputShape[i];
@@ -515,6 +533,57 @@ std::string reaLine(size_t index, const EQBand& band) {
     return out.str();
 }
 
+struct QualityGrade {
+    char grade = 'A';
+    int score = 100;
+    std::vector<std::string> reasons;
+};
+
+QualityGrade gradeResult(const MasteringResult& result, const MasteringConfig& config) {
+    QualityGrade quality;
+    auto penalise = [&](int points, const std::string& reason) {
+        quality.score -= points;
+        quality.reasons.push_back(reason);
+    };
+    if (config.autoGain && !result.targetReached) {
+        penalise(25, "The loudness target was not reached");
+    }
+    const double average = result.limiter.averageReductionDb;
+    const double maximum = result.limiter.maxReductionDb;
+    if (average > 3.0) {
+        penalise(25, "The limiter is working very hard (" + num(average, 1) + " dB on average)");
+    } else if (average > 2.0) {
+        penalise(15, "The limiter is working hard (" + num(average, 1) + " dB on average)");
+    } else if (average > 1.0) {
+        penalise(5, "The limiter is working moderately (" + num(average, 1) + " dB on average)");
+    }
+    if (maximum > 8.0) {
+        penalise(10, "The limiter reaches " + num(maximum, 1) + " dB on the loudest hits");
+    } else if (maximum > 5.0) {
+        penalise(5, "The limiter reaches " + num(maximum, 1) + " dB on the loudest hits");
+    }
+    if (result.output.truePeakDb > config.ceilingDb + 0.05) {
+        penalise(15, "The true peak is above the ceiling");
+    }
+    if (result.output.clippedSamples > 0) {
+        penalise(10, "The output contains samples at full scale");
+    }
+    if (result.matchMeasured && result.matchAfterDb > result.matchBeforeDb + 0.05) {
+        penalise(15, "The tone moved away from the target");
+    } else if (result.matchMeasured && result.matchAfterDb > 2.0) {
+        penalise(5, "The tone is still some way from the target");
+    }
+    if (result.output.hasStereo && result.output.monoLossDb < -4.0) {
+        penalise(10, "The mix loses level when folded to mono");
+    }
+    if (result.output.hasStereo && result.output.correlation < 0.0) {
+        penalise(10, "The stereo correlation is negative");
+    }
+    quality.score = std::max(quality.score, 0);
+    quality.grade = quality.score >= 90 ? 'A' : (quality.score >= 75 ? 'B' : (quality.score >= 60 ? 'C' : 'D'));
+    return quality;
+}
+
 }
 
 MasteringEngine::MasteringEngine(const MasteringConfig& config) : config_(config) {
@@ -534,8 +603,9 @@ void MasteringEngine::emit(const std::string& message, double percent) const {
 
 Analysis MasteringEngine::analyze(const std::vector<std::string>& references, const std::string& input) {
     validateConfig(config_);
-    if (references.empty()) {
-        throw MasteredError("At least one reference track is required");
+    const bool genreMode = references.empty();
+    if (genreMode && config_.genre.empty()) {
+        throw MasteredError("Provide at least one reference track or choose a genre target curve");
     }
     emit("Analysing input track", 0.0);
     const FileScan in = scanFile(input, config_.fftSize, config_.dualMono);
@@ -590,7 +660,9 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         averaged.lowCorrelation = 1.0;
         averaged.sideToMidDb = -120.0;
     }
-    analysis.reference = averaged;
+    if (!genreMode) {
+        analysis.reference = averaged;
+    }
 
     const double maxHz = std::min(18000.0, 0.45 * minRate);
     const std::vector<double> centres = makeBandCentres(30.0, maxHz);
@@ -612,12 +684,22 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     analysis.shapeWidthOctaves = width;
     analysis.inputWaveform = in.waveform;
     analysis.inputShapeDb = shapeOf(bandLevelsDb(in.spectrum, false, centres, width), range);
-    analysis.referenceShapeDb.assign(centres.size(), 0.0);
+    std::vector<const AverageSpectrum*> referenceSpectra;
     for (const FileScan& ref : refs) {
-        const std::vector<double> shape = shapeOf(bandLevelsDb(ref.spectrum, false, centres, width), range);
-        for (size_t i = 0; i < shape.size(); ++i) {
-            analysis.referenceShapeDb[i] += shape[i] / count;
-        }
+        referenceSpectra.push_back(&ref.spectrum);
+    }
+    if (genreMode) {
+        analysis.referenceShapeDb = shapeOf(genreLevelsDb(config_.genre, centres), range);
+        analysis.reference = Measurements();
+    } else {
+        analysis.referenceShapeDb = referenceShapeOf(referenceSpectra, false, centres, width, range);
+    }
+    const double fitAggressiveness = genreMode ? config_.aggressiveness * kGenreAggressivenessScale : config_.aggressiveness;
+    const double fitMaxBoost = genreMode ? std::min(config_.maxBoostDb, kGenreMaxBoostDb) : config_.maxBoostDb;
+    const double fitMaxCut = genreMode ? std::min(config_.maxCutDb, kGenreMaxCutDb) : config_.maxCutDb;
+    if (genreMode) {
+        analysis.notes.push_back(std::string("No reference track was used: the tone was matched to the built-in ") + findGenre(config_.genre)->name +
+                                 " target curve, which is a general guide, so the correction is gentler than with a real reference");
     }
 
     double emptyAboveHz = 0.0;
@@ -629,16 +711,12 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     }
 
     emit("Fitting mid EQ", 32.0);
-    std::vector<const AverageSpectrum*> referenceSpectra;
-    for (const FileScan& ref : refs) {
-        referenceSpectra.push_back(&ref.spectrum);
-    }
-    const std::vector<double> midTarget = buildTarget(in.spectrum, referenceSpectra, false, centres, width, range, config_.aggressiveness, config_.maxCutDb, config_.maxBoostDb);
+    const std::vector<double> midTarget = buildTarget(in.spectrum, analysis.referenceShapeDb, false, centres, width, range, fitAggressiveness, fitMaxCut, fitMaxBoost);
     analysis.mid = fitCurve(centres, midTarget, config_.maxEQBands, in.sampleRate, maxHz, config_.perceptualWeighting, emptyAboveHz);
     analysis.plan.midBands = analysis.mid.bands;
 
     const bool inputStereo = in.channels == 2 && in.measurements.sideToMidDb > kSideFloorDb;
-    bool referencesStereo = true;
+    bool referencesStereo = !genreMode;
     for (const FileScan& ref : refs) {
         if (!ref.spectrum.hasSide || !ref.measurements.hasStereo || ref.measurements.sideToMidDb <= kSideFloorDb) {
             referencesStereo = false;
@@ -647,7 +725,8 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     if (inputStereo && referencesStereo) {
         if (config_.midSide && config_.maxSideBands > 0) {
             emit("Fitting side EQ", 34.0);
-            const std::vector<double> sideTarget = buildTarget(in.spectrum, referenceSpectra, true, centres, width, range, config_.aggressiveness, config_.maxCutDb, config_.maxBoostDb);
+            const std::vector<double> sideTarget = buildTarget(in.spectrum, referenceShapeOf(referenceSpectra, true, centres, width, range), true, centres, width, range,
+                                                               config_.aggressiveness, config_.maxCutDb, config_.maxBoostDb);
             analysis.side = fitCurve(centres, sideTarget, config_.maxSideBands, in.sampleRate, maxHz, config_.perceptualWeighting);
             analysis.plan.sideBands = analysis.side.bands;
         }
@@ -672,7 +751,9 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         analysis.notes.push_back(note.str());
     }
 
-    if (config_.dynamics) {
+    if (config_.dynamics && genreMode) {
+        analysis.warnings.push_back("Dynamics matching needs a reference track and was skipped");
+    } else if (config_.dynamics) {
         DynamicsSettings dynamics;
         dynamics.enabled = true;
         const std::array<double, 3> attack = {15.0, 8.0, 3.0};
@@ -755,6 +836,13 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     analysis.plan.lookaheadMs = config_.limiterLookaheadMs;
     analysis.plan.releaseMs = config_.limiterReleaseMs;
     analysis.plan.bassLimiter = config_.bassLimiter;
+    analysis.plan.strictPeak = config_.strictPeak;
+    if (config_.subsonicHz > 0.0) {
+        analysis.plan.subsonicHz = config_.subsonicHz;
+    } else if (config_.autoSubsonic && in.measurements.dcOffset > 0.005) {
+        analysis.plan.subsonicHz = kAutoSubsonicHz;
+        analysis.notes.push_back("A 20 Hz high-pass filter was applied because the input has a DC offset");
+    }
 
     if (in.measurements.truePeakDb > 0.0) {
         analysis.warnings.push_back("Input contains true peaks above 0 dBTP");
@@ -762,7 +850,7 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     if (in.measurements.clippedSamples > 0) {
         analysis.warnings.push_back("Input has " + std::to_string(in.measurements.clippedSamples) + " samples at full scale; it may already be clipped");
     }
-    if (in.measurements.dcOffset > 0.005) {
+    if (in.measurements.dcOffset > 0.005 && analysis.plan.subsonicHz <= 0.0) {
         analysis.warnings.push_back("Input has a DC offset; it wastes headroom and can be removed with a high-pass filter");
     }
     if (in.measurements.hasStereo && in.measurements.lowCorrelation < 0.3 && analysis.plan.monoBassHz <= 0.0) {
@@ -859,38 +947,85 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         return plan;
     };
     double slopeEstimate = 1.0;
+    bool saturated = false;
+    double saturationBestLufs = 0.0;
     auto converge = [&](double initialGain) {
-        double current = initialGain;
-        double bestGain = initialGain;
-        double bestError = 1e9;
-        double previousGain = 0.0;
-        double previousLufs = 0.0;
-        for (int i = 1; i <= config_.maxLoudnessIterations; ++i) {
+        struct Probe {
+            double gain;
+            double lufs;
+        };
+        std::vector<Probe> probes;
+        auto probe = [&](double gainDb) {
             advance("Matching loudness (pass " + std::to_string(iterations + 1) + ")", percent + 1.5);
-            const Measurements m = runPost(cache.path(), analysis, planFor(current), nullptr, PeakMode::Off, config_.dualMono);
+            const Measurements m = runPost(cache.path(), analysis, planFor(gainDb), nullptr, PeakMode::Off, config_.dualMono);
             ++iterations;
-            const double error = config_.targetLufs - m.integratedLufs;
-            if (std::fabs(error) < std::fabs(bestError)) {
-                bestError = error;
-                bestGain = current;
-            }
+            probes.push_back({gainDb, m.integratedLufs});
+            return m.integratedLufs;
+        };
+        double current = initialGain;
+        int stalls = 0;
+        saturated = false;
+        for (int i = 1; i <= config_.maxLoudnessIterations; ++i) {
+            const double lufs = probe(current);
+            const double error = config_.targetLufs - lufs;
             if (std::fabs(error) <= config_.loudnessToleranceLu) {
-                break;
+                return current;
             }
             double slope = slopeEstimate;
-            if (i > 1 && std::fabs(current - previousGain) > 1e-3) {
-                slope = std::min(std::max((m.integratedLufs - previousLufs) / (current - previousGain), 0.15), 1.0);
-                slopeEstimate = slope;
+            if (probes.size() > 1) {
+                const Probe& a = probes[probes.size() - 2];
+                const Probe& b = probes.back();
+                if (std::fabs(b.gain - a.gain) > 1e-3) {
+                    const double measured = (b.lufs - a.lufs) / (b.gain - a.gain);
+                    stalls = measured < kSaturationSlope ? stalls + 1 : 0;
+                    slope = std::min(std::max(measured, 0.25), 1.0);
+                    slopeEstimate = slope;
+                }
             }
-            previousGain = current;
-            previousLufs = m.integratedLufs;
+            if (stalls >= 2) {
+                saturated = true;
+                break;
+            }
             const double next = std::min(std::max(current + error / slope, -kMaxMakeupDb), kMaxMakeupDb);
             if (std::fabs(next - current) < 1e-4) {
                 break;
             }
             current = next;
         }
-        return bestGain;
+        size_t best = 0;
+        double highest = probes[0].lufs;
+        for (size_t k = 1; k < probes.size(); ++k) {
+            if (std::fabs(config_.targetLufs - probes[k].lufs) < std::fabs(config_.targetLufs - probes[best].lufs)) {
+                best = k;
+            }
+            highest = std::max(highest, probes[k].lufs);
+        }
+        if (!saturated) {
+            return probes[best].gain;
+        }
+        saturationBestLufs = highest;
+        const double threshold = highest - kKneeToleranceLu;
+        double high = probes[best].gain;
+        for (const Probe& p : probes) {
+            if (p.lufs >= threshold && p.gain < high) {
+                high = p.gain;
+            }
+        }
+        double low = high - 6.0;
+        for (const Probe& p : probes) {
+            if (p.lufs < threshold && p.gain < high && p.gain > low) {
+                low = p.gain;
+            }
+        }
+        for (int k = 0; k < kMaxKneeRefinements; ++k) {
+            const double middle = 0.5 * (low + high);
+            if (probe(middle) >= threshold) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        return high;
     };
 
     uint16_t depth = config_.bitDepth;
@@ -919,7 +1054,7 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
             result.framesWritten = writer.framesWritten();
             writer.finalize();
         }
-        delivered = MasteringEngine::measureFile(output, config_.dualMono, config_.accuratePeak);
+        delivered = MasteringEngine::measureFile(output, config_.dualMono, config_.strictPeak);
         const double over = delivered.truePeakDb - peakTarget;
         bool again = false;
         if (config_.accuratePeak && attempt < kMaxPeakTrims) {
@@ -952,8 +1087,14 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         result.targetReached = std::fabs(finalError) <= std::max(config_.loudnessToleranceLu, 0.05) * 1.5;
         if (!result.targetReached) {
             std::ostringstream message;
-            message << "Loudness target not reached: measured " << std::fixed << std::setprecision(2) << result.output.integratedLufs
-                    << " LUFS against a target of " << config_.targetLufs << " LUFS; the true-peak ceiling limits the achievable loudness";
+            if (saturated) {
+                message << "Loudness target not reached: this track cannot get much louder than " << std::fixed << std::setprecision(2) << saturationBestLufs
+                        << " LUFS at a ceiling of " << config_.ceilingDb << " dBTP without crushing its dynamics, so the engine stopped at " << result.output.integratedLufs
+                        << " LUFS instead of " << config_.targetLufs << " LUFS; choose a lower target or a higher ceiling";
+            } else {
+                message << "Loudness target not reached: measured " << std::fixed << std::setprecision(2) << result.output.integratedLufs
+                        << " LUFS against a target of " << config_.targetLufs << " LUFS; the true-peak ceiling limits the achievable loudness";
+            }
             result.warnings.push_back(message.str());
         }
     }
@@ -993,9 +1134,9 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
     return result;
 }
 
-Measurements MasteringEngine::measureFile(const std::string& path, bool dualMono, bool accuratePeak) {
+Measurements MasteringEngine::measureFile(const std::string& path, bool dualMono, bool strictPeak) {
     WavReader reader(path);
-    Meter meter(reader.sampleRate(), reader.channels(), accuratePeak ? PeakMode::Accurate : PeakMode::Standard, dualMono);
+    Meter meter(reader.sampleRate(), reader.channels(), strictPeak ? PeakMode::Accurate : PeakMode::Standard, dualMono);
     AudioBlock block;
     size_t n;
     while ((n = reader.read(block, kBlockFrames)) > 0) {
@@ -1020,7 +1161,8 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result, const Mas
     out << "  \"version\": " << quote(kVersion) << ",\n";
     out << "  \"settings\": {\"targetLufs\": " << num(config.targetLufs, 2) << ", \"ceilingDb\": " << num(config.ceilingDb, 2)
         << ", \"toleranceLu\": " << num(config.loudnessToleranceLu, 3) << ", \"dualMono\": " << (config.dualMono ? "true" : "false")
-        << ", \"lookaheadMs\": " << num(config.limiterLookaheadMs, 1) << ", \"releaseMs\": " << num(config.limiterReleaseMs, 0) << "},\n";
+        << ", \"lookaheadMs\": " << num(config.limiterLookaheadMs, 1) << ", \"releaseMs\": " << num(config.limiterReleaseMs, 0)
+        << ", \"strictPeak\": " << (config.strictPeak ? "true" : "false") << ", \"genre\": " << quote(config.genre) << "},\n";
     out << "  \"input\": {\"path\": " << quote(result.inputPath) << ", \"sampleRate\": " << a.sampleRate << ", \"channels\": " << a.channels
         << ", \"frames\": " << a.frames << ", \"measurements\": " << measurementsJson(a.input) << "},\n";
     out << "  \"references\": {\"count\": " << a.referenceCount << ", \"measurements\": " << measurementsJson(a.reference) << "},\n";
@@ -1028,6 +1170,14 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result, const Mas
         << ", \"measurements\": " << measurementsJson(result.output) << "},\n";
     out << "  \"gain\": {\"makeupDb\": " << num(result.makeupGainDb, 2) << ", \"iterations\": " << result.iterations
         << ", \"targetReached\": " << (result.targetReached ? "true" : "false") << ", \"ceilingTrimDb\": " << num(result.ceilingTrimDb, 3) << "},\n";
+    {
+        const QualityGrade quality = gradeResult(result, config);
+        out << "  \"quality\": {\"grade\": " << quote(std::string(1, quality.grade)) << ", \"score\": " << quality.score << ", \"reasons\": [";
+        for (size_t i = 0; i < quality.reasons.size(); ++i) {
+            out << (i > 0 ? ", " : "") << quote(quality.reasons[i]);
+        }
+        out << "]},\n";
+    }
     auto extreme = [](const std::vector<EQBand>& bands, bool boost) {
         double value = 0.0;
         for (const EQBand& band : bands) {
