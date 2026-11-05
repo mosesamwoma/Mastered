@@ -35,6 +35,7 @@ const byId = (id) => document.getElementById(id);
 const form = byId('job-form');
 const referenceInput = byId('reference');
 const trackInput = byId('track');
+const genreSelect = byId('genre');
 const dropZones = [
   [byId('drop-reference'), referenceInput, byId('reference-name'), 'Drop a finished track here or click to choose'],
   [byId('drop-track'), trackInput, byId('track-name'), 'Drop your mix here or click to choose'],
@@ -65,6 +66,7 @@ const flagInputs = [
   ['dual_mono', byId('dual-mono')],
   ['bass_limiter', byId('bass-limiter')],
   ['transparent', byId('transparent')],
+  ['strict_peak', byId('strict-peak')],
 ];
 const planSummary = byId('plan-summary');
 const savedSelect = byId('saved-select');
@@ -252,7 +254,7 @@ function refreshDropZone(entry) {
   } else if (files.length === 1) {
     nameNode.textContent = files[0].name + ' (' + formatSize(files[0].size) + ')';
   } else {
-    nameNode.textContent = files.length + ' tracks: ' + files.map((file) => file.name).join(', ');
+    nameNode.textContent = files.length + ' files: ' + files.map((file) => file.name).join(', ');
   }
   zone.classList.toggle('filled', files.length > 0);
   refreshReadyHint();
@@ -290,13 +292,35 @@ function trackFiles() {
   return trackInput.files ? Array.from(trackInput.files) : [];
 }
 
+function referenceFiles() {
+  return referenceInput.files ? Array.from(referenceInput.files) : [];
+}
+
+function maxReferences() {
+  return limits && Number.isInteger(limits.maxReferences) ? limits.maxReferences : 1;
+}
+
+function buildGenreOptions() {
+  const genres = limits && Array.isArray(limits.genres) ? limits.genres : [];
+  Array.from(genreSelect.options)
+    .slice(1)
+    .forEach((option) => option.remove());
+  genres.forEach((genre) => {
+    const option = document.createElement('option');
+    option.value = genre.id;
+    option.textContent = genre.name + ' (' + genre.note + ')';
+    genreSelect.appendChild(option);
+  });
+  genreSelect.closest('.field').hidden = genres.length === 0;
+}
+
 function refreshReadyHint() {
-  const hasReference = Boolean(referenceInput.files && referenceInput.files[0]);
+  const hasReference = referenceFiles().length > 0 || genreSelect.value !== '';
   const tracks = trackFiles().length;
   if (!hasReference && tracks === 0) {
-    readyHint.textContent = 'Start by choosing a reference song and your track.';
+    readyHint.textContent = 'Start by choosing a reference song (or a style) and your track.';
   } else if (!hasReference) {
-    readyHint.textContent = 'Now choose the reference song whose sound you want to match.';
+    readyHint.textContent = 'Now choose the reference song whose sound you want to match, or pick a style.';
   } else if (tracks === 0) {
     readyHint.textContent = 'Now choose the track you want to master.';
   } else if (tracks > MAX_BATCH_TRACKS) {
@@ -338,15 +362,18 @@ function updatePlan() {
   const ceiling = numberOr(ceilingInput, null);
   const parts = [];
   const strength = Number(aggressivenessInput.value);
+  const usesGenre = referenceFiles().length === 0 && genreSelect.value !== '';
   parts.push(
     strength === 0
       ? 'The tone is left as it is.'
-      : 'The tone of your track is moved ' + strength + '% of the way towards the reference' + (byId('mid-side').checked ? ', in mid and side separately' : '') + '.'
+      : usesGenre
+        ? 'The tone of your track is moved gently towards the built-in style you chose.'
+        : 'The tone of your track is moved ' + strength + '% of the way towards the reference' + (byId('mid-side').checked ? ', in mid and side separately' : '') + '.'
   );
   if (byId('match-width').checked && byId('mid-side').checked) {
     parts.push('The stereo width is matched.');
   }
-  if (byId('dynamics').checked) {
+  if (byId('dynamics').checked && !usesGenre) {
     parts.push('Dynamics are matched with a three-band compressor.');
   }
   if (monoBassCheck.checked) {
@@ -370,9 +397,16 @@ function updatePlan() {
 }
 
 function checkInputs() {
-  const reference = referenceInput.files && referenceInput.files[0];
+  const references = referenceFiles();
   const tracks = trackFiles();
-  const files = [['The reference song', reference]];
+  const files = [];
+  if (references.length === 0 && genreSelect.value === '') {
+    files.push(['The reference song (or a style)', null]);
+  }
+  if (references.length > maxReferences()) {
+    return 'You can use up to ' + maxReferences() + ' reference songs.';
+  }
+  references.forEach((file, index) => files.push([references.length > 1 ? 'Reference ' + (index + 1) : 'The reference song', file]));
   tracks.forEach((file, index) => files.push([tracks.length > 1 ? 'Track ' + (index + 1) : 'Your track', file]));
   if (tracks.length === 0) {
     files.push(['Your track', null]);
@@ -412,7 +446,13 @@ function checkInputs() {
 
 function buildFormData(trackFile) {
   const data = new FormData();
-  data.append('reference', referenceInput.files[0]);
+  const references = referenceFiles();
+  if (references.length > 0) {
+    data.append('reference', references[0]);
+    references.slice(1).forEach((file) => data.append('extra_references', file));
+  } else {
+    data.append('genre', genreSelect.value);
+  }
   data.append('track', trackFile);
   data.append('target_lufs', targetInput.value);
   data.append('aggressiveness', String(Number(aggressivenessInput.value) / 100));
@@ -1126,15 +1166,20 @@ function showResult(index) {
   const job = entry.job;
   const report = job.report;
   const output = report.output.measurements;
+  const quality = report.quality && typeof report.quality === 'object' ? report.quality : null;
   heroSummary.textContent =
     formatNumber(output.integratedLufs, 2, 'LUFS') + ' and ' + formatNumber(output.truePeakDb, 2, 'dBTP') + ', ' +
-    report.gain.iterations + ' loudness pass' + (report.gain.iterations === 1 ? '' : 'es') + '.';
+    report.gain.iterations + ' loudness pass' + (report.gain.iterations === 1 ? '' : 'es') + '.' +
+    (quality ? ' Quality grade ' + quality.grade + ' (' + quality.score + '/100).' : '');
   buildBatchBar();
   buildStats(report);
+  const hasReference = Boolean(report.references && report.references.count > 0);
   measurementsBody.replaceChildren(
-    measurementRow('Your track', report.input.measurements, true),
-    measurementRow('Reference', report.references.measurements, true),
-    measurementRow('Mastered', report.output.measurements, true)
+    ...[
+      measurementRow('Your track', report.input.measurements, true),
+      ...(hasReference ? [measurementRow('Reference', report.references.measurements, true)] : []),
+      measurementRow('Mastered', report.output.measurements, true),
+    ]
   );
   gainSummary.textContent = 'Gain applied: ' + formatNumber(report.gain.makeupDb, 1, 'dB') + '.';
   const limiter = report.limiter;
@@ -1143,7 +1188,8 @@ function showResult(index) {
       ' dB on average, working during ' + Math.round(limiter.reducedFraction * 100) + '% of the track.' + (limiter.softClip ? ' The soft clipper was on.' : '')
     : '';
   fillList(changesList, describeChanges(report.changes));
-  fillList(notesList, (report.notes || []).concat(conversionNotes(report)));
+  const qualityNotes = quality && Array.isArray(quality.reasons) ? quality.reasons.map((reason) => 'Quality: ' + reason + '.') : [];
+  fillList(notesList, (report.notes || []).concat(qualityNotes, conversionNotes(report)));
   fillList(warningsList, report.warnings);
   buildPlatforms(report);
   addSpectrum(report);
@@ -1927,6 +1973,11 @@ async function init() {
     '. Large WAV files can be sent as FLAC or MP3 instead, which are much smaller.';
   limitsText.textContent = describeLimits();
   buildPresetChips();
+  buildGenreOptions();
+  genreSelect.addEventListener('change', () => {
+    refreshReadyHint();
+    updatePlan();
+  });
   fillExportFormats();
   submitButton.disabled = false;
   const saved = readStorage();
