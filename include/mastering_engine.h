@@ -35,6 +35,10 @@ struct MasteringConfig {
     bool softClip = false;
     double softClipKneeDb = 3.0;
     bool accuratePeak = true;
+    bool strictPeak = false;
+    std::string genre;
+    double subsonicHz = 0.0;
+    bool autoSubsonic = true;
     double limiterLookaheadMs = 5.0;
     double limiterReleaseMs = 80.0;
     uint16_t bitDepth = 0;
@@ -119,7 +123,7 @@ public:
     MasteringResult render(const Analysis& analysis, const std::string& input, const std::string& output);
     MasteringResult run(const std::vector<std::string>& references, const std::string& input, const std::string& output);
 
-    static Measurements measureFile(const std::string& path, bool dualMono = false, bool accuratePeak = true);
+    static Measurements measureFile(const std::string& path, bool dualMono = false, bool strictPeak = false);
     static std::string measurementsJsonText(const Measurements& measurements);
 
     static std::string exportJSON(const MasteringResult& result, const MasteringConfig& config = MasteringConfig());
