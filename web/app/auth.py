@@ -9,6 +9,8 @@ import time
 from http.cookies import CookieError, SimpleCookie
 
 COOKIE_NAME = "mastered_session"
+HOST_COOKIE_NAME = "__Host-mastered_session"
+COOKIE_NAMES = (HOST_COOKIE_NAME, COOKIE_NAME)
 SCRYPT_N = 2 ** 14
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -144,12 +146,15 @@ class SessionSigner:
 
 def session_token(headers):
     for name, value in headers:
-        if name == b"cookie":
-            jar = SimpleCookie()
-            try:
-                jar.load(value.decode("latin-1"))
-            except CookieError:
-                return None
-            morsel = jar.get(COOKIE_NAME)
-            return morsel.value if morsel else None
+        if name != b"cookie":
+            continue
+        jar = SimpleCookie()
+        try:
+            jar.load(value.decode("latin-1"))
+        except CookieError:
+            continue
+        for cookie_name in COOKIE_NAMES:
+            morsel = jar.get(cookie_name)
+            if morsel is not None and morsel.value:
+                return morsel.value
     return None
