@@ -5,12 +5,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .media import MediaError, run_process
+from .media import MediaError, make_limits, run_process
 
 ENCODE_TIMEOUT_SEC = 240
 MEASURE_TIMEOUT_SEC = 120
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 6
 PEAK_AIM_DB = 0.1
+LOUDNESS_TOLERANCE_LU = 0.08
+MAX_STEP_DB = 4.0
+FILE_SIZE_LIMIT = 4 << 30
 EXPORT_KEY = re.compile(r"^[a-z0-9_]{3,40}$")
 MAX_EXPORTS_PER_JOB = 12
 DELIVERY_RATES = (0, 48000)
@@ -158,7 +161,7 @@ def encode_arguments(ffmpeg, source, destination, fmt, quality, gain_db, channel
 
 async def run_checked(arguments, timeout, failure):
     try:
-        code, stdout, _ = await run_process(arguments, timeout)
+        code, stdout, _ = await run_process(arguments, timeout, limits=make_limits(0, timeout * 2, FILE_SIZE_LIMIT))
     except MediaError:
         raise MediaError(failure) from None
     except OSError:
@@ -168,7 +171,7 @@ async def run_checked(arguments, timeout, failure):
     return stdout
 
 
-async def measure_file(engine, ffmpeg, path, work_directory, dual_mono):
+async def measure_file(engine, ffmpeg, path, work_directory, dual_mono, strict_peak=False):
     decoded = work_directory / f"measure_{path.stem}.wav"
     try:
         await run_checked(
@@ -178,6 +181,8 @@ async def measure_file(engine, ffmpeg, path, work_directory, dual_mono):
         arguments = [str(engine), "--measure", str(decoded)]
         if dual_mono:
             arguments.append("--dual-mono")
+        if strict_peak:
+            arguments.append("--strict-peak")
         stdout = await run_checked(arguments, MEASURE_TIMEOUT_SEC, "the exported file could not be measured")
         try:
             return json.loads(stdout.decode("utf-8", "replace"))["measurements"]
@@ -197,6 +202,7 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
     settings_block = report.get("settings", {})
     ceiling = float(settings_block.get("ceilingDb", -1.0))
     dual_mono = bool(settings_block.get("dualMono", False))
+    strict_peak = bool(settings_block.get("strictPeak", False))
     channels = int(report.get("input", {}).get("channels", 2) or 2)
     sample_rate = int(report.get("input", {}).get("sampleRate", 44100) or 44100)
     mastered_measurements = report["output"]["measurements"]
@@ -204,6 +210,8 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
         tags = None
     bits = int(report.get("output", {}).get("bitDepth", 24) or 24)
     needs_check = fmt.lossy or bool(rate)
+    target_lufs = float(mastered_measurements.get("integratedLufs", -120.0))
+    retarget = fmt.lossy and target_lufs > -100.0
     key = export_key(fmt.id, quality.id) + ("_48k" if rate else "") + ("_tags" if tags else "")
 
     def describe(path, measured, gain_db, attempts):
@@ -226,6 +234,7 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
                 "truePeakDb": measured["truePeakDb"],
                 "loudnessRangeLu": measured["loudnessRangeLu"],
             },
+            "loudnessErrorLu": round(float(measured["integratedLufs"]) - target_lufs, 3) if retarget else 0.0,
         }
 
     if fmt.id == "wav" and not rate:
@@ -242,30 +251,70 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
 
     measured = mastered_measurements
     gain_db = 0.0
+    applied_db = 0.0
     attempts = 0
     history = []
+    ok_gain = None
+    bad_gain = None
+
+    async def encode_and_measure(gain):
+        arguments = encode_arguments(settings.ffmpeg_path, master, destination, fmt, quality, gain, channels, sample_rate, title, rate, tags, bits)
+        await run_checked(arguments, ENCODE_TIMEOUT_SEC, "the file could not be encoded")
+        return await measure_file(settings.engine_path, settings.ffmpeg_path, destination, directory, dual_mono, strict_peak)
+
     try:
         while attempts < MAX_ATTEMPTS:
             attempts += 1
-            arguments = encode_arguments(settings.ffmpeg_path, master, destination, fmt, quality, gain_db, channels, sample_rate, title, rate, tags, bits)
-            await run_checked(arguments, ENCODE_TIMEOUT_SEC, "the file could not be encoded")
+            applied_db = gain_db
             if not needs_check:
+                await run_checked(
+                    encode_arguments(settings.ffmpeg_path, master, destination, fmt, quality, gain_db, channels, sample_rate, title, rate, tags, bits),
+                    ENCODE_TIMEOUT_SEC, "the file could not be encoded",
+                )
                 break
-            measured = await measure_file(settings.engine_path, settings.ffmpeg_path, destination, directory, dual_mono)
+            measured = await encode_and_measure(gain_db)
             peak = float(measured["truePeakDb"])
-            if peak <= ceiling:
-                break
-            step = peak - (ceiling - PEAK_AIM_DB) + 0.01
-            history.append((gain_db, peak))
-            if len(history) >= 2:
-                lowered = history[-2][0] - history[-1][0]
-                moved = history[-2][1] - history[-1][1]
-                if lowered > 0 and moved < 0.5 * lowered:
-                    step *= 2.0 + attempts
-            gain_db -= step
+            valid = peak <= ceiling
+            room = ceiling - PEAK_AIM_DB - peak - 0.01
+            if valid:
+                ok_gain = applied_db if ok_gain is None else max(ok_gain, applied_db)
+            else:
+                bad_gain = applied_db if bad_gain is None else min(bad_gain, applied_db)
+            if retarget:
+                loud_error = target_lufs - float(measured["integratedLufs"])
+                if valid and (abs(loud_error) <= LOUDNESS_TOLERANCE_LU or (loud_error > 0 and room <= LOUDNESS_TOLERANCE_LU)):
+                    break
+                change = min(loud_error, room)
+                if valid and 0 <= change < 0.01:
+                    break
+            else:
+                if valid:
+                    break
+                change = room
+            if not valid:
+                history.append((gain_db, peak))
+                if len(history) >= 2:
+                    lowered = history[-2][0] - history[-1][0]
+                    moved = history[-2][1] - history[-1][1]
+                    if lowered > 0 and moved < 0.5 * lowered:
+                        change *= 1.5
+                change = max(change, -MAX_STEP_DB)
+            candidate = gain_db + change
+            if bad_gain is not None and candidate >= bad_gain - 0.005:
+                if ok_gain is None:
+                    candidate = bad_gain - max(0.25, -change)
+                else:
+                    if bad_gain - ok_gain < 0.03:
+                        break
+                    candidate = 0.5 * (ok_gain + bad_gain)
+            gain_db = candidate
+        if needs_check and float(measured["truePeakDb"]) > ceiling and ok_gain is not None:
+            applied_db = ok_gain
+            attempts += 1
+            measured = await encode_and_measure(ok_gain)
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
-    info = describe(destination, measured, gain_db, attempts)
+    info = describe(destination, measured, applied_db, attempts)
     sidecar.write_text(json.dumps(info), "utf-8")
     return info
