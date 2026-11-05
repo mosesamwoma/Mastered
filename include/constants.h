@@ -4,7 +4,7 @@
 #include <cstdint>
 
 #ifndef MASTERED_VERSION
-#define MASTERED_VERSION "2.4.0"
+#define MASTERED_VERSION "2.5.0"
 #endif
 
 namespace mastered {
