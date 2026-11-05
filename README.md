@@ -12,9 +12,12 @@ Everything runs as a streaming pipeline in fixed-size blocks, so memory use stay
 - Mid/side analysis and EQ, stereo width matching, correlation reporting
 - Multi-reference averaging
 - Dynamics matching: three-band compression whose ratios come from the measured level spread of each band in your track and in the reference, refined by measuring what the compressor actually achieves
-- Optional soft clipper before the limiter
-- Look-ahead true-peak limiter with a closed-loop check: the final output is measured with a more accurate 8x oversampled detector and the limiter ceiling is trimmed until the measured peak respects the ceiling
-- Loudness loop: gain is computed after EQ and dynamics, then iterated until the measured output hits the target
+- Optional soft clipper before the limiter, run at 4x oversampling so its distortion does not alias; it passes the audio through untouched while nothing is near the threshold
+- No reference? Match one of seven built-in style curves instead (`--genre`); the correction is gentler and dynamics matching is skipped
+- Quality grade (A to D) in every report, with the reasons for any deduction
+- Automatic 20 Hz high-pass when the input has a DC offset (`--subsonic HZ` to choose your own)
+- Look-ahead true-peak limiter with a program-dependent release (it releases more slowly the deeper it works) and a closed-loop check: the final output is measured with the same detector the limiter uses, and the limiter ceiling is trimmed until the measured peak respects the ceiling. The detector is the 4x one that DAW meters use by default, or a strict 8x one with `--strict-peak`
+- Loudness loop: gain is computed after EQ and dynamics, then iterated until the measured output hits the target. If the limiter saturates (more gain barely adds loudness), the loop stops at the knee instead of crushing the track, and the report says how loud the track can honestly get
 - TPDF dither with optional first-order noise shaping for 16 and 24 bit output
 - WAV input: 16/24/32-bit PCM, 32/64-bit float, WAVE_FORMAT_EXTENSIBLE, RF64/BW64 files over 4 GB, up to 8 channels, odd-sized chunks, streamed headers
 - WAV output: 16/24-bit PCM, 32-bit float (format tag 3), extensible header above two channels, automatic RF64 beyond 4 GB
@@ -50,6 +53,7 @@ Outputs: `build/mastered_cli`, `build/libmastered.so` (or the platform equivalen
 
 ```
 ./build/mastered_cli <reference.wav> <input.wav> [options]
+./build/mastered_cli <input.wav> --genre NAME [options]
 ```
 
 By default the mastered file is written next to the input as `<input>_mastered.wav`, with a JSON report next to it. The command line reads WAV files only; the web app converts other formats first.
@@ -62,6 +66,11 @@ By default the mastered file is written next to the input as `<input>_mastered.w
 | `--presets` | off | Write `.reaeq.txt` and `.apo.txt` EQ files |
 | `--preset NAME` | | Target and ceiling for a service; `--target` and `--ceiling` still override it |
 | `--list-presets` | | Print the presets as JSON and exit |
+| `--genre NAME` | | Match a built-in style curve instead of a reference track (see `--list-genres`) |
+| `--list-genres` | | Print the style curves as JSON and exit |
+| `--strict-peak` | | Limit and check true peak with the strict 8x detector (default is the 4x detector that DAW meters use) |
+| `--subsonic HZ` | | High-pass below HZ, 10 to 60. Without it, 20 Hz is used only when the input has a DC offset |
+| `--no-auto-subsonic` | | Do not remove a DC offset automatically |
 | `--mono-bass HZ` | off | Make everything below HZ mono, 20 to 500 (about -24 dB of side signal one octave below HZ) |
 | `--target LUFS` | -14 | Loudness target, -60 to -1 |
 | `--aggressive N` | 0.85 | EQ and dynamics strength, 0 to 1 |
@@ -79,12 +88,12 @@ By default the mastered file is written next to the input as `<input>_mastered.w
 | `--dynamics` | | Multiband compression matched to the reference |
 | `--dynamics-ratio N` | | Fixed ratio, 1 to 20 (implies `--dynamics`) |
 | `--soft-clip` | | Always use the soft clipper before the limiter |
-| `--no-auto-clip` | | Do not switch the soft clipper on automatically when the limiter would have to remove more than about 3 dB |
-| `--bass-limiter` | | Experimental: limit the band below 140 Hz separately (off by default, see Notes) |
+| `--no-auto-clip` | | Do not switch the soft clipper on automatically when the limiter would have to remove more than about 4 dB |
+| `--bass-limiter` | | Limit the band below 140 Hz separately; the audio is left bit-for-bit untouched while the bass is under its threshold (off by default) |
 | `--no-auto-mono-bass` | | Do not make the bass mono automatically when the low end is out of phase (correlation below 0.3) |
 | `--dual-mono` | | Measure single-channel files as dual mono (+3 LU) |
 | `--measure PATH` | | Measure a WAV file with the engine's meter, print JSON and exit |
-| `--fast-peak` | | Use the 4x peak detector and skip the closed-loop ceiling check (about a third faster) |
+| `--fast-peak` | | Skip the closed-loop ceiling check after rendering (faster) |
 | `--lookahead MS` | 5 | Limiter look-ahead, 0.5 to 20 |
 | `--release MS` | 80 | Limiter release, 5 to 1000 |
 | `--fft N` | 8192 | FFT size, power of two 1024 to 65536 |
@@ -113,7 +122,7 @@ Mastered/
   render.yaml       Render blueprint (free plan)
   web/
     app/            FastAPI service
-    static/         index.html, login.html, style.css, app.js, login.js
+    static/         index.html, login.html, style.css, login.js, js/ (page modules)
 ```
 
 ### Run it locally
@@ -332,7 +341,7 @@ const char* json = mastered_result_json(e);
 mastered_destroy(e);
 ```
 
-Options: `target_lufs`, `aggressiveness`, `ceiling_db`, `max_bands`, `max_side_bands`, `smoothing`, `perceptual_weighting`, `auto_gain`, `mid_side`, `match_width`, `dynamics`, `dynamics_match`, `dynamics_ratio`, `dynamics_threshold_offset_db`, `soft_clip`, `soft_clip_knee_db`, `accurate_peak`, `lookahead_ms`, `release_ms`, `bit_depth`, `dither`, `noise_shaping`, `tolerance_lu`, `max_iterations`, `fft_size`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`.
+Options: `target_lufs`, `aggressiveness`, `ceiling_db`, `max_bands`, `max_side_bands`, `smoothing`, `perceptual_weighting`, `auto_gain`, `mid_side`, `match_width`, `dynamics`, `dynamics_match`, `dynamics_ratio`, `dynamics_threshold_offset_db`, `soft_clip`, `soft_clip_knee_db`, `accurate_peak`, `lookahead_ms`, `release_ms`, `bit_depth`, `dither`, `noise_shaping`, `tolerance_lu`, `max_iterations`, `fft_size`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `strict_peak`, `subsonic_hz`, `auto_subsonic`.
 
 Metrics: `input_lufs`, `input_true_peak_db`, `input_lra`, `reference_lufs`, `output_lufs`, `output_true_peak_db`, `output_lra`, `output_correlation`, `makeup_gain_db`, `iterations`, `target_reached`, `mid_band_count`, `side_band_count`.
 
@@ -363,14 +372,16 @@ The JSON report contains input, reference and output measurements, the makeup ga
 - Bands where the input has almost no content (more than 50 dB below its average level, for example above the cut-off of a lossy file) are not boosted.
 - Platform targets are typical values and change over time; services also differ in whether they turn quiet tracks up.
 - Mid/side EQ is used for stereo files only. For other channel counts the mid EQ is applied to every channel.
-- True peak: the limiter detects with a 4x, 24-tap-per-phase oversampler. The reported output peak and the closed-loop check use an 8x, 64-tap-per-phase detector. Compared with a much longer reference filter it read within 0.04 dB on typical material and up to about 0.2 dB low on very heavily limited material. Input and reference peaks in the report use the 4x detector.
-- `--fast-peak` (used by the web page's Fast precision) skips the accurate measurement and the closed-loop check, so the peak is only guaranteed to the 4x detector's accuracy.
-- If the ceiling prevents the loudness target from being reached, the closest result is written and a warning is reported.
+- True peak: by default the limiter, the closed-loop check and the reported peak all use the same 4x, 24-tap-per-phase oversampler, which reads like most DAW and ffmpeg meters. `--strict-peak` switches all three to an 8x, 64-tap-per-phase detector. On very bright, heavily limited material the 4x detector can read about a dB lower than a much longer reference filter, so use the strict detector (or a lower ceiling) when you deliver to strict codecs.
+- `--fast-peak` (used by the web page's Fast precision) skips the closed-loop check, so the peak is only guaranteed to the limiter's own detector.
+- If the ceiling prevents the loudness target from being reached, the closest result is written and a warning is reported. When the limiter saturates, the engine stops at the knee (within 0.25 LU of the loudest result it found) rather than pushing gain to the limit.
+- Built-in style curves (`--genre`) are general long-term spectrum shapes, not measurements of any particular music. They are applied at 60% strength with boosts capped at 4 dB and cuts at 5 dB.
 - Dynamics matching moves each band's level spread toward the reference; it is an approximation and a band is left alone when it already matches.
 - `--bitdepth 32` writes IEEE float. 32-bit integer PCM input is accepted and converted.
 - Bundled FFmpeg-based conversion is only as capable as the FFmpeg build installed on the server.
-- Meters and loudness: the integrated loudness follows ITU-R BS.1770-4 / EBU R128 with absolute and relative gating, and agrees with ffmpeg's `ebur128` filter to within about 0.05 LU. Other meters can differ in what they show: a single-channel file is measured as one channel (use `--dual-mono` for meters that count it twice), short-term and momentary readings are not the integrated value, and true-peak meters with 4x oversampling (including ffmpeg's) read a little lower than this engine's 8x detector.
+- Meters and loudness: the integrated loudness follows ITU-R BS.1770-4 / EBU R128 with absolute and relative gating, and agrees with ffmpeg's `ebur128` filter to within about 0.05 LU. Other meters can differ in what they show: a single-channel file is measured as one channel (use `--dual-mono` for meters that count it twice), short-term and momentary readings are not the integrated value. True-peak readings follow the detector you choose: the default 4x detector matches most DAW and ffmpeg meters, while `--strict-peak` reads a little higher on bright material.
 - Disk use: while a file is mastered, a temporary 32-bit float copy of the processed signal (4 bytes per sample per channel) is kept next to the output; a 5 minute stereo 44.1 kHz track needs about 106 MB for it, and it is removed when the run ends.
-- `--bass-limiter` is experimental and off by default. On a synthetic kick-and-bass test it moved loudness from the bass to the highs and did not reduce modulation of the highs, so the default chain relies on the automatic soft clipper and the two-follower release instead. Judge it by ear on your own material before using it.
+- `--bass-limiter` is off by default. It subtracts only what the bass limiter takes from the low band, so there is no crossover phase shift, but judge it by ear on your own material before using it.
 - The soft clipper that is switched on for heavy limiting trades limiter pumping for a little clipping distortion on the tallest peaks. If you prefer the limiter alone, use `--no-auto-clip` (the web page has the same switch under Advanced).
-- Lossy exports from the web app are checked after encoding, but a player's own decoder and sample-rate conversion can still add a little peak; leave some room in the ceiling if a platform is strict.
+- Lossy exports from the web app are decoded and measured after encoding. The gain is searched so the file stays under the ceiling and, where the codec allows, keeps the mastered loudness; the true peak always wins, and the difference is reported as `loudnessErrorLu`. Encoders add overs on heavily limited masters, so a few tenths of a LU (more for AAC on very loud material) can be traded away. A player's own decoder and sample-rate conversion can still add a little peak; leave some room in the ceiling if a platform is strict.
+- The web server's session cookie uses the `__Host-` prefix whenever the connection is HTTPS. Ffmpeg runs with a demuxer allow-list, a file-protocol-only allow-list, a CPU limit and an output-size limit.
