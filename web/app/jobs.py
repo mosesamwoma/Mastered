@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .media import MediaError, MediaInfo, kill_group, make_limits
+from .media import MediaError, MediaInfo, apply_limits_to, kill_group, limit_prefix, make_limits
 from .observability import log_event, metrics
 from .store import JobStore
 from .wav_info import WavError, inspect_wav
@@ -72,7 +72,6 @@ class JobManager:
         self.wake = asyncio.Event()
         self.tasks = []
         self.export_gate = asyncio.Semaphore(1)
-        self.failure_category = "engine"
         self.started_at = time.time()
 
     def job_directory(self, job_id):
@@ -325,17 +324,20 @@ class JobManager:
         job_id = row["id"]
         directory = self.job_directory(job_id)
         converted = False
-        for index, label in enumerate(("reference", "track")):
+        labels = sorted(key for key in row["sources"] if key.startswith("reference")) + ["track"]
+        for index, label in enumerate(labels):
             source = row["sources"].get(label, {})
             if not source.get("convert"):
                 continue
-            await self.progress(job_id, 1.0 + 3.0 * index, f"Converting the {label} file", force=True)
+            display = "track" if label == "track" else ("reference" if label == "reference" else f"reference {label[len('reference'):]}")
+            await self.progress(job_id, 1.0 + (CONVERT_PROGRESS - 2.0) * index / len(labels), f"Converting the {display} file", force=True)
             info = MediaInfo(source["codec"], source["channels"], source["sample_rate"], source["bits"], source["duration"])
             raw = directory / f"{label}.src"
             wav = directory / f"{label}.wav"
             try:
                 await self.media.convert_to_wav(
-                    raw, wav, info, self.settings.max_duration_sec, self.settings.convert_timeout_sec, self.register(job_id)
+                    raw, wav, info, self.settings.max_duration_sec, self.settings.convert_timeout_sec, self.register(job_id),
+                    self.settings.max_decoded_mb * 1024 * 1024,
                 )
                 converted_info = await asyncio.to_thread(inspect_wav, wav)
                 if converted_info.duration > self.settings.max_duration_sec + 1.0:
@@ -346,7 +348,7 @@ class JobManager:
             except (MediaError, WavError) as error:
                 if self.is_cancelled(job_id):
                     return None
-                await self.fail(job_id, f"The {label} file could not be converted: {error}", "conversion")
+                await self.fail(job_id, f"The {display} file could not be converted: {error}", "conversion")
                 return None
             raw.unlink(missing_ok=True)
             converted = True
@@ -355,26 +357,35 @@ class JobManager:
     async def run_engine(self, row, base):
         job_id = row["id"]
         directory = self.job_directory(job_id)
-        command = [
-            str(self.settings.engine_path),
-            str(directory / "reference.wav"),
-            str(directory / "track.wav"),
+        references = sorted(directory.glob("reference*.wav"))
+        command = [str(self.settings.engine_path)]
+        if references:
+            command += [str(references[0]), str(directory / "track.wav")]
+            for extra in references[1:]:
+                command += ["--reference", str(extra)]
+        else:
+            command += [str(directory / "track.wav")]
+        command += [
             "--output", str(directory / "mastered.wav"),
             "--json", str(directory / "report.json"),
             *row["cli_args"],
         ]
+        limits = make_limits(self.settings.engine_memory_mb * 1024 * 1024, self.settings.job_timeout_sec + 60)
+        prefix = limit_prefix(limits)
         try:
             process = await asyncio.create_subprocess_exec(
+                *prefix,
                 *command,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=1 << 20,
                 start_new_session=True,
-                preexec_fn=make_limits(self.settings.engine_memory_mb * 1024 * 1024, self.settings.job_timeout_sec + 60),
             )
         except OSError:
-            return "The mastering engine could not be started"
+            return "The mastering engine could not be started", "engine"
+        if not prefix:
+            apply_limits_to(process.pid, limits)
         self.register(job_id)(process)
         stderr_task = asyncio.create_task(self.collect(process.stderr))
         timed_out = False
@@ -391,14 +402,12 @@ class JobManager:
             self.register(job_id)(None)
         stderr = await stderr_task
         if self.is_cancelled(job_id):
-            return None
+            return None, ""
         if timed_out:
-            self.failure_category = "timeout"
-            return f"Mastering took longer than {describe_duration(self.settings.job_timeout_sec)} and was stopped"
+            return f"Mastering took longer than {describe_duration(self.settings.job_timeout_sec)} and was stopped", "timeout"
         if process.returncode != 0:
-            self.failure_category = "engine"
-            return self.engine_error(stderr, job_id)
-        return ""
+            return self.engine_error(stderr, job_id), "engine"
+        return "", ""
 
     async def collect(self, stream):
         kept = b""
@@ -420,7 +429,12 @@ class JobManager:
 
     def clean_message(self, text, job_id):
         directory = self.job_directory(job_id)
-        for name, label in (("reference.wav", "reference file"), ("track.wav", "track file")):
+        names = (
+            ("reference.wav", "reference file"), ("reference2.wav", "second reference file"),
+            ("reference3.wav", "third reference file"), ("reference4.wav", "fourth reference file"),
+            ("track.wav", "track file"),
+        )
+        for name, label in names:
             text = text.replace(str(directory / name), label)
         return text.replace(str(directory), "job").strip()[:300]
 
@@ -455,12 +469,11 @@ class JobManager:
             return
         convert_done = time.time()
         base = CONVERT_PROGRESS if converted else 0.0
-        self.failure_category = "engine"
-        failure = await self.run_engine(row, base)
+        failure, category = await self.run_engine(row, base)
         if failure is None:
             return
         if failure:
-            await self.fail(job_id, failure, self.failure_category)
+            await self.fail(job_id, failure, category)
             return
         engine_done = time.time()
         directory = self.job_directory(job_id)
@@ -474,7 +487,8 @@ class JobManager:
         report["input"]["path"] = row["track_name"][:120]
         report["output"]["path"] = download_name(row["track_name"])
         report["conversion"] = {
-            label: list((row["sources"].get(label) or {}).get("notes") or []) for label in ("reference", "track")
+            label: list((row["sources"].get(label) or {}).get("notes") or [])
+            for label in sorted(key for key in row["sources"] if key.startswith("reference")) + ["track"]
         }
         await self.progress(job_id, 97.0, "Preparing the preview", force=True)
         preview = await self.make_previews(job_id)
@@ -493,8 +507,8 @@ class JobManager:
             metrics.observe("job_stage", value, {"stage": name})
         metrics.count("jobs", {"outcome": "done", "category": "ok"})
         log_event("job done", job=job_id[:8], **timing)
-        for name in ("reference.wav", "track.wav", "report.json"):
-            (directory / name).unlink(missing_ok=True)
+        for path in [*directory.glob("reference*.wav"), directory / "track.wav", directory / "report.json"]:
+            path.unlink(missing_ok=True)
         await self.database(
             self.store.update, job_id, status="done", progress=100.0, message="Done",
             finished=finished, report=report, preview=preview, timings=timing,
