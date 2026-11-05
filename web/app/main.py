@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from .auth import COOKIE_NAME, MAX_PASSWORD_BYTES, SessionSigner, hash_password, session_token, verify_password
+from .auth import COOKIE_NAME, HOST_COOKIE_NAME, MAX_PASSWORD_BYTES, SessionSigner, hash_password, session_token, verify_password
 from .config import load_settings
 from .exports import DELIVERY_RATES, EXPORT_KEY, MAX_EXPORTS_PER_JOB, build_export, describe_formats, find_quality
 from .jobs import DiskLow, JobManager, QueueFull, RateLimited, describe_duration, download_name, track_stem
@@ -26,11 +26,13 @@ from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeaders
 from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key
 from .wav_info import WavError, inspect_wav
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024
 BIT_DEPTHS = (0, 16, 24, 32)
+MAX_REFERENCES = 4
+GENRE_ID = re.compile(r"^[a-z0-9-]{0,32}$")
 LOGIN_WINDOW_SEC = 900.0
 LOGIN_BODY_BYTES = 4096
 
@@ -41,7 +43,9 @@ manager = JobManager(settings, media)
 signer = SessionSigner(settings.session_secret, settings.session_seconds) if settings.auth_enabled else None
 login_limiter = SlidingWindow(settings.login_attempts, LOGIN_WINDOW_SEC)
 user_limiter = SlidingWindow(settings.login_attempts * 3, LOGIN_WINDOW_SEC)
+global_login_limiter = SlidingWindow(settings.login_attempts * 40, LOGIN_WINDOW_SEC)
 presets = []
+genres = []
 placeholder_hash = hash_password(secrets.token_urlsafe(16)) if settings.auth_enabled else ""
 
 
@@ -50,10 +54,10 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=MAX_PASSWORD_BYTES)
 
 
-async def load_presets():
+async def load_engine_list(flag):
     try:
         process = await asyncio.create_subprocess_exec(
-            str(settings.engine_path), "--list-presets",
+            str(settings.engine_path), flag,
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
@@ -65,7 +69,8 @@ async def load_presets():
 
 @asynccontextmanager
 async def lifespan(_app):
-    presets[:] = await load_presets()
+    presets[:] = await load_engine_list("--list-presets")
+    genres[:] = await load_engine_list("--list-genres")
     await media.detect_preview_codec()
     await manager.start()
     try:
@@ -77,7 +82,7 @@ async def lifespan(_app):
 app = FastAPI(title="Mastered", version=VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     BodySizeLimitMiddleware,
-    max_bytes=settings.max_file_bytes * 2 + BODY_OVERHEAD_BYTES,
+    max_bytes=settings.max_file_bytes * (MAX_REFERENCES + 1) + BODY_OVERHEAD_BYTES,
     path="/api/jobs",
 )
 app.add_middleware(
@@ -199,6 +204,8 @@ def build_engine_arguments(
     dual_mono=False,
     bass_limiter=False,
     transparent=False,
+    strict_peak=False,
+    genre="",
 ):
     arguments = [
         "--target", f"{target_lufs:.3f}",
@@ -237,6 +244,10 @@ def build_engine_arguments(
         arguments += ["--mono-bass", f"{mono_bass_hz:.1f}"]
     if transparent:
         arguments.append("--transparent")
+    if strict_peak:
+        arguments.append("--strict-peak")
+    if genre:
+        arguments += ["--genre", genre]
     return arguments
 
 
@@ -256,6 +267,10 @@ def cookie_options(request):
     return {"httponly": True, "samesite": "lax", "secure": secure_cookie(request), "path": "/"}
 
 
+def session_cookie_name(request):
+    return HOST_COOKIE_NAME if secure_cookie(request) else COOKIE_NAME
+
+
 async def require_job(job_id, request):
     row = await manager.row(job_id) if JOB_ID.match(job_id) else None
     if row is None or row["cancel"] or row["status"] == "uploading":
@@ -270,8 +285,8 @@ async def login(request: Request, body: LoginRequest):
     if signer is None:
         raise HTTPException(404, "Sign-in is not enabled on this server.")
     key = client_of(request.scope)
-    account = body.username.lower()
-    wait = max(login_limiter.retry_after(key), user_limiter.retry_after(account))
+    account = f"{key}|{body.username.lower()}"
+    wait = max(login_limiter.retry_after(key), user_limiter.retry_after(account), global_login_limiter.retry_after("all"))
     if wait > 0:
         raise HTTPException(
             429,
@@ -283,6 +298,7 @@ async def login(request: Request, body: LoginRequest):
     if stored is None or not valid:
         login_limiter.hit(key)
         user_limiter.hit(account)
+        global_login_limiter.hit("all")
         metrics.count("logins", {"result": "failed"})
         raise HTTPException(401, "Incorrect username or password.")
     login_limiter.clear(key)
@@ -290,7 +306,7 @@ async def login(request: Request, body: LoginRequest):
     metrics.count("logins", {"result": "ok"})
     response = JSONResponse({"user": body.username}, headers={"Cache-Control": "no-store"})
     response.set_cookie(
-        COOKIE_NAME, signer.issue(body.username, stored), max_age=settings.session_seconds, **cookie_options(request)
+        session_cookie_name(request), signer.issue(body.username, stored), max_age=settings.session_seconds, **cookie_options(request)
     )
     return response
 
@@ -300,7 +316,10 @@ async def logout(request: Request):
     if signer is not None:
         signer.revoke(session_token(request.scope.get("headers", [])))
     response = Response(status_code=204)
-    response.set_cookie(COOKIE_NAME, "", max_age=0, **cookie_options(request))
+    options = cookie_options(request)
+    response.set_cookie(COOKIE_NAME, "", max_age=0, **options)
+    if options["secure"]:
+        response.set_cookie(HOST_COOKIE_NAME, "", max_age=0, **options)
     return response
 
 
@@ -339,7 +358,7 @@ async def storage_writable():
 
 
 @app.get("/api/ready")
-async def ready():
+async def ready(request: Request):
     try:
         database = bool(manager.store is not None and await asyncio.to_thread(manager.store.check))
     except Exception:
@@ -354,8 +373,11 @@ async def ready():
         "worker": all(not task.done() for task in manager.tasks) and bool(manager.tasks),
     }
     healthy = checks["engine"] and checks["storage"] and checks["database"] and checks["disk"] and checks["worker"]
+    body = {"status": "ok" if healthy else "degraded"}
+    if admin_allowed(request):
+        body["checks"] = checks
     return JSONResponse(
-        {"status": "ok" if healthy else "degraded", "checks": checks},
+        body,
         status_code=200 if healthy else 503,
         headers={"Cache-Control": "no-store"},
     )
@@ -427,14 +449,19 @@ async def public_config():
         "preview": media.preview_codec is not None,
         "authRequired": signer is not None,
         "presets": presets,
+        "genres": genres,
+        "maxReferences": MAX_REFERENCES,
     }
 
 
 @app.post("/api/jobs", status_code=202)
 async def create_job(
     request: Request,
-    reference: UploadFile = File(...),
     track: UploadFile = File(...),
+    reference: UploadFile | None = File(None),
+    extra_references: list[UploadFile] | None = File(None),
+    genre: str = Form(""),
+    strict_peak: bool = Form(False),
     target_lufs: float = Form(-14.0, ge=-60.0, le=-1.0),
     aggressiveness: float = Form(0.85, ge=0.0, le=1.0),
     ceiling_db: float = Form(-1.0, ge=-12.0, le=0.0),
@@ -458,10 +485,22 @@ async def create_job(
         raise HTTPException(422, "bit_depth must be 0, 16, 24 or 32")
     if 0.0 < mono_bass_hz < 20.0:
         raise HTTPException(422, "mono_bass_hz must be 0 (off) or between 20 and 500")
+    reference_uploads = [upload for upload in [reference, *(extra_references or [])] if upload is not None and upload.filename]
+    if len(reference_uploads) > MAX_REFERENCES:
+        raise HTTPException(422, f"At most {MAX_REFERENCES} reference tracks can be used")
+    genre = genre.strip().lower()
+    if not GENRE_ID.match(genre):
+        raise HTTPException(422, "genre is not valid")
+    if reference_uploads:
+        genre = ""
+    elif not genre:
+        raise HTTPException(422, "Upload at least one reference track or choose a genre target curve")
+    elif genre not in {entry.get("id") for entry in genres}:
+        raise HTTPException(422, "genre is not a known target curve")
     arguments = build_engine_arguments(
         target_lufs, aggressiveness, ceiling_db, bands, bit_depth, precision,
         dynamics, soft_clip, dither, noise_shaping, mid_side, match_width, mono_bass_hz,
-        auto_clip, auto_mono_bass, dual_mono, bass_limiter, transparent,
+        auto_clip, auto_mono_bass, dual_mono, bass_limiter, transparent, strict_peak, genre,
     )
     client = identity(request)
     try:
@@ -476,10 +515,11 @@ async def create_job(
         raise HTTPException(503, "The server is out of storage space. Please try again later.", headers={"Retry-After": "120"}) from None
     directory = manager.job_directory(job_id)
     try:
-        sources = {
-            "reference": await store_upload(reference, directory, "reference"),
-            "track": await store_upload(track, directory, "track"),
-        }
+        sources = {}
+        for index, upload in enumerate(reference_uploads):
+            label = "reference" if index == 0 else f"reference{index + 1}"
+            sources[label] = await store_upload(upload, directory, label)
+        sources["track"] = await store_upload(track, directory, "track")
         await manager.set_sources(job_id, sources)
     except BaseException:
         await manager.discard(job_id)
