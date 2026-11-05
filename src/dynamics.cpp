@@ -177,4 +177,97 @@ double SoftClipper::apply(double x) const {
     return x < 0.0 ? -y : y;
 }
 
+namespace {
+
+double besselI0(double x) {
+    double sum = 1.0;
+    double term = 1.0;
+    const double q = x * x * 0.25;
+    for (int k = 1; k < 60; ++k) {
+        term *= q / (static_cast<double>(k) * static_cast<double>(k));
+        sum += term;
+        if (term < sum * 1e-17) {
+            break;
+        }
+    }
+    return sum;
+}
+
+}
+
+OversampledClipper::OversampledClipper(double ceilingLinear, double kneeDb, size_t channels)
+    : clipper_(ceilingLinear, kneeDb), gate_(clipper_.threshold() * 0.6), channels_(channels) {
+    constexpr double kBeta = 8.0;
+    const double centre = static_cast<double>(kLength - 1) / 2.0;
+    double sum = 0.0;
+    for (size_t n = 0; n < kLength; ++n) {
+        const double offset = static_cast<double>(n) - centre;
+        const double x = offset / static_cast<double>(kFactor);
+        const double sinc = std::fabs(x) < 1e-12 ? 1.0 : std::sin(kPi * x) / (kPi * x);
+        const double r = offset / centre;
+        const double window = besselI0(kBeta * std::sqrt(std::max(0.0, 1.0 - r * r))) / besselI0(kBeta);
+        filter_[n] = sinc * window;
+        sum += filter_[n];
+    }
+    for (double& v : filter_) {
+        v /= sum;
+    }
+    for (size_t p = 0; p < kFactor; ++p) {
+        for (size_t m = 0; m <= kTaps; ++m) {
+            const size_t index = kFactor * m + p;
+            interpolation_[p][m] = index < kLength ? static_cast<double>(kFactor) * filter_[index] : 0.0;
+        }
+    }
+}
+
+double OversampledClipper::upsampled(const ChannelState& state, uint64_t time, size_t phase) const {
+    double acc = 0.0;
+    for (size_t m = 0; m <= kTaps; ++m) {
+        acc += interpolation_[phase][m] * state.input[(time - m) & (kInputRing - 1)];
+    }
+    return acc;
+}
+
+void OversampledClipper::store(ChannelState& state, uint64_t time) const {
+    for (size_t p = 0; p < kFactor; ++p) {
+        state.clipped[(kFactor * time + p) & (kClipRing - 1)] = clipper_.apply(upsampled(state, time, p));
+    }
+}
+
+void OversampledClipper::process(AudioBlock& block, size_t frames) {
+    for (size_t ch = 0; ch < channels_.size(); ++ch) {
+        ChannelState& state = channels_[ch];
+        double* data = block[ch].data();
+        for (size_t i = 0; i < frames; ++i) {
+            const uint64_t time = position_ + i;
+            const double x = data[i];
+            state.input[time & (kInputRing - 1)] = x;
+            if (std::fabs(x) > gate_) {
+                state.hold = kHold;
+                if (!state.active) {
+                    for (uint64_t t = time - kLatency; t < time; ++t) {
+                        store(state, t);
+                    }
+                    state.active = true;
+                }
+            }
+            if (state.active) {
+                store(state, time);
+                const uint64_t k = kFactor * time;
+                double acc = 0.0;
+                for (size_t n = 0; n < kLength; ++n) {
+                    acc += filter_[n] * state.clipped[(k - n) & (kClipRing - 1)];
+                }
+                data[i] = acc;
+                if (--state.hold == 0) {
+                    state.active = false;
+                }
+            } else {
+                data[i] = state.input[(time - kLatency) & (kInputRing - 1)];
+            }
+        }
+    }
+    position_ += frames;
+}
+
 }
