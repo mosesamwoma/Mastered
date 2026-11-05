@@ -19,7 +19,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     APP_ENV=production \
     WORK_DIR=/data
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
     && mkdir /data \
