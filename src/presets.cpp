@@ -1,5 +1,6 @@
 #include "presets.h"
 
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 
@@ -18,10 +19,35 @@ const Preset kPresets[] = {
     {"podcast", "Podcast", "Spoken word", -16.0, -1.0, "-16 LUFS is common for stereo podcasts"},
     {"ebu-r128", "EBU R128 broadcast", "Broadcast", -23.0, -1.0, "European broadcast, -23 LUFS"},
     {"atsc-a85", "ATSC A/85 broadcast", "Broadcast", -24.0, -2.0, "North American broadcast, -24 LKFS"},
+    {"codec-safe", "Codec-safe (MP3 / AAC delivery)", "Other", -14.0, -2.0, "-2 dBTP leaves room for the overs that lossy encoding adds"},
     {"loud", "Loud master (CD, club)", "Other", -9.0, -0.3, "Dense and loud; streaming services will turn it down"},
 };
 
 constexpr size_t kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
+
+struct Bump {
+    double centreHz;
+    double gainDb;
+    double widthOctaves;
+};
+
+struct GenreCurve {
+    Genre info;
+    double slopeDbPerOctave;
+    Bump bumps[3];
+};
+
+const GenreCurve kGenres[] = {
+    {{"balanced", "Balanced", "A neutral, modern long-term spectrum"}, 4.5, {{0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}}},
+    {{"bright-pop", "Bright pop", "Open top end and clear vocals"}, 3.9, {{9000.0, 1.5, 1.5}, {3000.0, 1.0, 1.2}, {0.0, 0.0, 1.0}}},
+    {{"warm", "Warm and smooth", "Softer top, fuller low mids"}, 5.3, {{250.0, 1.0, 1.5}, {0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}}},
+    {{"hiphop-edm", "Hip-hop and electronic", "Strong sub and bass with a lively top"}, 4.6, {{60.0, 4.0, 1.2}, {10000.0, 1.5, 1.5}, {0.0, 0.0, 1.0}}},
+    {{"rock", "Rock and guitar music", "Forward upper mids with solid low end"}, 4.2, {{3000.0, 1.5, 1.2}, {100.0, 1.0, 1.0}, {0.0, 0.0, 1.0}}},
+    {{"acoustic", "Acoustic and folk", "Natural balance with a little air"}, 4.4, {{50.0, -2.0, 1.5}, {5000.0, 1.0, 1.5}, {0.0, 0.0, 1.0}}},
+    {{"spoken", "Spoken word and podcast", "Clear speech, controlled low end"}, 5.5, {{3000.0, 2.0, 1.5}, {60.0, -4.0, 1.5}, {0.0, 0.0, 1.0}}},
+};
+
+constexpr size_t kGenreCount = sizeof(kGenres) / sizeof(kGenres[0]);
 
 std::string escape(const std::string& text) {
     std::string out;
@@ -64,6 +90,58 @@ std::string presetsJson() {
     }
     out << "]";
     return out.str();
+}
+
+size_t genreCount() {
+    return kGenreCount;
+}
+
+const Genre& genreAt(size_t index) {
+    return kGenres[index < kGenreCount ? index : kGenreCount - 1].info;
+}
+
+const Genre* findGenre(const std::string& id) {
+    for (const GenreCurve& genre : kGenres) {
+        if (id == genre.info.id) {
+            return &genre.info;
+        }
+    }
+    return nullptr;
+}
+
+std::string genresJson() {
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < kGenreCount; ++i) {
+        const Genre& g = kGenres[i].info;
+        out << (i > 0 ? ", " : "") << "{\"id\": \"" << escape(g.id) << "\", \"name\": \"" << escape(g.name) << "\", \"note\": \""
+            << escape(g.note) << "\"}";
+    }
+    out << "]";
+    return out.str();
+}
+
+std::vector<double> genreLevelsDb(const std::string& id, const std::vector<double>& centresHz) {
+    std::vector<double> levels(centresHz.size(), 0.0);
+    for (const GenreCurve& genre : kGenres) {
+        if (id != genre.info.id) {
+            continue;
+        }
+        for (size_t i = 0; i < centresHz.size(); ++i) {
+            const double octaves = std::log2(centresHz[i] / 1000.0);
+            double value = -genre.slopeDbPerOctave * octaves;
+            for (const Bump& bump : genre.bumps) {
+                if (bump.gainDb == 0.0) {
+                    continue;
+                }
+                const double distance = std::log2(centresHz[i] / bump.centreHz) / bump.widthOctaves;
+                value += bump.gainDb * std::exp(-0.5 * distance * distance);
+            }
+            levels[i] = value;
+        }
+        break;
+    }
+    return levels;
 }
 
 }
