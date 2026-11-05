@@ -20,7 +20,8 @@ void printUsage() {
     std::cout <<
         "Mastered " << mastered::kVersion << " - reference-based audio mastering\n\n"
         "Usage:\n"
-        "  mastered_cli <reference.wav> <input.wav> [options]\n\n"
+        "  mastered_cli <reference.wav> <input.wav> [options]\n"
+        "  mastered_cli <input.wav> --genre NAME [options]     (no reference track)\n\n"
         "Options:\n"
         "  --reference PATH      Additional reference track (repeatable)\n"
         "  --output PATH         Mastered WAV path (default: <input>_mastered.wav)\n"
@@ -29,6 +30,12 @@ void printUsage() {
         "  --preset NAME         Loudness target and ceiling for a service (see --list-presets);\n"
         "                        --target and --ceiling still override it\n"
         "  --list-presets        Print the presets as JSON and exit\n"
+        "  --genre NAME          Match a built-in target curve instead of a reference track\n"
+        "  --list-genres         Print the genre target curves as JSON and exit\n"
+        "  --strict-peak         Check and limit true peak with the strict 8x detector\n"
+        "                        (default is the 4x detector that DAW meters use)\n"
+        "  --subsonic HZ         High-pass filter below HZ, 10 to 60 (default: 20 only when DC offset is found)\n"
+        "  --no-auto-subsonic    Do not remove DC offset automatically\n"
         "  --mono-bass HZ        Make everything below HZ mono, 20 to 500 (default off)\n"
         "  --target LUFS         Loudness target, -60 to -1 (default -14)\n"
         "  --aggressive N        EQ strength, 0 to 1 (default 0.85)\n"
@@ -51,7 +58,7 @@ void printUsage() {
         "  --no-auto-mono-bass   Do not make the bass mono automatically when it is out of phase\n"
         "  --dual-mono           Measure single-channel files as dual mono (+3 LU)\n"
         "  --measure PATH        Measure a WAV file (loudness and true peak) as JSON and exit\n"
-        "  --fast-peak           Use the faster 4x peak detector and skip the ceiling check\n"
+        "  --fast-peak           Skip the true-peak ceiling check after rendering\n"
         "  --lookahead MS        Limiter look-ahead, 0.5 to 20 (default 5)\n"
         "  --release MS          Limiter release, 5 to 1000 (default 80)\n"
         "  --fft N               FFT size, power of two 1024 to 65536 (default 8192)\n"
@@ -132,6 +139,10 @@ int run(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--list-presets") {
             std::cout << mastered::presetsJson() << "\n";
+            return 0;
+        }
+        if (arg == "--list-genres") {
+            std::cout << mastered::genresJson() << "\n";
             return 0;
         }
         if (arg == "--preset") {
@@ -216,6 +227,16 @@ int run(int argc, char** argv) {
             measurePath = value();
         } else if (arg == "--fast-peak") {
             config.accuratePeak = false;
+        } else if (arg == "--strict-peak") {
+            config.strictPeak = true;
+        } else if (arg == "--genre") {
+            config.genre = value();
+        } else if (arg == "--list-genres") {
+            continue;
+        } else if (arg == "--subsonic") {
+            config.subsonicHz = parseNumber(arg, value());
+        } else if (arg == "--no-auto-subsonic") {
+            config.autoSubsonic = false;
         } else if (arg == "--lookahead") {
             config.limiterLookaheadMs = parseNumber(arg, value());
         } else if (arg == "--release") {
@@ -248,18 +269,21 @@ int run(int argc, char** argv) {
     }
     if (!measurePath.empty()) {
         const mastered::Measurements measured =
-            mastered::MasteringEngine::measureFile(measurePath, config.dualMono, config.accuratePeak);
+            mastered::MasteringEngine::measureFile(measurePath, config.dualMono, config.strictPeak);
         std::cout << "{\"measurements\": " << mastered::MasteringEngine::measurementsJsonText(measured) << "}\n";
         return 0;
     }
-    if (positional.size() != 2) {
+    std::string inputPath;
+    std::vector<std::string> references;
+    if (positional.size() == 2) {
+        references.push_back(positional[0]);
+        inputPath = positional[1];
+    } else if (positional.size() == 1 && !config.genre.empty()) {
+        inputPath = positional[0];
+    } else {
         printUsage();
         return 2;
     }
-
-    const std::string referencePath = positional[0];
-    const std::string inputPath = positional[1];
-    std::vector<std::string> references{referencePath};
     references.insert(references.end(), extraReferences.begin(), extraReferences.end());
 
     std::filesystem::path output;
@@ -284,7 +308,9 @@ int run(int argc, char** argv) {
 
     std::cout << "\nResults\n";
     printMeasurements("Input", result.analysis.input);
-    printMeasurements("Reference", result.analysis.reference);
+    if (result.analysis.referenceCount > 0) {
+        printMeasurements("Reference", result.analysis.reference);
+    }
     printMeasurements("Output", result.output);
     if (result.matchMeasured) {
         std::cout << "  Tonal match to reference " << std::fixed << std::setprecision(2) << result.matchBeforeDb << " dB -> "
