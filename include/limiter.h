@@ -20,7 +20,7 @@ struct LimiterStats {
 
 class TruePeakLimiter {
 public:
-    TruePeakLimiter(double sampleRate, size_t channels, double ceilingDb, double lookaheadMs, double releaseMs);
+    TruePeakLimiter(double sampleRate, size_t channels, double ceilingDb, double lookaheadMs, double releaseMs, const OversamplingKernel& kernel);
 
     size_t latency() const { return latency_; }
     void process(AudioBlock& block, size_t frames);
@@ -34,7 +34,9 @@ private:
     size_t lookahead_;
     size_t latency_;
     double ceiling_;
-    double fastReleaseCoefficient_;
+    static constexpr size_t kDepthSteps = 9;
+    std::array<double, kDepthSteps> fastReleaseByDepth_{};
+    std::array<double, kDepthSteps - 1> depthThreshold_{};
     double slowReleaseCoefficient_;
     double slowAttackCoefficient_;
     std::vector<std::vector<double>> history_;
