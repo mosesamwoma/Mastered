@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import signal
 import unicodedata
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ ALLOWED_CONTAINERS = {
     "mp3", "flac", "ogg", "mov", "mp4", "m4a", "3gp", "3g2", "mj2",
     "aac", "wav", "w64", "aiff", "matroska", "webm",
 }
+FORMAT_WHITELIST = "mp3,flac,ogg,mov,aac,wav,w64,aiff,matroska,webm"
+PRLIMIT = shutil.which("prlimit")
 SOURCE_EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac")
 PROBE_TIMEOUT_SEC = 20
 PREVIEW_TIMEOUT_SEC = 180
@@ -76,18 +79,49 @@ def clean_tag(value):
     return text.strip()[:TAG_LIMIT]
 
 
-def make_limits(memory_bytes, cpu_seconds):
-    if resource is None:
-        return None
+@dataclass(frozen=True)
+class Limits:
+    memory: int = 0
+    cpu: int = 0
+    file_size: int = 0
+    open_files: int = 256
 
-    def apply():
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        if cpu_seconds:
-            resource.setrlimit(resource.RLIMIT_CPU, (int(cpu_seconds), int(cpu_seconds) + 5))
-        if memory_bytes:
-            resource.setrlimit(resource.RLIMIT_AS, (int(memory_bytes), int(memory_bytes)))
 
-    return apply
+def make_limits(memory_bytes, cpu_seconds, file_bytes=0, open_files=256):
+    return Limits(int(memory_bytes or 0), int(cpu_seconds or 0), int(file_bytes or 0), int(open_files or 0))
+
+
+def limit_prefix(limits):
+    if limits is None or PRLIMIT is None:
+        return []
+    prefix = [PRLIMIT, "--core=0"]
+    if limits.cpu:
+        prefix.append(f"--cpu={limits.cpu}:{limits.cpu + 5}")
+    if limits.memory:
+        prefix.append(f"--as={limits.memory}")
+    if limits.file_size:
+        prefix.append(f"--fsize={limits.file_size}")
+    if limits.open_files:
+        prefix.append(f"--nofile={limits.open_files}")
+    prefix.append("--")
+    return prefix
+
+
+def apply_limits_to(pid, limits):
+    if limits is None or resource is None or not hasattr(resource, "prlimit"):
+        return
+    try:
+        resource.prlimit(pid, resource.RLIMIT_CORE, (0, 0))
+        if limits.cpu:
+            resource.prlimit(pid, resource.RLIMIT_CPU, (limits.cpu, limits.cpu + 5))
+        if limits.memory:
+            resource.prlimit(pid, resource.RLIMIT_AS, (limits.memory, limits.memory))
+        if limits.file_size:
+            resource.prlimit(pid, resource.RLIMIT_FSIZE, (limits.file_size, limits.file_size))
+        if limits.open_files:
+            resource.prlimit(pid, resource.RLIMIT_NOFILE, (limits.open_files, limits.open_files))
+    except (OSError, ValueError, ProcessLookupError):
+        pass
 
 
 def kill_group(process):
@@ -103,14 +137,17 @@ def kill_group(process):
 
 
 async def run_process(arguments, timeout, on_start=None, limits=None):
+    prefix = limit_prefix(limits)
     process = await asyncio.create_subprocess_exec(
+        *prefix,
         *arguments,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
-        preexec_fn=limits,
     )
+    if limits is not None and not prefix:
+        apply_limits_to(process.pid, limits)
     if on_start is not None:
         on_start(process)
     try:
@@ -170,7 +207,7 @@ class MediaTools:
 
     async def probe(self, path: Path, on_start=None):
         arguments = [
-            str(self.ffprobe), "-v", "error", "-protocol_whitelist", "file",
+            str(self.ffprobe), "-v", "error", "-protocol_whitelist", "file", "-format_whitelist", FORMAT_WHITELIST,
             "-select_streams", "a:0",
             "-show_entries",
             "stream=codec_name,channels,sample_rate,bits_per_raw_sample,duration:format=format_name,duration:format_tags=title,artist,album",
@@ -214,11 +251,11 @@ class MediaTools:
         tags = {name: clean_tag(lowered[name]) for name in TAG_FIELDS if lowered.get(name) and clean_tag(lowered[name])}
         return MediaInfo(str(stream.get("codec_name") or ""), channels, sample_rate, bits, duration, tags)
 
-    async def convert_to_wav(self, source: Path, destination: Path, info: MediaInfo, max_duration, timeout, on_start=None):
+    async def convert_to_wav(self, source: Path, destination: Path, info: MediaInfo, max_duration, timeout, on_start=None, max_decoded_bytes=0):
         pcm = "pcm_s16le" if 0 < info.bits <= 16 else "pcm_s24le"
         arguments = [
             str(self.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-protocol_whitelist", "file", "-i", str(source),
+            "-protocol_whitelist", "file", "-format_whitelist", FORMAT_WHITELIST, "-i", str(source),
             "-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1", "-t", f"{max_duration + 1:.3f}",
         ]
         if info.channels > MAX_CHANNELS:
@@ -227,7 +264,8 @@ class MediaTools:
             arguments += ["-ar", "44100"]
         arguments += ["-c:a", pcm, "-f", "wav", "-y", str(destination)]
         try:
-            code, _, _ = await run_process(arguments, timeout, on_start, make_limits(0, timeout * 2))
+            limit = max_decoded_bytes + (1 << 20) if max_decoded_bytes else 0
+            code, _, _ = await run_process(arguments, timeout, on_start, make_limits(0, timeout * 2, limit))
         except OSError:
             raise MediaError("the audio tools could not be started") from None
         if code != 0 or not destination.is_file():
