@@ -44,6 +44,9 @@ bool setOption(mastered::MasteringConfig& c, const std::string& key, double v) {
     else if (key == "bass_limiter") c.bassLimiter = flag;
     else if (key == "soft_clip_knee_db") c.softClipKneeDb = v;
     else if (key == "accurate_peak") c.accuratePeak = flag;
+    else if (key == "strict_peak") c.strictPeak = flag;
+    else if (key == "subsonic_hz") c.subsonicHz = v;
+    else if (key == "auto_subsonic") c.autoSubsonic = flag;
     else if (key == "lookahead_ms") c.limiterLookaheadMs = v;
     else if (key == "release_ms") c.limiterReleaseMs = v;
     else if (key == "bit_depth") c.bitDepth = v < 0.0 ? 0 : static_cast<uint16_t>(v);
