@@ -21,6 +21,8 @@ struct ChainPlan {
     double monoBassHz = 0.0;
     bool softClip = false;
     double softClipKneeDb = 3.0;
+    bool strictPeak = false;
+    double subsonicHz = 0.0;
     bool limiterEnabled = true;
     double ceilingDb = -1.0;
     double lookaheadMs = 5.0;
@@ -51,8 +53,6 @@ private:
     struct BassSplit {
         Biquad lowA;
         Biquad lowB;
-        Biquad highA;
-        Biquad highB;
     };
 
     ChainPlan plan_;
@@ -60,19 +60,22 @@ private:
     ChainStage stage_;
     bool useMidSide_;
     double gainLinear_;
+    std::vector<Biquad> subsonic_;
     std::vector<std::vector<Biquad>> channelFilters_;
     std::vector<Biquad> midFilters_;
     std::vector<Biquad> sideFilters_;
     std::vector<Biquad> sideHighPass_;
     std::unique_ptr<MultibandCompressor> compressor_;
-    std::unique_ptr<SoftClipper> clipper_;
+    std::unique_ptr<OversampledClipper> clipper_;
     std::unique_ptr<TruePeakLimiter> limiter_;
     std::unique_ptr<TruePeakLimiter> bassLimiter_;
     std::vector<BassSplit> bassSplit_;
-    std::vector<std::vector<double>> bassDelay_;
+    std::vector<std::vector<double>> bassDryDelay_;
+    std::vector<std::vector<double>> bassReferenceDelay_;
     size_t bassDelayPosition_ = 0;
     AudioBlock bassLow_;
-    AudioBlock bassHigh_;
+    AudioBlock bassDry_;
+    AudioBlock bassReference_;
     std::vector<double> mid_;
     std::vector<double> side_;
 };
