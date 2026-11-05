@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace mastered {
@@ -105,10 +106,46 @@ public:
     SoftClipper(double ceilingLinear, double kneeDb);
 
     double apply(double x) const;
+    double threshold() const { return threshold_; }
 
 private:
     double ceiling_;
     double threshold_;
+};
+
+class OversampledClipper {
+public:
+    static constexpr size_t kLatency = 16;
+
+    OversampledClipper(double ceilingLinear, double kneeDb, size_t channels);
+
+    size_t latency() const { return kLatency; }
+    void process(AudioBlock& block, size_t frames);
+
+private:
+    static constexpr size_t kFactor = 4;
+    static constexpr size_t kTaps = 16;
+    static constexpr size_t kLength = kFactor * kTaps + 1;
+    static constexpr size_t kInputRing = 64;
+    static constexpr size_t kClipRing = 128;
+    static constexpr size_t kHold = 48;
+
+    struct ChannelState {
+        std::array<double, kInputRing> input{};
+        std::array<double, kClipRing> clipped{};
+        size_t hold = 0;
+        bool active = false;
+    };
+
+    double upsampled(const ChannelState& state, uint64_t time, size_t phase) const;
+    void store(ChannelState& state, uint64_t time) const;
+
+    SoftClipper clipper_;
+    double gate_;
+    std::array<double, kLength> filter_{};
+    std::array<std::array<double, kTaps + 1>, kFactor> interpolation_{};
+    std::vector<ChannelState> channels_;
+    uint64_t position_ = 64;
 };
 
 }
