@@ -42,7 +42,12 @@ export function conversionNotes(report) {
     return [];
   }
   const lines = [];
-  [['reference', 'Reference'], ['track', 'Your track']].forEach(([key, label]) => {
+  const keys = Object.keys(conversion)
+    .filter((key) => key !== 'track')
+    .sort()
+    .concat(['track']);
+  keys.forEach((key) => {
+    const label = key === 'track' ? 'Your track' : key === 'reference' ? 'Reference' : 'Reference ' + key.slice('reference'.length);
     (Array.isArray(conversion[key]) ? conversion[key] : []).forEach((text) => lines.push(label + ': ' + text + '.'));
   });
   return lines;
