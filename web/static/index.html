@@ -33,11 +33,11 @@
       <div class="grid two">
         <div class="field">
           <label class="dropzone" id="drop-reference" for="reference">
-            <span class="drop-title">Reference song</span>
+            <span class="drop-title">Reference songs</span>
             <span class="drop-name" id="reference-name">Drop a finished track here or click to choose</span>
-            <span class="drop-hint">A release whose sound you like.</span>
+            <span class="drop-hint">A release whose sound you like. Choose up to four to blend them, or skip this and pick a style below.</span>
           </label>
-          <input id="reference" name="reference" type="file" class="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,audio/*">
+          <input id="reference" name="reference" type="file" class="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,audio/*" multiple>
         </div>
         <div class="field">
           <label class="dropzone" id="drop-track" for="track">
@@ -47,6 +47,13 @@
           </label>
           <input id="track" name="track" type="file" class="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,audio/*" multiple>
         </div>
+      </div>
+      <div class="field">
+        <label for="genre">No reference song? Use a built-in style instead</label>
+        <select id="genre" name="genre">
+          <option value="">Use my reference songs</option>
+        </select>
+        <small id="genre-note">A general guide, so the tone is matched more gently than with a real reference. Dynamics are not matched.</small>
       </div>
       <p id="formats-hint" class="hint"></p>
       <p id="ready-hint" class="hint" role="status"></p>
@@ -145,6 +152,7 @@
         <label><input type="checkbox" id="auto-mono-bass" checked> Make the bass mono automatically when it is out of phase</label>
         <label><input type="checkbox" id="dual-mono"> Measure mono files as dual mono (+3 LU)</label>
         <label><input type="checkbox" id="transparent"> Transparent mode: small EQ moves, no compression, no width change</label>
+        <label><input type="checkbox" id="strict-peak"> Strict peak check (8x detector, a little more cautious than DAW meters)</label>
         <label><input type="checkbox" id="bass-limiter"> Limit the bass separately (experimental)</label>
       </div>
     </details>
