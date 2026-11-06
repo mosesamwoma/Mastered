@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(MasteredEngine VERSION 2.5.0 LANGUAGES CXX)
+project(MasteredEngine VERSION 2.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,6 +26,7 @@ set(MASTERED_SOURCES
     src/eq_fitter.cpp
     src/fft.cpp
     src/limiter.cpp
+    src/linear_phase.cpp
     src/loudness.cpp
     src/mastering_engine.cpp
     src/presets.cpp
