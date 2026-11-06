@@ -34,6 +34,8 @@ bool setOption(mastered::MasteringConfig& c, const std::string& key, double v) {
     else if (key == "match_width") c.matchWidth = flag;
     else if (key == "dynamics") c.dynamics = flag;
     else if (key == "dynamics_match") c.dynamicsMatch = flag;
+    else if (key == "dynamics_bands") c.dynamicsBands = v < 0.0 ? 0 : static_cast<size_t>(v);
+    else if (key == "adaptive_crossovers") c.adaptiveCrossovers = flag;
     else if (key == "dynamics_ratio") c.dynamicsRatio = v;
     else if (key == "dynamics_threshold_offset_db") c.dynamicsThresholdOffsetDb = v;
     else if (key == "mono_bass_hz") c.monoBassHz = v;
@@ -45,6 +47,8 @@ bool setOption(mastered::MasteringConfig& c, const std::string& key, double v) {
     else if (key == "soft_clip_knee_db") c.softClipKneeDb = v;
     else if (key == "accurate_peak") c.accuratePeak = flag;
     else if (key == "strict_peak") c.strictPeak = flag;
+    else if (key == "linear_phase") c.linearPhase = flag;
+    else if (key == "deess") c.deess = flag;
     else if (key == "subsonic_hz") c.subsonicHz = v;
     else if (key == "auto_subsonic") c.autoSubsonic = flag;
     else if (key == "lookahead_ms") c.limiterLookaheadMs = v;
