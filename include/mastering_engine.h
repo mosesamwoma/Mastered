@@ -29,6 +29,8 @@ struct MasteringConfig {
     bool matchWidth = true;
     bool dynamics = false;
     bool dynamicsMatch = true;
+    size_t dynamicsBands = 3;
+    bool adaptiveCrossovers = false;
     double dynamicsRatio = 2.0;
     double dynamicsThresholdOffsetDb = 0.0;
     double monoBassHz = 0.0;
@@ -36,6 +38,8 @@ struct MasteringConfig {
     double softClipKneeDb = 3.0;
     bool accuratePeak = true;
     bool strictPeak = false;
+    bool linearPhase = false;
+    bool deess = false;
     std::string genre;
     double subsonicHz = 0.0;
     bool autoSubsonic = true;
@@ -68,8 +72,9 @@ struct Analysis {
     CurveFit mid;
     CurveFit side;
     double sideGainDb = 0.0;
-    std::array<double, 3> inputSpreadDb{{0.0, 0.0, 0.0}};
-    std::array<double, 3> referenceSpreadDb{{0.0, 0.0, 0.0}};
+    std::vector<double> inputSpreadDb;
+    std::vector<double> referenceSpreadDb;
+    std::vector<double> dynamicsCrossoversHz;
     uint32_t sampleRate = 0;
     uint16_t channels = 0;
     uint64_t frames = 0;
