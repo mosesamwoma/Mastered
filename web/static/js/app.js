@@ -67,7 +67,11 @@ const flagInputs = [
   ['bass_limiter', byId('bass-limiter')],
   ['transparent', byId('transparent')],
   ['strict_peak', byId('strict-peak')],
+  ['linear_phase', byId('linear-phase')],
+  ['deess', byId('deess')],
+  ['adaptive_crossovers', byId('adaptive-crossovers')],
 ];
+const dynamicsBandsSelect = byId('dynamics-bands');
 const planSummary = byId('plan-summary');
 const savedSelect = byId('saved-select');
 const savedName = byId('saved-name');
@@ -332,6 +336,12 @@ function refreshReadyHint() {
   }
 }
 
+function syncDynamicsControls() {
+  const on = byId('dynamics').checked;
+  dynamicsBandsSelect.disabled = !on;
+  byId('adaptive-crossovers').disabled = !on;
+}
+
 function applyStyle(name) {
   const style = STYLES[name];
   if (!style) {
@@ -340,6 +350,7 @@ function applyStyle(name) {
   aggressivenessInput.value = String(style.strength);
   aggressivenessValue.textContent = style.strength + '%';
   byId('dynamics').checked = style.dynamics;
+  syncDynamicsControls();
   byId('soft-clip').checked = style.softClip;
   byId('transparent').checked = style.transparent === true;
   styleNote.textContent = style.note;
@@ -461,6 +472,7 @@ function buildFormData(trackFile) {
   data.append('bit_depth', bitDepthSelect.value);
   data.append('precision', precisionSelect.value);
   data.append('mono_bass_hz', monoBassCheck.checked ? monoBassHz.value : '0');
+  data.append('dynamics_bands', dynamicsBandsSelect.value);
   flagInputs.forEach(([name, input]) => {
     data.append(name, input.checked ? 'true' : 'false');
   });
@@ -495,6 +507,7 @@ function collectSettings() {
     precision: precisionSelect.value,
     monoBass: monoBassCheck.checked,
     monoBassHz: monoBassHz.value,
+    dynamicsBands: dynamicsBandsSelect.value,
     flags: {},
   };
   flagInputs.forEach(([name, input]) => {
@@ -522,11 +535,15 @@ function applySettings(values) {
   }
   monoBassCheck.checked = values.monoBass === true;
   setValue(monoBassHz, values.monoBassHz);
+  if (['3', '4', '5'].includes(String(values.dynamicsBands))) {
+    dynamicsBandsSelect.value = String(values.dynamicsBands);
+  }
   flagInputs.forEach(([name, input]) => {
     if (values.flags && typeof values.flags[name] === 'boolean') {
       input.checked = values.flags[name];
     }
   });
+  syncDynamicsControls();
   clearStyleSelection();
   refreshPresetChips();
   updatePlan();
@@ -1917,6 +1934,8 @@ async function init() {
     clearStyleSelection();
   });
   byId('dynamics').addEventListener('change', clearStyleSelection);
+  byId('dynamics').addEventListener('change', syncDynamicsControls);
+  syncDynamicsControls();
   byId('soft-clip').addEventListener('change', clearStyleSelection);
   byId('transparent').addEventListener('change', clearStyleSelection);
   styleButtons.forEach((button) => button.addEventListener('click', () => applyStyle(button.dataset.style)));
