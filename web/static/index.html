@@ -93,6 +93,13 @@
         <label><input type="checkbox" id="mid-side" checked> Mid/side EQ</label>
         <label><input type="checkbox" id="match-width" checked> Match stereo width</label>
         <label><input type="checkbox" id="dynamics"> Match dynamics (multiband compression)</label>
+        <label class="with-input">Compressor bands
+          <select id="dynamics-bands" aria-label="Number of compressor bands">
+            <option value="3" selected>3 (default)</option>
+            <option value="4">4</option>
+            <option value="5">5</option>
+          </select></label>
+        <label><input type="checkbox" id="adaptive-crossovers"> Move the compressor crossovers to nearby spectral valleys</label>
         <label><input type="checkbox" id="soft-clip"> Soft clipper before the limiter</label>
         <label class="with-input"><input type="checkbox" id="mono-bass"> Mono bass below
           <input id="mono-bass-hz" type="number" min="20" max="500" step="10" value="120" aria-label="Mono bass frequency in hertz"> Hz</label>
@@ -152,6 +159,8 @@
         <label><input type="checkbox" id="auto-mono-bass" checked> Make the bass mono automatically when it is out of phase</label>
         <label><input type="checkbox" id="dual-mono"> Measure mono files as dual mono (+3 LU)</label>
         <label><input type="checkbox" id="transparent"> Transparent mode: small EQ moves, no compression, no width change</label>
+        <label><input type="checkbox" id="linear-phase"> Linear-phase EQ (no phase shift, but adds pre-ringing and is slower)</label>
+        <label><input type="checkbox" id="deess"> De-esser (tames sharp bursts of 4.5 to 9.5 kHz, best for vocals and speech)</label>
         <label><input type="checkbox" id="strict-peak"> Strict peak check (8x detector, a little more cautious than DAW meters)</label>
         <label><input type="checkbox" id="bass-limiter"> Limit the bass separately (experimental)</label>
       </div>
