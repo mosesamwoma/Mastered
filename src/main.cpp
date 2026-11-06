@@ -30,8 +30,12 @@ void printUsage() {
         "  --preset NAME         Loudness target and ceiling for a service (see --list-presets);\n"
         "                        --target and --ceiling still override it\n"
         "  --list-presets        Print the presets as JSON and exit\n"
+        "  --dynamics-bands N    Number of compressor bands, 2 to 5 (default 3; implies --dynamics)\n"
+        "  --adaptive-crossovers Move the compressor crossovers to nearby spectral valleys\n"
         "  --genre NAME          Match a built-in target curve instead of a reference track\n"
         "  --list-genres         Print the genre target curves as JSON and exit\n"
+        "  --deess               Reduce harsh sibilance (only acts when the track has it)\n"
+        "  --linear-phase        Use a linear-phase EQ (no phase shift, adds pre-ringing)\n"
         "  --strict-peak         Check and limit true peak with the strict 8x detector\n"
         "                        (default is the 4x detector that DAW meters use)\n"
         "  --subsonic HZ         High-pass filter below HZ, 10 to 60 (default: 20 only when DC offset is found)\n"
@@ -227,6 +231,15 @@ int run(int argc, char** argv) {
             measurePath = value();
         } else if (arg == "--fast-peak") {
             config.accuratePeak = false;
+        } else if (arg == "--dynamics-bands") {
+            config.dynamicsBands = static_cast<size_t>(parseNumber(arg, value()));
+            config.dynamics = true;
+        } else if (arg == "--adaptive-crossovers") {
+            config.adaptiveCrossovers = true;
+        } else if (arg == "--deess") {
+            config.deess = true;
+        } else if (arg == "--linear-phase") {
+            config.linearPhase = true;
         } else if (arg == "--strict-peak") {
             config.strictPeak = true;
         } else if (arg == "--genre") {
