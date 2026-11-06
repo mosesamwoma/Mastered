@@ -32,6 +32,7 @@ constexpr double kGenreAggressivenessScale = 0.6;
 constexpr double kGenreMaxBoostDb = 4.0;
 constexpr double kGenreMaxCutDb = 5.0;
 constexpr double kAutoSubsonicHz = 20.0;
+constexpr double kDeEsserMinSpreadDb = 6.0;
 constexpr double kAutoMonoBassHz = 120.0;
 constexpr double kHeavyAverageReductionDb = 2.0;
 constexpr double kHeavyMaxReductionDb = 8.0;
@@ -53,7 +54,6 @@ struct FileScan {
     uint64_t frames = 0;
     AverageSpectrum spectrum;
     Measurements measurements;
-    std::array<BandStatistics, 3> bandStats;
     Waveform waveform;
 };
 
@@ -94,6 +94,9 @@ void validateConfig(const MasteringConfig& c) {
     if (c.bitDepth != 0 && c.bitDepth != 16 && c.bitDepth != 24 && c.bitDepth != 32) {
         throw MasteredError("Configuration value out of range: bitDepth must be 0, 16, 24 or 32");
     }
+    if (c.dynamicsBands < 2 || c.dynamicsBands > kMaxDynamicsBands) {
+        throw MasteredError("Configuration value out of range: dynamicsBands must be between 2 and 5");
+    }
     if (!c.genre.empty() && findGenre(c.genre) == nullptr) {
         throw MasteredError("Configuration value out of range: genre is not a known target curve");
     }
@@ -120,26 +123,80 @@ FileScan scanFile(const std::string& path, size_t fftSize, bool dualMono) {
     scan.frames = reader.frames();
     SpectrumAccumulator spectrum(scan.sampleRate, scan.channels, fftSize);
     Meter meter(scan.sampleRate, scan.channels, PeakMode::Standard, dualMono);
-    BandLevelMeter bands(scan.sampleRate, DynamicsSettings().lowCrossoverHz, DynamicsSettings().highCrossoverHz);
     WaveformBuilder waveform(scan.frames, kWaveformColumns);
     AudioBlock block;
     size_t n;
     while ((n = reader.read(block, kBlockFrames)) > 0) {
         spectrum.push(block, n);
         meter.process(block, n);
-        bands.process(block, n);
         waveform.process(block, n);
     }
     scan.waveform = waveform.finish();
     scan.spectrum = spectrum.finish();
     scan.measurements = meter.finish();
-    scan.bandStats = bands.statistics();
     return scan;
 }
 
-std::array<BandStatistics, 3> measureDynamics(const std::string& input, const DynamicsSettings& settings) {
+std::vector<BandStatistics> measureBands(const std::string& path, const std::vector<double>& crossovers) {
+    WavReader reader(path);
+    BandLevelMeter meter(reader.sampleRate(), crossovers);
+    AudioBlock block;
+    size_t n;
+    while ((n = reader.read(block, kBlockFrames)) > 0) {
+        meter.process(block, n);
+    }
+    return meter.statistics();
+}
+
+BandStatistics measureSibilance(const std::string& path, double lowHz, double highHz) {
+    WavReader reader(path);
+    SibilanceMeter meter(reader.sampleRate(), lowHz, highHz);
+    AudioBlock block;
+    size_t n;
+    while ((n = reader.read(block, kBlockFrames)) > 0) {
+        meter.process(block, n);
+    }
+    return meter.statistics();
+}
+
+std::vector<double> chooseCrossovers(size_t bandCount, const AverageSpectrum& spectrum, double sampleRate, bool adaptive, const std::vector<double>& centres,
+                                     double width) {
+    std::vector<double> crossovers = defaultCrossovers(bandCount, sampleRate);
+    if (!adaptive || centres.size() < 3) {
+        return crossovers;
+    }
+    const std::vector<double> levels = bandLevelsDb(spectrum, false, centres, width);
+    std::vector<double> chosen;
+    for (double nominal : crossovers) {
+        double best = nominal;
+        double bestLevel = 1e9;
+        for (size_t i = 1; i + 1 < centres.size(); ++i) {
+            if (centres[i] < nominal / 1.26 || centres[i] > nominal * 1.26) {
+                continue;
+            }
+            const double smooth = (levels[i - 1] + levels[i] + levels[i + 1]) / 3.0;
+            if (smooth < bestLevel) {
+                bestLevel = smooth;
+                best = centres[i];
+            }
+        }
+        if (!chosen.empty() && best < chosen.back() * 1.6) {
+            best = nominal;
+        }
+        if (!chosen.empty() && best <= chosen.back()) {
+            best = chosen.back() * 1.6;
+        }
+        if (best >= sampleRate * 0.45) {
+            break;
+        }
+        chosen.push_back(best);
+    }
+    return chosen.empty() ? crossovers : chosen;
+}
+
+std::vector<BandStatistics> measureDynamics(const std::string& input, const DynamicsSettings& settings) {
     WavReader reader(input);
-    BandLevelMeter meter(reader.sampleRate(), settings.lowCrossoverHz, settings.highCrossoverHz);
+    BandLevelMeter meter(reader.sampleRate(), settings.crossovers());
     MultibandCompressor compressor(settings, reader.sampleRate(), reader.channels());
     AudioBlock block;
     size_t n;
@@ -320,11 +377,36 @@ Measurements runPre(const std::string& input, const ChainPlan& plan, const std::
     Meter meter(reader.sampleRate(), channels, PeakMode::Standard, dualMono);
     CacheWriter cache(cachePath, channels);
     AudioBlock block;
+    size_t skip = chain.preLatency();
+
+    auto emitBlock = [&](AudioBlock& data, size_t frames) {
+        size_t offset = std::min(skip, frames);
+        skip -= offset;
+        if (offset >= frames) {
+            return;
+        }
+        if (offset > 0) {
+            for (auto& channel : data) {
+                channel.erase(channel.begin(), channel.begin() + static_cast<std::ptrdiff_t>(offset));
+            }
+        }
+        const size_t count = frames - offset;
+        meter.process(data, count);
+        cache.write(data, count);
+    };
+
     size_t n;
     while ((n = reader.read(block, kBlockFrames)) > 0) {
         chain.processPre(block, n);
-        meter.process(block, n);
-        cache.write(block, n);
+        emitBlock(block, n);
+    }
+    size_t pending = chain.preLatency();
+    while (pending > 0) {
+        const size_t count = std::min(pending, kBlockFrames);
+        AudioBlock tail = makeBlock(channels, count);
+        chain.processPre(tail, count);
+        emitBlock(tail, count);
+        pending -= count;
     }
     cache.close();
     return meter.finish();
@@ -756,14 +838,37 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     } else if (config_.dynamics) {
         DynamicsSettings dynamics;
         dynamics.enabled = true;
-        const std::array<double, 3> attack = {15.0, 8.0, 3.0};
-        const std::array<double, 3> release = {120.0, 90.0, 60.0};
+        const std::vector<double> crossovers = chooseCrossovers(config_.dynamicsBands, in.spectrum, in.sampleRate, config_.adaptiveCrossovers, centres, width);
+        dynamics.bandCount = crossovers.size() + 1;
+        for (size_t k = 0; k < crossovers.size(); ++k) {
+            dynamics.crossoversHz[k] = crossovers[k];
+        }
+        analysis.dynamicsCrossoversHz = crossovers;
+        const size_t bandCount = dynamics.bandCount;
+        emit("Measuring band levels", 31.0);
+        const std::vector<BandStatistics> inputBands = measureBands(input, crossovers);
+        std::vector<std::vector<BandStatistics>> referenceBands;
+        for (const std::string& path : references) {
+            referenceBands.push_back(measureBands(path, crossovers));
+        }
+        static const std::array<std::array<double, 5>, 4> kAttack = {{{12.0, 3.0, 0.0, 0.0, 0.0},
+                                                                      {15.0, 8.0, 3.0, 0.0, 0.0},
+                                                                      {15.0, 10.0, 5.0, 3.0, 0.0},
+                                                                      {15.0, 10.0, 8.0, 4.0, 2.5}}};
+        static const std::array<std::array<double, 5>, 4> kRelease = {{{110.0, 60.0, 0.0, 0.0, 0.0},
+                                                                       {120.0, 90.0, 60.0, 0.0, 0.0},
+                                                                       {120.0, 100.0, 80.0, 60.0, 0.0},
+                                                                       {120.0, 100.0, 90.0, 70.0, 50.0}}};
+        const std::array<double, 5>& attack = kAttack[bandCount - 2];
+        const std::array<double, 5>& release = kRelease[bandCount - 2];
+        analysis.inputSpreadDb.assign(bandCount, 0.0);
+        analysis.referenceSpreadDb.assign(bandCount, 0.0);
         bool active = false;
-        for (size_t b = 0; b < 3; ++b) {
-            const double inputSpread = in.bandStats[b].spreadDb();
+        for (size_t b = 0; b < bandCount; ++b) {
+            const double inputSpread = inputBands[b].spreadDb();
             double referenceSpread = 0.0;
-            for (const FileScan& ref : refs) {
-                referenceSpread += ref.bandStats[b].spreadDb() / count;
+            for (const std::vector<BandStatistics>& ref : referenceBands) {
+                referenceSpread += ref[b].spreadDb() / count;
             }
             analysis.inputSpreadDb[b] = inputSpread;
             analysis.referenceSpreadDb[b] = referenceSpread;
@@ -776,7 +881,7 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
                     ratio = std::min(inputSpread / remaining, 6.0);
                 }
             }
-            dynamics.bands[b].thresholdDb = in.bandStats[b].p50Db + config_.dynamicsThresholdOffsetDb;
+            dynamics.bands[b].thresholdDb = inputBands[b].p50Db + config_.dynamicsThresholdOffsetDb;
             dynamics.bands[b].ratio = ratio;
             dynamics.bands[b].kneeDb = 6.0;
             dynamics.bands[b].attackMs = attack[b];
@@ -788,9 +893,9 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         if (active && config_.dynamicsMatch) {
             for (int round = 0; round < 3; ++round) {
                 emit("Refining dynamics", 33.0 + static_cast<double>(round));
-                const std::array<BandStatistics, 3> achieved = measureDynamics(input, dynamics);
+                const std::vector<BandStatistics> achieved = measureDynamics(input, dynamics);
                 bool changed = false;
-                for (size_t b = 0; b < 3; ++b) {
+                for (size_t b = 0; b < bandCount; ++b) {
                     const double inputSpread = analysis.inputSpreadDb[b];
                     const double ratio = dynamics.bands[b].ratio;
                     if (ratio < 1.05 || inputSpread <= 0.5) {
@@ -816,7 +921,7 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
                 }
             }
             active = false;
-            for (size_t b = 0; b < 3; ++b) {
+            for (size_t b = 0; b < bandCount; ++b) {
                 if (dynamics.bands[b].ratio >= 1.05) {
                     active = true;
                 }
@@ -829,6 +934,29 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         analysis.plan.dynamics = dynamics;
     }
 
+    if (config_.deess) {
+        double lowHz = 0.0;
+        double highHz = 0.0;
+        if (!deEsserBand(in.sampleRate, lowHz, highHz)) {
+            analysis.warnings.push_back("The sample rate is too low for the de-esser, so it was skipped");
+        } else {
+            emit("Measuring sibilance", 36.0);
+            const BandStatistics sibilance = measureSibilance(input, lowHz, highHz);
+            const double spread = sibilance.p95Db - sibilance.p50Db;
+            if (spread >= kDeEsserMinSpreadDb) {
+                DeEsserSettings deEsser;
+                deEsser.enabled = true;
+                deEsser.lowHz = lowHz;
+                deEsser.highHz = highHz;
+                deEsser.thresholdDb = sibilance.p50Db + 0.5 * spread;
+                analysis.plan.deEsser = deEsser;
+                analysis.notes.push_back("The de-esser is on: the " + num(lowHz, 0) + " to " + num(highHz, 0) + " Hz band is reduced when it jumps well above its usual level");
+            } else {
+                analysis.notes.push_back("No harsh sibilance was found, so the de-esser was left off");
+            }
+        }
+    }
+
     analysis.plan.softClip = config_.softClip;
     analysis.plan.softClipKneeDb = config_.softClipKneeDb;
     analysis.plan.limiterEnabled = true;
@@ -837,6 +965,7 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
     analysis.plan.releaseMs = config_.limiterReleaseMs;
     analysis.plan.bassLimiter = config_.bassLimiter;
     analysis.plan.strictPeak = config_.strictPeak;
+    analysis.plan.linearPhase = config_.linearPhase;
     if (config_.subsonicHz > 0.0) {
         analysis.plan.subsonicHz = config_.subsonicHz;
     } else if (config_.autoSubsonic && in.measurements.dcOffset > 0.005) {
@@ -1162,7 +1291,7 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result, const Mas
     out << "  \"settings\": {\"targetLufs\": " << num(config.targetLufs, 2) << ", \"ceilingDb\": " << num(config.ceilingDb, 2)
         << ", \"toleranceLu\": " << num(config.loudnessToleranceLu, 3) << ", \"dualMono\": " << (config.dualMono ? "true" : "false")
         << ", \"lookaheadMs\": " << num(config.limiterLookaheadMs, 1) << ", \"releaseMs\": " << num(config.limiterReleaseMs, 0)
-        << ", \"strictPeak\": " << (config.strictPeak ? "true" : "false") << ", \"genre\": " << quote(config.genre) << "},\n";
+        << ", \"strictPeak\": " << (config.strictPeak ? "true" : "false") << ", \"linearPhase\": " << (config.linearPhase ? "true" : "false") << ", \"deess\": " << (config.deess ? "true" : "false") << ", \"genre\": " << quote(config.genre) << "},\n";
     out << "  \"input\": {\"path\": " << quote(result.inputPath) << ", \"sampleRate\": " << a.sampleRate << ", \"channels\": " << a.channels
         << ", \"frames\": " << a.frames << ", \"measurements\": " << measurementsJson(a.input) << "},\n";
     out << "  \"references\": {\"count\": " << a.referenceCount << ", \"measurements\": " << measurementsJson(a.reference) << "},\n";
@@ -1199,9 +1328,11 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result, const Mas
         << ", \"bands\": " << (a.mid.bands.size() + a.side.bands.size()) << "},\n";
     out << "  \"mid\": " << curveJson(a.mid) << ",\n";
     out << "  \"side\": " << curveJson(a.side) << ",\n";
+    out << "  \"deEsser\": {\"enabled\": " << (a.plan.deEsser.enabled ? "true" : "false") << ", \"thresholdDb\": " << num(a.plan.deEsser.thresholdDb, 2)
+        << ", \"ratio\": " << num(a.plan.deEsser.ratio, 1) << ", \"lowHz\": " << num(a.plan.deEsser.lowHz, 0) << ", \"highHz\": " << num(a.plan.deEsser.highHz, 0) << "},\n";
     out << "  \"width\": {\"sideGainDb\": " << num(a.sideGainDb, 2) << ", \"midSide\": " << (a.plan.midSide ? "true" : "false") << "},\n";
     out << "  \"dynamics\": {\"enabled\": " << (a.plan.dynamics.enabled ? "true" : "false") << ", \"bands\": [";
-    for (size_t i = 0; i < a.plan.dynamics.bands.size(); ++i) {
+    for (size_t i = 0; i < a.plan.dynamics.bandCount; ++i) {
         const CompressorBand& b = a.plan.dynamics.bands[i];
         out << (i > 0 ? ", " : "") << "{\"thresholdDb\": " << num(b.thresholdDb, 2) << ", \"ratio\": " << num(b.ratio, 2)
             << ", \"kneeDb\": " << num(b.kneeDb, 1) << ", \"attackMs\": " << num(b.attackMs, 1) << ", \"releaseMs\": " << num(b.releaseMs, 1) << "}";
