@@ -116,7 +116,7 @@ const OversamplingKernel& standardKernel() {
 }
 
 const OversamplingKernel& accurateKernel() {
-    static const OversamplingKernel kernel = buildKernel(8, 64, 5.0);
+    static const OversamplingKernel kernel = buildKernel(8, 96, 7.0);
     return kernel;
 }
 
