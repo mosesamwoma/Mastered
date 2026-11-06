@@ -26,7 +26,7 @@ from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeaders
 from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key
 from .wav_info import WavError, inspect_wav
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024
@@ -206,6 +206,10 @@ def build_engine_arguments(
     transparent=False,
     strict_peak=False,
     genre="",
+    linear_phase=False,
+    deess=False,
+    dynamics_bands=3,
+    adaptive_crossovers=False,
 ):
     arguments = [
         "--target", f"{target_lufs:.3f}",
@@ -222,6 +226,14 @@ def build_engine_arguments(
         arguments += ["--passes", "20", "--tolerance", "0.01"]
     if dynamics:
         arguments.append("--dynamics")
+        if dynamics_bands != 3:
+            arguments += ["--dynamics-bands", str(dynamics_bands)]
+        if adaptive_crossovers:
+            arguments.append("--adaptive-crossovers")
+    if linear_phase:
+        arguments.append("--linear-phase")
+    if deess:
+        arguments.append("--deess")
     if soft_clip:
         arguments.append("--soft-clip")
     if not auto_clip:
@@ -462,6 +474,10 @@ async def create_job(
     extra_references: list[UploadFile] | None = File(None),
     genre: str = Form(""),
     strict_peak: bool = Form(False),
+    linear_phase: bool = Form(False),
+    deess: bool = Form(False),
+    dynamics_bands: int = Form(3, ge=2, le=5),
+    adaptive_crossovers: bool = Form(False),
     target_lufs: float = Form(-14.0, ge=-60.0, le=-1.0),
     aggressiveness: float = Form(0.85, ge=0.0, le=1.0),
     ceiling_db: float = Form(-1.0, ge=-12.0, le=0.0),
@@ -501,6 +517,7 @@ async def create_job(
         target_lufs, aggressiveness, ceiling_db, bands, bit_depth, precision,
         dynamics, soft_clip, dither, noise_shaping, mid_side, match_width, mono_bass_hz,
         auto_clip, auto_mono_bass, dual_mono, bass_limiter, transparent, strict_peak, genre,
+        linear_phase, deess, dynamics_bands, adaptive_crossovers,
     )
     client = identity(request)
     try:
