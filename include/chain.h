@@ -3,6 +3,7 @@
 #include "biquad.h"
 #include "dynamics.h"
 #include "limiter.h"
+#include "linear_phase.h"
 #include "types.h"
 
 #include <cstddef>
@@ -17,11 +18,13 @@ struct ChainPlan {
     bool midSide = false;
     double sideGain = 1.0;
     DynamicsSettings dynamics;
+    DeEsserSettings deEsser;
     double gainDb = 0.0;
     double monoBassHz = 0.0;
     bool softClip = false;
     double softClipKneeDb = 3.0;
     bool strictPeak = false;
+    bool linearPhase = false;
     double subsonicHz = 0.0;
     bool limiterEnabled = true;
     double ceilingDb = -1.0;
@@ -43,6 +46,7 @@ public:
     ProcessingChain(const ChainPlan& plan, double sampleRate, size_t channels, ChainStage stage = ChainStage::Full);
 
     size_t latency() const;
+    size_t preLatency() const { return preLatency_; }
     void process(AudioBlock& block, size_t frames);
     void processPre(AudioBlock& block, size_t frames);
     void processPost(AudioBlock& block, size_t frames);
@@ -60,11 +64,16 @@ private:
     ChainStage stage_;
     bool useMidSide_;
     double gainLinear_;
+    size_t preLatency_ = 0;
     std::vector<Biquad> subsonic_;
+    std::unique_ptr<LinearPhaseFilter> midLinear_;
+    std::unique_ptr<LinearPhaseFilter> sideLinear_;
+    std::vector<std::unique_ptr<LinearPhaseFilter>> channelLinear_;
     std::vector<std::vector<Biquad>> channelFilters_;
     std::vector<Biquad> midFilters_;
     std::vector<Biquad> sideFilters_;
     std::vector<Biquad> sideHighPass_;
+    std::unique_ptr<DeEsser> deEsser_;
     std::unique_ptr<MultibandCompressor> compressor_;
     std::unique_ptr<OversampledClipper> clipper_;
     std::unique_ptr<TruePeakLimiter> limiter_;
