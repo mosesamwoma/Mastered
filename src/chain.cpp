@@ -34,17 +34,32 @@ ProcessingChain::ProcessingChain(const ChainPlan& plan, double sampleRate, size_
         if (plan.subsonicHz > 0.0) {
             subsonic_.assign(channels, Biquad(designButterworth(true, plan.subsonicHz, sampleRate)));
         }
+        if (plan.linearPhase) {
+            preLatency_ = LinearPhaseFilter::latencyFor(sampleRate);
+        }
         if (useMidSide_) {
-            midFilters_ = makeFilters(plan.midBands, sampleRate);
-            sideFilters_ = makeFilters(plan.midSide ? plan.sideBands : plan.midBands, sampleRate);
+            if (plan.linearPhase) {
+                midLinear_ = std::make_unique<LinearPhaseFilter>(plan.midBands, sampleRate);
+                sideLinear_ = std::make_unique<LinearPhaseFilter>(plan.midSide ? plan.sideBands : plan.midBands, sampleRate);
+            } else {
+                midFilters_ = makeFilters(plan.midBands, sampleRate);
+                sideFilters_ = makeFilters(plan.midSide ? plan.sideBands : plan.midBands, sampleRate);
+            }
             if (plan.monoBassHz > 0.0) {
                 const BiquadCoefficients highPass = designButterworth(true, plan.monoBassHz, sampleRate);
                 sideHighPass_.assign(2, Biquad(highPass));
+            }
+        } else if (plan.linearPhase) {
+            for (size_t ch = 0; ch < channels; ++ch) {
+                channelLinear_.push_back(std::make_unique<LinearPhaseFilter>(plan.midBands, sampleRate));
             }
         } else {
             for (size_t ch = 0; ch < channels; ++ch) {
                 channelFilters_.push_back(makeFilters(plan.midBands, sampleRate));
             }
+        }
+        if (plan.deEsser.enabled) {
+            deEsser_ = std::make_unique<DeEsser>(plan.deEsser, sampleRate, channels);
         }
         if (plan.dynamics.enabled) {
             compressor_ = std::make_unique<MultibandCompressor>(plan.dynamics, sampleRate, channels);
@@ -74,7 +89,7 @@ ProcessingChain::ProcessingChain(const ChainPlan& plan, double sampleRate, size_
 }
 
 size_t ProcessingChain::latency() const {
-    size_t total = 0;
+    size_t total = stage_ == ChainStage::Full ? preLatency_ : 0;
     if (clipper_) {
         total += clipper_->latency();
     }
@@ -109,12 +124,19 @@ void ProcessingChain::processPre(AudioBlock& block, size_t frames) {
     for (size_t ch = 0; ch < subsonic_.size(); ++ch) {
         subsonic_[ch].processBlock(block[ch].data(), frames);
     }
+    if (deEsser_) {
+        deEsser_->process(block, frames);
+    }
     if (useMidSide_) {
         mid_.resize(frames);
         side_.resize(frames);
         for (size_t i = 0; i < frames; ++i) {
             mid_[i] = 0.5 * (block[0][i] + block[1][i]);
             side_[i] = 0.5 * (block[0][i] - block[1][i]);
+        }
+        if (midLinear_) {
+            midLinear_->process(mid_.data(), frames);
+            sideLinear_->process(side_.data(), frames);
         }
         for (Biquad& filter : midFilters_) {
             filter.processBlock(mid_.data(), frames);
@@ -132,7 +154,10 @@ void ProcessingChain::processPre(AudioBlock& block, size_t frames) {
             block[1][i] = mid_[i] - s;
         }
     } else {
-        for (size_t ch = 0; ch < channels_; ++ch) {
+        for (size_t ch = 0; ch < channelLinear_.size(); ++ch) {
+            channelLinear_[ch]->process(block[ch].data(), frames);
+        }
+        for (size_t ch = 0; ch < channelFilters_.size(); ++ch) {
             for (Biquad& filter : channelFilters_[ch]) {
                 filter.processBlock(block[ch].data(), frames);
             }
