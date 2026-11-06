@@ -13,6 +13,9 @@ Everything runs as a streaming pipeline in fixed-size blocks, so memory use stay
 - Multi-reference averaging
 - Dynamics matching: three-band compression whose ratios come from the measured level spread of each band in your track and in the reference, refined by measuring what the compressor actually achieves
 - Optional soft clipper before the limiter, run at 4x oversampling so its distortion does not alias; it passes the audio through untouched while nothing is near the threshold
+- Multiband compression with 2 to 5 bands (`--dynamics-bands`), optionally with crossovers moved to nearby spectral valleys (`--adaptive-crossovers`)
+- Optional linear-phase EQ (`--linear-phase`): no phase shift between bands or between mid and side, at the cost of pre-ringing and some speed
+- Optional de-esser (`--deess`) that subtracts only what it detects from a 4.5 to 9.5 kHz band, so it is exactly transparent while nothing is over its threshold
 - No reference? Match one of seven built-in style curves instead (`--genre`); the correction is gentler and dynamics matching is skipped
 - Quality grade (A to D) in every report, with the reasons for any deduction
 - Automatic 20 Hz high-pass when the input has a DC offset (`--subsonic HZ` to choose your own)
@@ -87,6 +90,10 @@ By default the mastered file is written next to the input as `<input>_mastered.w
 | `--no-perceptual` | | Disable perceptual error weighting in the EQ fit |
 | `--dynamics` | | Multiband compression matched to the reference |
 | `--dynamics-ratio N` | | Fixed ratio, 1 to 20 (implies `--dynamics`) |
+| `--dynamics-bands N` | 3 | Number of compressor bands, 2 to 5 (implies `--dynamics`). Crossovers: 2 bands 400 Hz; 3 bands 150 and 3000 Hz; 4 bands 120, 800 and 5000 Hz; 5 bands 80, 300, 1800 and 7000 Hz. Crossovers above 45% of the sample rate are dropped |
+| `--adaptive-crossovers` | | Move each compressor crossover to the quietest point of your track's average spectrum within a third of an octave, so it does not split a spectral peak |
+| `--linear-phase` | | Linear-phase FIR EQ (8191 taps up to 56 kHz, longer above). The result is aligned automatically; expect pre-ringing on strong low-frequency moves |
+| `--deess` | | Tame bursts in the 4.5 to 9.5 kHz band. It switches on when the band's 95th percentile level is at least 6 dB above its median, then reduces by up to 8 dB (ratio 4) above a threshold halfway between them |
 | `--soft-clip` | | Always use the soft clipper before the limiter |
 | `--no-auto-clip` | | Do not switch the soft clipper on automatically when the limiter would have to remove more than about 4 dB |
 | `--bass-limiter` | | Limit the band below 140 Hz separately; the audio is left bit-for-bit untouched while the bass is under its threshold (off by default) |
@@ -288,7 +295,7 @@ All settings are environment variables with safe defaults.
 | `POST /api/logout` | Clears the session cookie |
 | `GET /api/session` | Whether sign-in is required and who is signed in |
 | `GET /api/config` | Limits, accepted formats, whether previews are available and whether sign-in is required |
-| `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `soft_clip`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `dither`, `noise_shaping`, `mid_side`, `match_width`, `mono_bass_hz`; returns 202 with the job id |
+| `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `dynamics_bands` (2 to 5), `adaptive_crossovers`, `linear_phase`, `deess`, `strict_peak`, `soft_clip`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `dither`, `noise_shaping`, `mid_side`, `match_width`, `mono_bass_hz`. `reference` may be omitted when `genre` names a style curve, and extra reference tracks go in `extra_references` (at most 4 in total); returns 202 with the job id |
 | `GET /api/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`), progress, queue position, and when done the report, download link and preview links |
 | `GET /api/jobs/{id}/download` | Mastered WAV |
 | `POST /api/jobs/{id}/export` | JSON body `{"format": "mp3", "quality": "320", "rate": 48000, "metadata": true}` (`rate` is 0 to keep the sample rate or 48000; `metadata` keeps title, artist and album from the source file); encodes and checks the file, returns its name, URL, size and measured loudness and true peak. One export runs at a time, at most 12 files per job |
@@ -302,15 +309,16 @@ All settings are environment variables with safe defaults.
 
 The mastered WAV is the master; every other format is made from it with ffmpeg when you ask for it, and cached with the job until it expires. Which formats are offered depends on the encoders in the server's ffmpeg: FLAC and AIFF (lossless), MP3 (320, V0, 192, 128), OGG Vorbis (q9 to q3), Opus (192 to 96 kbps) and AAC in M4A (256 to 128 kbps).
 
-Lossy encoders move the true peak: an MP3, Opus or AAC file can come out above the ceiling that the master respected. Each lossy file is therefore decoded again and measured with the engine's own meter (`mastered_cli --measure`). If its true peak is above the ceiling, the level is lowered by the overshoot and the file is encoded again (up to five encodes). The result shows the loudness and peak of the file you actually download, and says so when the level had to be lowered or the ceiling could not be met.
+Lossy encoders move the true peak: an MP3, Opus or AAC file can come out above the ceiling that the master respected. Each lossy file is therefore decoded again and measured with the engine's own meter (`mastered_cli --measure`). The gain is then searched, bracketing the last level that fit under the ceiling and the first that did not (up to six encodes, at most 4 dB per step, with a final re-encode at the last safe level if needed), so the file stays under the ceiling and, where the codec allows, keeps the mastered loudness. The true peak always wins; the result shows the loudness and peak of the file you actually download, the gap to the mastered loudness (`loudnessErrorLu`), and says so when the level had to be lowered or the ceiling could not be met.
 
 Also available for each result: a text or JSON report and, for the EQ, ReaEQ and Equalizer APO settings.
 
 ## Processing chain
 
 ```
-reader -> [mid/side split] -> EQ -> [side gain] -> [mid/side merge]
-       -> multiband compressor (optional) -> temporary 32-bit float file
+reader -> [20 Hz high-pass for DC offset] -> de-esser (optional)
+       -> [mid/side split] -> EQ (minimum-phase, or linear-phase) -> [side gain] -> [mid/side merge]
+       -> multiband compressor (optional, 2 to 5 bands) -> temporary 32-bit float file
 temporary file -> makeup gain -> soft clipper (optional, automatic for heavy limiting)
        -> true-peak limiter -> writer -> meter (on the written file)
 ```
@@ -341,7 +349,7 @@ const char* json = mastered_result_json(e);
 mastered_destroy(e);
 ```
 
-Options: `target_lufs`, `aggressiveness`, `ceiling_db`, `max_bands`, `max_side_bands`, `smoothing`, `perceptual_weighting`, `auto_gain`, `mid_side`, `match_width`, `dynamics`, `dynamics_match`, `dynamics_ratio`, `dynamics_threshold_offset_db`, `soft_clip`, `soft_clip_knee_db`, `accurate_peak`, `lookahead_ms`, `release_ms`, `bit_depth`, `dither`, `noise_shaping`, `tolerance_lu`, `max_iterations`, `fft_size`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `strict_peak`, `subsonic_hz`, `auto_subsonic`.
+Options: `target_lufs`, `aggressiveness`, `ceiling_db`, `max_bands`, `max_side_bands`, `smoothing`, `perceptual_weighting`, `auto_gain`, `mid_side`, `match_width`, `dynamics`, `dynamics_match`, `dynamics_ratio`, `dynamics_threshold_offset_db`, `soft_clip`, `soft_clip_knee_db`, `accurate_peak`, `lookahead_ms`, `release_ms`, `bit_depth`, `dither`, `noise_shaping`, `tolerance_lu`, `max_iterations`, `fft_size`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `strict_peak`, `linear_phase`, `deess`, `dynamics_bands`, `adaptive_crossovers`, `subsonic_hz`, `auto_subsonic`.
 
 Metrics: `input_lufs`, `input_true_peak_db`, `input_lra`, `reference_lufs`, `output_lufs`, `output_true_peak_db`, `output_lra`, `output_correlation`, `makeup_gain_db`, `iterations`, `target_reached`, `mid_band_count`, `side_band_count`.
 
@@ -372,7 +380,7 @@ The JSON report contains input, reference and output measurements, the makeup ga
 - Bands where the input has almost no content (more than 50 dB below its average level, for example above the cut-off of a lossy file) are not boosted.
 - Platform targets are typical values and change over time; services also differ in whether they turn quiet tracks up.
 - Mid/side EQ is used for stereo files only. For other channel counts the mid EQ is applied to every channel.
-- True peak: by default the limiter, the closed-loop check and the reported peak all use the same 4x, 24-tap-per-phase oversampler, which reads like most DAW and ffmpeg meters. `--strict-peak` switches all three to an 8x, 64-tap-per-phase detector. On very bright, heavily limited material the 4x detector can read about a dB lower than a much longer reference filter, so use the strict detector (or a lower ceiling) when you deliver to strict codecs.
+- True peak: by default the limiter, the closed-loop check and the reported peak all use the same 4x, 24-tap-per-phase oversampler, which reads like most DAW and ffmpeg meters. `--strict-peak` switches all three to an 8x, 96-tap-per-phase detector, which stayed within 0.07 dB of a much longer reference filter even on adversarial test signals. On very bright, heavily limited material the 4x detector can read about a dB lower than a much longer reference filter, so use the strict detector (or a lower ceiling) when you deliver to strict codecs.
 - `--fast-peak` (used by the web page's Fast precision) skips the closed-loop check, so the peak is only guaranteed to the limiter's own detector.
 - If the ceiling prevents the loudness target from being reached, the closest result is written and a warning is reported. When the limiter saturates, the engine stops at the knee (within 0.25 LU of the loudest result it found) rather than pushing gain to the limit.
 - Built-in style curves (`--genre`) are general long-term spectrum shapes, not measurements of any particular music. They are applied at 60% strength with boosts capped at 4 dB and cuts at 5 dB.
