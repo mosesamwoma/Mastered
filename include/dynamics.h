@@ -18,17 +18,26 @@ struct CompressorBand {
     double releaseMs = 150.0;
 };
 
+constexpr size_t kMaxDynamicsBands = 5;
+
 struct DynamicsSettings {
     bool enabled = false;
-    double lowCrossoverHz = 150.0;
-    double highCrossoverHz = 3000.0;
-    std::array<CompressorBand, 3> bands;
+    size_t bandCount = 3;
+    std::array<double, kMaxDynamicsBands - 1> crossoversHz{{150.0, 3000.0, 0.0, 0.0}};
+    std::array<CompressorBand, kMaxDynamicsBands> bands;
+
+    std::vector<double> crossovers() const {
+        return std::vector<double>(crossoversHz.begin(), crossoversHz.begin() + static_cast<std::ptrdiff_t>(bandCount - 1));
+    }
 };
 
-class ThreeBandSplitter {
-public:
-    ThreeBandSplitter(double lowHz, double highHz, double sampleRate);
+std::vector<double> defaultCrossovers(size_t bandCount, double sampleRate);
 
+class BandSplitter {
+public:
+    BandSplitter(const std::vector<double>& crossoversHz, double sampleRate);
+
+    size_t bandCount() const { return stages_.size() + 1; }
     void split(double x, double* out);
 
 private:
@@ -51,9 +60,8 @@ private:
         }
     };
 
-    LR4 first_;
-    LR4 second_;
-    LR4 align_;
+    std::vector<LR4> stages_;
+    std::vector<std::vector<LR4>> alignment_;
 };
 
 struct BandStatistics {
@@ -67,19 +75,20 @@ struct BandStatistics {
 
 class BandLevelMeter {
 public:
-    BandLevelMeter(double sampleRate, double lowHz, double highHz);
+    BandLevelMeter(double sampleRate, const std::vector<double>& crossoversHz);
 
     void process(const AudioBlock& block, size_t frames);
-    std::array<BandStatistics, 3> statistics() const;
+    std::vector<BandStatistics> statistics() const;
 
 private:
-    ThreeBandSplitter splitter_;
+    BandSplitter splitter_;
+    size_t bands_;
     size_t blockFrames_;
     size_t blockFilled_ = 0;
-    std::array<double, 3> blockSums_{{0.0, 0.0, 0.0}};
-    std::array<double, 3> totalSums_{{0.0, 0.0, 0.0}};
+    std::vector<double> blockSums_;
+    std::vector<double> totalSums_;
     double totalFrames_ = 0.0;
-    std::array<std::vector<double>, 3> levels_;
+    std::vector<std::vector<double>> levels_;
 };
 
 class MultibandCompressor {
@@ -93,12 +102,65 @@ private:
 
     DynamicsSettings settings_;
     size_t channels_;
-    std::vector<ThreeBandSplitter> splitters_;
-    std::array<double, 3> attack_{{0.0, 0.0, 0.0}};
-    std::array<double, 3> release_{{0.0, 0.0, 0.0}};
-    std::array<double, 3> detector_{{0.0, 0.0, 0.0}};
-    std::array<double, 3> power_{{0.0, 0.0, 0.0}};
-    std::array<double, 3> reductionDb_{{0.0, 0.0, 0.0}};
+    size_t bands_;
+    std::vector<BandSplitter> splitters_;
+    std::array<double, kMaxDynamicsBands> attack_{};
+    std::array<double, kMaxDynamicsBands> release_{};
+    std::array<double, kMaxDynamicsBands> detector_{};
+    std::array<double, kMaxDynamicsBands> power_{};
+    std::array<double, kMaxDynamicsBands> reductionDb_{};
+};
+
+struct DeEsserSettings {
+    bool enabled = false;
+    double lowHz = 4500.0;
+    double highHz = 9500.0;
+    double thresholdDb = -40.0;
+    double ratio = 4.0;
+    double kneeDb = 4.0;
+    double maxReductionDb = 8.0;
+    double attackMs = 0.5;
+    double releaseMs = 30.0;
+};
+
+bool deEsserBand(double sampleRate, double& lowHz, double& highHz);
+
+class SibilanceMeter {
+public:
+    SibilanceMeter(double sampleRate, double lowHz, double highHz);
+
+    void process(const AudioBlock& block, size_t frames);
+    BandStatistics statistics() const;
+
+private:
+    Biquad highPass_;
+    Biquad lowPass_;
+    size_t blockFrames_;
+    size_t blockFilled_ = 0;
+    double blockSum_ = 0.0;
+    std::vector<double> levels_;
+};
+
+class DeEsser {
+public:
+    DeEsser(const DeEsserSettings& settings, double sampleRate, size_t channels);
+
+    void process(AudioBlock& block, size_t frames);
+
+private:
+    struct Filters {
+        Biquad highPass;
+        Biquad lowPass;
+    };
+
+    DeEsserSettings settings_;
+    size_t channels_;
+    std::vector<Filters> filters_;
+    double detector_;
+    double attack_;
+    double release_;
+    double power_ = 0.0;
+    double reductionDb_ = 0.0;
 };
 
 class SoftClipper {
