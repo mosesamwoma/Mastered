@@ -1,5 +1,8 @@
 import { delay, describeError, ignore, parseJson, readStorage, redirectToLogin, request, writeStorage } from './api.js';
-import { buildBandTable, buildChart, buildSpectrumChart } from './charts.js';
+import { buildBandTable, buildChart, buildSpectrumChart, buildTimelineChart } from './charts.js';
+import { createAbx } from './abx.js';
+import { renderAnalysis } from './analysis.js';
+import { initTabs, initTheme, toast } from './ui.js';
 import { conversionNotes, describeChanges } from './summary.js';
 import { cell, describeWait, formatNumber, formatSize, formatTime, signed } from './format.js';
 
@@ -26,7 +29,7 @@ const STYLES = {
   gentle: { strength: 60, dynamics: false, softClip: false, note: 'A light touch: the tone follows the reference only partly and dynamics are left alone.' },
   balanced: { strength: 85, dynamics: false, softClip: false, note: 'The default: tone follows the reference closely, dynamics are left alone.' },
   transparent: { strength: 70, dynamics: false, softClip: false, transparent: true, note: 'Keeps the sound as it is: small EQ moves, no compression and no change to the stereo width.' },
-  punchy: { strength: 90, dynamics: true, softClip: true, note: 'Denser and louder sounding: also matches dynamics and rounds peaks before the limiter.' },
+  punchy: { strength: 90, dynamics: true, softClip: true, glue: true, note: 'Denser and louder sounding: also matches dynamics, glues the mix together and rounds peaks before the limiter.' },
 };
 
 const PROGRESS_STEPS = ['Upload', 'Analyse', 'Match tone', 'Master', 'Preview'];
@@ -69,10 +72,25 @@ const flagInputs = [
   ['strict_peak', byId('strict-peak')],
   ['linear_phase', byId('linear-phase')],
   ['deess', byId('deess')],
+  ['glue', byId('glue')],
+  ['resonance', byId('resonance')],
   ['adaptive_crossovers', byId('adaptive-crossovers')],
 ];
 const dynamicsBandsSelect = byId('dynamics-bands');
 const planSummary = byId('plan-summary');
+const punchGuardSelect = byId('punch-guard');
+const progressPercent = byId('progress-percent');
+const bundleLink = byId('bundle');
+const adjustButton = byId('adjust');
+const downloadAllButton = byId('download-all');
+const timelineCard = byId('timeline-card');
+const timelineBox = byId('timeline');
+const safeSummary = byId('safe-summary');
+const compareCard = byId('compare-card');
+const compareBody = byId('compare-body');
+const albumPanel = byId('album-panel');
+const albumBody = byId('album-body');
+const albumSummary = byId('album-summary');
 const savedSelect = byId('saved-select');
 const savedName = byId('saved-name');
 const savedSave = byId('saved-save');
@@ -139,6 +157,8 @@ const hearMastered = byId('hear-mastered');
 const matchLevel = byId('match-level');
 const playerNote = byId('player-note');
 const panels = [form, progressPanel, errorPanel, resultPanel];
+const ANALYSIS_IDS = ['analysis-status', 'spec-original', 'spec-mastered', 'vector-original', 'vector-mastered', 'vector-original-text', 'vector-mastered-text'];
+const DOWNLOAD_ALL_GAP_MS = 900;
 
 let limits = null;
 let jobId = null;
@@ -153,11 +173,19 @@ let waveData = null;
 let frameRequest = null;
 let exportBusy = false;
 let progressStartedAt = 0;
+let previousEntry = null;
+let analysisDone = false;
+let analysisToken = 0;
+let tabs = null;
+let abx = null;
 
 function show(panel) {
   panels.forEach((item) => {
     item.hidden = item !== panel;
   });
+  if (panel !== form) {
+    window.scrollTo({ top: 0 });
+  }
 }
 
 function setStatus(text) {
@@ -219,6 +247,7 @@ function setProgress(value, title, message, step) {
   } else {
     progressBar.value = value;
   }
+  progressPercent.textContent = value === null ? '' : Math.round(value) + '%';
   progressTitle.textContent = title;
   progressMessage.textContent = message;
   paintSteps(typeof step === 'number' ? step : stepIndexFor(message, value));
@@ -332,7 +361,7 @@ function refreshReadyHint() {
   } else if (tracks > 1) {
     readyHint.textContent = tracks + ' tracks will be mastered one after another with the same settings.';
   } else {
-    readyHint.textContent = 'Ready. Check the settings below and press Master my track.';
+    readyHint.textContent = 'Ready. Check the settings and press Master my track.';
   }
 }
 
@@ -352,6 +381,7 @@ function applyStyle(name) {
   byId('dynamics').checked = style.dynamics;
   syncDynamicsControls();
   byId('soft-clip').checked = style.softClip;
+  byId('glue').checked = style.glue === true;
   byId('transparent').checked = style.transparent === true;
   styleNote.textContent = style.note;
   styleButtons.forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.style === name)));
@@ -393,6 +423,15 @@ function updatePlan() {
   if (target !== null && ceiling !== null) {
     parts.push('The result is set to ' + target + ' LUFS with peaks kept under ' + ceiling + ' dBTP.');
   }
+  if (byId('glue').checked) {
+    parts.push('A gentle glue compressor sits in front of the limiter.');
+  }
+  if (byId('resonance').checked) {
+    parts.push('Narrow harsh resonances are tamed only while they stick out.');
+  }
+  if (punchGuardSelect.value !== '0') {
+    parts.push('The punch guard keeps at least ' + punchGuardSelect.value + ' dB between peaks and average level.');
+  }
   if (byId('soft-clip').checked) {
     parts.push('A soft clipper rounds the peaks before the limiter.');
   } else if (byId('auto-clip').checked) {
@@ -402,9 +441,9 @@ function updatePlan() {
   parts.push('You get a WAV at ' + depth + ', and can download MP3, OGG, FLAC and other formats afterwards.');
   const tracks = trackFiles().length;
   if (tracks > 1) {
-    parts.unshift(tracks + ' tracks, one after another.');
+    parts.unshift(tracks + ' tracks, one after another, with the same settings.');
   }
-  planSummary.textContent = 'What will happen: ' + parts.join(' ');
+  planSummary.textContent = parts.join(' ');
 }
 
 function checkInputs() {
@@ -473,6 +512,7 @@ function buildFormData(trackFile) {
   data.append('precision', precisionSelect.value);
   data.append('mono_bass_hz', monoBassCheck.checked ? monoBassHz.value : '0');
   data.append('dynamics_bands', dynamicsBandsSelect.value);
+  data.append('punch_guard', punchGuardSelect.value);
   flagInputs.forEach(([name, input]) => {
     data.append(name, input.checked ? 'true' : 'false');
   });
@@ -508,6 +548,7 @@ function collectSettings() {
     monoBass: monoBassCheck.checked,
     monoBassHz: monoBassHz.value,
     dynamicsBands: dynamicsBandsSelect.value,
+    punchGuard: punchGuardSelect.value,
     flags: {},
   };
   flagInputs.forEach(([name, input]) => {
@@ -537,6 +578,9 @@ function applySettings(values) {
   setValue(monoBassHz, values.monoBassHz);
   if (['3', '4', '5'].includes(String(values.dynamicsBands))) {
     dynamicsBandsSelect.value = String(values.dynamicsBands);
+  }
+  if (['0', '7', '8', '10'].includes(String(values.punchGuard))) {
+    punchGuardSelect.value = String(values.punchGuard);
   }
   flagInputs.forEach(([name, input]) => {
     if (values.flags && typeof values.flags[name] === 'boolean') {
@@ -592,6 +636,7 @@ function onSavedSave() {
   }
   refreshSavedSelect(name);
   savedNote.textContent = 'Saved "' + name + '".';
+  toast('Saved "' + name + '".', 'good');
 }
 
 function onSavedDelete() {
@@ -781,14 +826,34 @@ function summariseFailures() {
   return results.map((item) => item.name + ': ' + (item.error || 'failed')).join(' · ');
 }
 
-function finishBatch() {
+async function attachPrevious() {
+  const earlier = previousEntry;
+  previousEntry = null;
+  if (!earlier || !earlier.job || !results.some((item) => item.job)) {
+    if (earlier && earlier.job) {
+      await discardJob(earlier.job.id);
+    }
+    return;
+  }
+  const response = await request('/api/jobs/' + earlier.job.id, { cache: 'no-store' });
+  if (response !== null && response.ok) {
+    results.push({ name: 'Previous: ' + earlier.name, job: earlier.job, error: '', previous: true, exports: earlier.exports });
+  }
+}
+
+async function finishBatch() {
   busy = false;
   progressEta.textContent = '';
   const firstDone = results.findIndex((item) => item.job);
   if (firstDone < 0) {
+    if (previousEntry && previousEntry.job) {
+      await discardJob(previousEntry.job.id);
+    }
+    previousEntry = null;
     showError(summariseFailures());
     return;
   }
+  await attachPrevious();
   showResult(firstDone);
 }
 
@@ -816,7 +881,7 @@ async function runBatch(files) {
       break;
     }
   }
-  finishBatch();
+  await finishBatch();
 }
 
 async function resumeJob(id) {
@@ -835,7 +900,7 @@ async function resumeJob(id) {
     return;
   }
   results = [{ name: outcome.job ? outcome.job.downloadName : 'Track', job: outcome.job || null, error: outcome.error || '' }];
-  finishBatch();
+  await finishBatch();
 }
 
 async function onSubmit(event) {
@@ -865,8 +930,179 @@ async function onCancel() {
 
 async function onLeaveResult() {
   const finished = results;
+  previousEntry = null;
   backToForm();
   await discardResults(finished);
+}
+
+async function onAdjust() {
+  const entry = results[shownIndex];
+  if (!entry || !entry.job) {
+    return;
+  }
+  const finished = results.filter((item) => item !== entry);
+  previousEntry = { name: entry.previous ? entry.name.replace(/^Previous: /, '') : entry.name, job: entry.job, exports: entry.exports };
+  backToForm();
+  await discardResults(finished);
+  toast('Your files are still loaded. Change the settings and master again to compare with the previous version.');
+}
+
+function downloadAll() {
+  const items = results.filter((item) => item.job && !item.previous);
+  items.forEach((item, index) => {
+    window.setTimeout(() => triggerDownload(item.job.downloadUrl, item.job.downloadName), index * DOWNLOAD_ALL_GAP_MS);
+  });
+  toast('Starting ' + items.length + ' downloads. Your browser may ask to allow several downloads.');
+}
+
+function buildTimeline(report) {
+  timelineBox.replaceChildren();
+  const timeline = report.timeline;
+  const chart = timeline && typeof timeline === 'object' ? buildTimelineChart(timeline) : null;
+  timelineCard.hidden = chart === null;
+  if (chart) {
+    const block = document.createElement('div');
+    block.className = 'chart-block';
+    block.appendChild(chart);
+    timelineBox.appendChild(block);
+  }
+}
+
+function buildSafeSummary(report) {
+  const safe = report.gain && typeof report.gain.safeMaxLufs === 'number' ? report.gain.safeMaxLufs : null;
+  const output = report.output.measurements.integratedLufs;
+  const settings = report.settings || {};
+  const lines = [];
+  if (safe !== null) {
+    lines.push(
+      'Safe loudness for this track: about ' + safe.toFixed(1) + ' LUFS.' +
+        (typeof output === 'number' && output > safe + 0.5 ? ' This master is ' + (output - safe).toFixed(1) + ' LU above that, so some punch was traded for loudness.' : ' This master stays within it.')
+    );
+  }
+  if (typeof settings.effectiveTargetLufs === 'number' && typeof settings.targetLufs === 'number' && Math.abs(settings.effectiveTargetLufs - settings.targetLufs) > 0.005) {
+    lines.push('The punch guard lowered the target from ' + settings.targetLufs.toFixed(1) + ' to ' + settings.effectiveTargetLufs.toFixed(1) + ' LUFS.');
+  }
+  safeSummary.textContent = lines.join(' ');
+}
+
+function deltaCell(value, digits, unit, betterWhenHigher) {
+  const node = cell('td', signed(value, digits, unit));
+  if (typeof value === 'number' && Math.abs(value) >= Math.pow(10, -digits) && betterWhenHigher !== null) {
+    node.className = value > 0 === betterWhenHigher ? 'up' : 'down';
+  }
+  return node;
+}
+
+function buildCompare(entry, report) {
+  compareBody.replaceChildren();
+  const other = results.find((item) => item.previous && item.job);
+  if (!other || entry.previous || !other.job.report) {
+    compareCard.hidden = true;
+    return;
+  }
+  const before = other.job.report;
+  const rows = [
+    ['Loudness', before.output.measurements.integratedLufs, report.output.measurements.integratedLufs, 'LUFS', 2, null],
+    ['True peak', before.output.measurements.truePeakDb, report.output.measurements.truePeakDb, 'dBTP', 2, null],
+    ['Loudness range', before.output.measurements.loudnessRangeLu, report.output.measurements.loudnessRangeLu, 'LU', 1, true],
+    ['Peak to loudness', before.output.measurements.plrDb, report.output.measurements.plrDb, 'dB', 1, true],
+  ];
+  rows.forEach(([label, was, now, unit, digits, better]) => {
+    const row = document.createElement('tr');
+    const head = cell('th', label);
+    head.scope = 'row';
+    row.appendChild(head);
+    row.appendChild(cell('td', formatNumber(was, digits, unit)));
+    row.appendChild(cell('td', formatNumber(now, digits, unit)));
+    row.appendChild(deltaCell(typeof was === 'number' && typeof now === 'number' ? now - was : null, digits, unit, better));
+    compareBody.appendChild(row);
+  });
+  const gradeBefore = before.quality ? before.quality.grade + ' (' + before.quality.score + ')' : '–';
+  const gradeNow = report.quality ? report.quality.grade + ' (' + report.quality.score + ')' : '–';
+  const row = document.createElement('tr');
+  const head = cell('th', 'Quality grade');
+  head.scope = 'row';
+  row.appendChild(head);
+  row.appendChild(cell('td', gradeBefore));
+  row.appendChild(cell('td', gradeNow));
+  row.appendChild(deltaCell(before.quality && report.quality ? report.quality.score - before.quality.score : null, 0, 'points', true));
+  compareBody.appendChild(row);
+  compareCard.hidden = false;
+}
+
+function buildAlbum() {
+  albumBody.replaceChildren();
+  const tracks = results.filter((item) => item.job && !item.previous);
+  albumPanel.hidden = tracks.length < 2;
+  if (tracks.length < 2) {
+    return;
+  }
+  const loudness = [];
+  tracks.forEach((item) => {
+    const report = item.job.report;
+    const measured = report.output.measurements;
+    const row = document.createElement('tr');
+    const head = cell('th', item.name);
+    head.scope = 'row';
+    row.appendChild(head);
+    row.appendChild(cell('td', formatNumber(measured.integratedLufs, 2, 'LUFS')));
+    row.appendChild(cell('td', formatNumber(measured.truePeakDb, 2, 'dBTP')));
+    row.appendChild(cell('td', formatNumber(measured.loudnessRangeLu, 1, 'LU')));
+    row.appendChild(cell('td', report.quality ? report.quality.grade + ' (' + report.quality.score + ')' : '–'));
+    albumBody.appendChild(row);
+    if (typeof measured.integratedLufs === 'number' && measured.integratedLufs > -100) {
+      loudness.push(measured.integratedLufs);
+    }
+  });
+  if (loudness.length > 1) {
+    const spread = Math.max(...loudness) - Math.min(...loudness);
+    albumSummary.textContent =
+      'Loudness spread across the album: ' + spread.toFixed(2) + ' LU. ' +
+      (spread <= 0.5 ? 'The tracks sit at the same level, so nothing will jump out when they play in a row.' : 'Some tracks differ noticeably in loudness; check the ones that are far from the others.');
+  } else {
+    albumSummary.textContent = '';
+  }
+}
+
+function resetAnalysis() {
+  analysisDone = false;
+  analysisToken += 1;
+  ANALYSIS_IDS.forEach((id) => {
+    const node = byId(id);
+    if (node.tagName === 'CANVAS') {
+      const context = node.getContext('2d');
+      if (context) {
+        context.clearRect(0, 0, node.width, node.height);
+      }
+    } else {
+      node.textContent = id === 'analysis-status' ? 'Open this tab to draw the analysis.' : '';
+    }
+  });
+}
+
+async function runAnalysis() {
+  const entry = results[shownIndex];
+  if (analysisDone || !entry || !entry.job || !entry.job.preview) {
+    if (!analysisDone) {
+      byId('analysis-status').textContent = 'No preview audio is available for this track, so the analysis cannot be drawn.';
+    }
+    return;
+  }
+  analysisDone = true;
+  const token = analysisToken;
+  const ok = await renderAnalysis(entry.job.preview, {
+    status: byId('analysis-status'),
+    specOriginal: byId('spec-original'),
+    specMastered: byId('spec-mastered'),
+    vectorOriginal: byId('vector-original'),
+    vectorMastered: byId('vector-mastered'),
+    vectorOriginalText: byId('vector-original-text'),
+    vectorMasteredText: byId('vector-mastered-text'),
+  });
+  if (token !== analysisToken) {
+    return;
+  }
+  analysisDone = ok;
 }
 
 function addChart(title, fit) {
@@ -1159,6 +1395,7 @@ async function onExport() {
     renderExports();
     exportStatus.textContent = 'Ready: ' + describeExport(payload);
   }
+  toast('Your ' + describeExport(payload) + ' is ready.', 'good');
   triggerDownload(payload.url, payload.name);
 }
 
@@ -1215,12 +1452,21 @@ function showResult(index) {
   if (report.side && Array.isArray(report.side.bands) && report.side.bands.length > 0) {
     addChart('Side EQ', report.side);
   }
+  buildTimeline(report);
+  buildSafeSummary(report);
+  buildCompare(entry, report);
+  buildAlbum();
+  resetAnalysis();
   downloadLink.href = job.downloadUrl;
   downloadLink.setAttribute('download', job.downloadName);
+  bundleLink.href = '/api/jobs/' + job.id + '/bundle';
   setLinks(job);
   exportStatus.textContent = '';
   renderExports();
   show(resultPanel);
+  if (tabs) {
+    tabs.select('overview');
+  }
   setupPlayer(job, report);
   waveData = validWaveform(report.waveform) ? report.waveform : null;
   waveCanvas.hidden = waveData === null;
@@ -1475,6 +1721,9 @@ function onKeyDown(event) {
     return;
   }
   const key = event.key;
+  if (abx && abx.isActive() && (key === 'a' || key === 'A' || key === 'b' || key === 'B')) {
+    return;
+  }
   if (key === ' ' || key === 'Spacebar') {
     if (tag === 'BUTTON' || tag === 'A') {
       return;
@@ -1878,9 +2127,15 @@ async function setupPlayer(job, report) {
   setPlaying(false);
   applyLevels();
   refreshTime();
+  if (abx) {
+    abx.setAvailable(true);
+  }
 }
 
 function teardownPlayer() {
+  if (abx) {
+    abx.reset();
+  }
   playerToken += 1;
   waveData = null;
   if (frameRequest !== null) {
@@ -1937,6 +2192,7 @@ async function init() {
   byId('dynamics').addEventListener('change', syncDynamicsControls);
   syncDynamicsControls();
   byId('soft-clip').addEventListener('change', clearStyleSelection);
+  byId('glue').addEventListener('change', clearStyleSelection);
   byId('transparent').addEventListener('change', clearStyleSelection);
   styleButtons.forEach((button) => button.addEventListener('click', () => applyStyle(button.dataset.style)));
   [targetInput, ceilingInput].forEach((input) => input.addEventListener('input', refreshPresetChips));
@@ -1972,6 +2228,42 @@ async function init() {
   savedSave.addEventListener('click', onSavedSave);
   savedDelete.addEventListener('click', onSavedDelete);
   window.addEventListener('pagehide', teardownPlayer);
+  initTheme(byId('theme-toggle'));
+  tabs = initTabs((name) => {
+    if (name === 'analysis') {
+      runAnalysis();
+    }
+  });
+  abx = createAbx({
+    ready: () => Boolean(player && player.impl),
+    choose: (name) => chooseVersion(name),
+    play: () => {
+      if (player && player.impl && !player.playing) {
+        togglePlay();
+      }
+    },
+    pause: () => pausePlayer(),
+    setBlind: (on) => {
+      if (!player) {
+        return;
+      }
+      if (on) {
+        player.matchBefore = matchLevel.checked;
+        matchLevel.checked = true;
+        matchLevel.disabled = true;
+        player.match = true;
+      } else {
+        matchLevel.disabled = false;
+        if (typeof player.matchBefore === 'boolean') {
+          matchLevel.checked = player.matchBefore;
+          player.match = player.matchBefore;
+        }
+      }
+      applyLevels();
+    },
+  });
+  adjustButton.addEventListener('click', onAdjust);
+  downloadAllButton.addEventListener('click', downloadAll);
   applyStyle('balanced');
   refreshSavedSelect('');
   refreshReadyHint();
