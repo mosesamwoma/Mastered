@@ -19,6 +19,8 @@ struct ChainPlan {
     double sideGain = 1.0;
     DynamicsSettings dynamics;
     DeEsserSettings deEsser;
+    ResonanceSettings resonance;
+    GlueSettings glue;
     double gainDb = 0.0;
     double monoBassHz = 0.0;
     bool softClip = false;
@@ -74,6 +76,8 @@ private:
     std::vector<Biquad> sideFilters_;
     std::vector<Biquad> sideHighPass_;
     std::unique_ptr<DeEsser> deEsser_;
+    std::unique_ptr<ResonanceTamer> resonance_;
+    std::unique_ptr<GlueCompressor> glue_;
     std::unique_ptr<MultibandCompressor> compressor_;
     std::unique_ptr<OversampledClipper> clipper_;
     std::unique_ptr<TruePeakLimiter> limiter_;
