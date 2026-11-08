@@ -44,6 +44,9 @@ bool setOption(mastered::MasteringConfig& c, const std::string& key, double v) {
     else if (key == "auto_mono_bass") c.autoMonoBass = flag;
     else if (key == "dual_mono") c.dualMono = flag;
     else if (key == "bass_limiter") c.bassLimiter = flag;
+    else if (key == "glue") c.glue = flag;
+    else if (key == "resonance") c.resonance = flag;
+    else if (key == "punch_guard_plr") c.punchGuardPlrDb = v;
     else if (key == "soft_clip_knee_db") c.softClipKneeDb = v;
     else if (key == "accurate_peak") c.accuratePeak = flag;
     else if (key == "strict_peak") c.strictPeak = flag;
