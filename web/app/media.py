@@ -44,7 +44,7 @@ class MediaInfo:
     tags: dict = field(default_factory=dict, compare=False)
 
     def decoded_bytes(self):
-        width = 2 if 0 < self.bits <= 16 else 3
+        width = 4
         rate = self.sample_rate if MIN_RATE <= self.sample_rate <= MAX_RATE else 44100
         channels = min(self.channels, MAX_CHANNELS) if self.channels <= MAX_CHANNELS else 2
         return int(self.duration * rate * channels * width)
@@ -214,7 +214,7 @@ class MediaTools:
             "-of", "json", str(path),
         ]
         try:
-            code, stdout, _ = await run_process(arguments, PROBE_TIMEOUT_SEC, on_start)
+            code, stdout, _ = await run_process(arguments, PROBE_TIMEOUT_SEC, on_start, make_limits(0, PROBE_TIMEOUT_SEC * 2, 0, 64))
         except OSError:
             raise MediaError("the audio tools could not be started") from None
         if code != 0:
@@ -252,9 +252,9 @@ class MediaTools:
         return MediaInfo(str(stream.get("codec_name") or ""), channels, sample_rate, bits, duration, tags)
 
     async def convert_to_wav(self, source: Path, destination: Path, info: MediaInfo, max_duration, timeout, on_start=None, max_decoded_bytes=0):
-        pcm = "pcm_s16le" if 0 < info.bits <= 16 else "pcm_s24le"
+        pcm = "pcm_f32le"
         arguments = [
-            str(self.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error",
+            str(self.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1",
             "-protocol_whitelist", "file", "-format_whitelist", FORMAT_WHITELIST, "-i", str(source),
             "-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1", "-t", f"{max_duration + 1:.3f}",
         ]
@@ -275,11 +275,11 @@ class MediaTools:
     async def make_preview(self, source: Path, destination: Path, on_start=None):
         encoder = ["-c:a", "libmp3lame", "-b:a", "160k"] if self.preview_codec == "mp3" else ["-c:a", "aac", "-b:a", "160k"]
         arguments = [
-            str(self.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-i", str(source), "-vn", "-ac", "2", "-ar", "44100", *encoder, "-y", str(destination),
+            str(self.ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1",
+            "-protocol_whitelist", "file", "-i", str(source), "-vn", "-ac", "2", "-ar", "44100", *encoder, "-y", str(destination),
         ]
         try:
-            code, _, _ = await run_process(arguments, PREVIEW_TIMEOUT_SEC, on_start)
+            code, _, _ = await run_process(arguments, PREVIEW_TIMEOUT_SEC, on_start, make_limits(0, PREVIEW_TIMEOUT_SEC * 2))
         except OSError:
             raise MediaError("the audio tools could not be started") from None
         if code != 0 or not destination.is_file():
@@ -299,4 +299,5 @@ def describe_conversion(info):
         notes.append(f"The source sample rate of {info.sample_rate} Hz is outside the supported range and was resampled to 44100 Hz")
     if 0 < info.bits <= 16:
         notes.append("The decoded audio was kept at 16 bits")
+    notes.append("The file was decoded at full precision so peaks above 0 dBFS were not clipped")
     return notes
