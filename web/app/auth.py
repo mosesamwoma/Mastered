@@ -92,10 +92,15 @@ MAX_REVOKED = 20000
 
 
 class SessionSigner:
-    def __init__(self, secret, lifetime_seconds):
+    def __init__(self, secret, lifetime_seconds, persist=None):
         self.secret = secret
         self.lifetime = lifetime_seconds
         self.revoked = {}
+        self.persist = persist
+
+    def load(self, entries):
+        for fingerprint, expires in entries:
+            self.revoked[fingerprint] = float(expires)
 
     @staticmethod
     def fingerprint(token):
@@ -109,7 +114,14 @@ class SessionSigner:
             del self.revoked[key]
         if len(self.revoked) >= MAX_REVOKED:
             self.revoked.pop(next(iter(self.revoked)))
-        self.revoked[self.fingerprint(token)] = now + self.lifetime + 60
+        fingerprint = self.fingerprint(token)
+        expires = now + self.lifetime + 60
+        self.revoked[fingerprint] = expires
+        if self.persist is not None:
+            try:
+                self.persist(fingerprint, expires)
+            except Exception:
+                pass
 
     def sign(self, body):
         return encode(hmac.new(self.secret, f"{TOKEN_VERSION}.{body}".encode("ascii"), hashlib.sha256).digest())
