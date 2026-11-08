@@ -163,6 +163,79 @@ private:
     double reductionDb_ = 0.0;
 };
 
+struct GlueSettings {
+    bool enabled = false;
+    double thresholdDb = -12.0;
+    double ratio = 1.5;
+    double kneeDb = 8.0;
+    double attackMs = 25.0;
+    double releaseMs = 140.0;
+};
+
+class GlueCompressor {
+public:
+    GlueCompressor(const GlueSettings& settings, double sampleRate, size_t channels);
+
+    void process(AudioBlock& block, size_t frames);
+
+private:
+    GlueSettings settings_;
+    size_t channels_;
+    double detector_;
+    double attack_;
+    double releaseFast_;
+    double releaseSlow_;
+    double power_ = 0.0;
+    double reductionDb_ = 0.0;
+};
+
+constexpr size_t kMaxResonanceBands = 4;
+
+struct ResonanceBand {
+    double frequency = 3000.0;
+    double q = 6.0;
+    double maxCutDb = 3.0;
+    double thresholdDb = 2.0;
+};
+
+struct ResonanceSettings {
+    bool enabled = false;
+    size_t count = 0;
+    std::array<ResonanceBand, kMaxResonanceBands> bands;
+};
+
+class ResonanceTamer {
+public:
+    ResonanceTamer(const ResonanceSettings& settings, double sampleRate, size_t channels);
+
+    void process(AudioBlock& block, size_t frames);
+
+private:
+    struct Detector {
+        Biquad centre;
+        Biquad low;
+        Biquad high;
+    };
+
+    struct BandState {
+        std::vector<Detector> detectors;
+        std::vector<Biquad> tone;
+        double centrePower = 0.0;
+        double neighbourPower = 0.0;
+        double cutDb = 0.0;
+        double appliedDb = 0.0;
+    };
+
+    ResonanceSettings settings_;
+    double sampleRate_;
+    size_t channels_;
+    double detector_;
+    double attack_;
+    double release_;
+    size_t counter_ = 0;
+    std::vector<BandState> states_;
+};
+
 class SoftClipper {
 public:
     SoftClipper(double ceilingLinear, double kneeDb);
