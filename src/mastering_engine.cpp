@@ -45,6 +45,12 @@ constexpr int kMaxPeakTrims = 5;
 constexpr int kMaxCeilingRaises = 2;
 constexpr double kEmptyBandDb = -50.0;
 constexpr size_t kWaveformColumns = 800;
+constexpr double kResonanceMinExcessDb = 5.0;
+constexpr double kResonanceMinHz = 1500.0;
+constexpr double kGlueThresholdBelowCeilingDb = 9.0;
+constexpr double kCoarseMinSeconds = 100.0;
+constexpr size_t kCoarseSegments = 8;
+constexpr double kCoarseSegmentSeconds = 4.0;
 
 struct FileScan {
     uint32_t sampleRate = 0;
@@ -55,6 +61,7 @@ struct FileScan {
     AverageSpectrum spectrum;
     Measurements measurements;
     Waveform waveform;
+    uint64_t nonFinite = 0;
 };
 
 void requireFinite(double value, const char* name) {
@@ -87,6 +94,10 @@ void validateConfig(const MasteringConfig& c) {
     }
     requireRange(c.maxBoostDb, 0.0, 12.0, "maxBoostDb");
     requireRange(c.maxCutDb, 0.0, 18.0, "maxCutDb");
+    requireFinite(c.punchGuardPlrDb, "punchGuardPlrDb");
+    if (c.punchGuardPlrDb != 0.0 && (c.punchGuardPlrDb < 3.0 || c.punchGuardPlrDb > 16.0)) {
+        throw MasteredError("Configuration value out of range: punchGuardPlrDb must be 0 (off) or between 3 and 16");
+    }
     requireRange(c.limiterLookaheadMs, 0.5, 20.0, "limiterLookaheadMs");
     requireRange(c.limiterReleaseMs, 5.0, 1000.0, "limiterReleaseMs");
     requireRange(c.loudnessToleranceLu, 0.005, 2.0, "loudnessToleranceLu");
@@ -131,6 +142,7 @@ FileScan scanFile(const std::string& path, size_t fftSize, bool dualMono) {
         meter.process(block, n);
         waveform.process(block, n);
     }
+    scan.nonFinite = reader.nonFiniteSamples();
     scan.waveform = waveform.finish();
     scan.spectrum = spectrum.finish();
     scan.measurements = meter.finish();
@@ -334,10 +346,17 @@ private:
 class CacheReader {
 public:
     CacheReader(const std::string& path, size_t channels, uint64_t frames)
-        : channels_(channels), remaining_(frames), file_(path, std::ios::binary) {
+        : channels_(channels), total_(frames), remaining_(frames), file_(path, std::ios::binary) {
         if (!file_) {
             throw MasteredError("Cannot read the temporary working file: " + path);
         }
+    }
+
+    void seek(uint64_t frame) {
+        const uint64_t position = std::min(frame, total_);
+        file_.clear();
+        file_.seekg(static_cast<std::streamoff>(position * channels_ * sizeof(float)));
+        remaining_ = total_ - position;
     }
 
     size_t read(AudioBlock& block, size_t maxFrames) {
@@ -365,6 +384,7 @@ public:
 
 private:
     size_t channels_;
+    uint64_t total_;
     uint64_t remaining_;
     std::ifstream file_;
     std::vector<float> buffer_;
@@ -461,6 +481,56 @@ Measurements runPost(const std::string& cachePath, const Analysis& analysis, con
     }
     if (limiter) {
         *limiter = chain.limiterStatistics();
+    }
+    return meter.finish();
+}
+
+struct Segment {
+    uint64_t start;
+    uint64_t length;
+};
+
+Measurements runPostExcerpts(const std::string& cachePath, const Analysis& analysis, const ChainPlan& plan, const std::vector<Segment>& segments,
+                             bool dualMono) {
+    const size_t channels = analysis.channels;
+    const double sampleRate = static_cast<double>(analysis.sampleRate);
+    Meter meter(sampleRate, channels, PeakMode::Off, dualMono);
+    for (const Segment& segment : segments) {
+        CacheReader reader(cachePath, channels, analysis.frames);
+        ProcessingChain chain(plan, sampleRate, channels, ChainStage::Post);
+        const uint64_t preroll = std::min<uint64_t>(segment.start, analysis.sampleRate);
+        reader.seek(segment.start - preroll);
+        uint64_t discard = preroll + chain.latency();
+        uint64_t remainingToMeter = segment.length;
+        const uint64_t toFeed = preroll + segment.length + chain.latency();
+        uint64_t fed = 0;
+        AudioBlock block;
+        while (fed < toFeed && remainingToMeter > 0) {
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(toFeed - fed, kBlockFrames));
+            size_t n = reader.read(block, want);
+            if (n == 0) {
+                block = makeBlock(channels, want);
+                n = want;
+            }
+            chain.processPost(block, n);
+            fed += n;
+            size_t offset = 0;
+            if (discard > 0) {
+                offset = static_cast<size_t>(std::min<uint64_t>(discard, n));
+                discard -= offset;
+            }
+            if (offset >= n) {
+                continue;
+            }
+            if (offset > 0) {
+                for (auto& channel : block) {
+                    channel.erase(channel.begin(), channel.begin() + static_cast<std::ptrdiff_t>(offset));
+                }
+            }
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(n - offset, remainingToMeter));
+            meter.process(block, count);
+            remainingToMeter -= count;
+        }
     }
     return meter.finish();
 }
@@ -957,6 +1027,68 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         }
     }
 
+    if (config_.resonance) {
+        const double limitHz = std::min(12000.0, static_cast<double>(in.sampleRate) * 0.3);
+        const std::vector<double> centres = makeBandCentres(kResonanceMinHz, limitHz);
+        if (centres.size() >= 9) {
+            const std::vector<double> levels = bandLevelsDb(in.spectrum, false, centres, 1.0 / 6.0);
+            struct Candidate {
+                size_t index;
+                double excess;
+            };
+            std::vector<Candidate> found;
+            for (size_t i = 3; i + 3 < centres.size(); ++i) {
+                double neighbours = 0.0;
+                size_t count = 0;
+                for (int d = -3; d <= 3; ++d) {
+                    if (d >= -1 && d <= 1) {
+                        continue;
+                    }
+                    neighbours += levels[static_cast<size_t>(static_cast<int>(i) + d)];
+                    ++count;
+                }
+                const double excess = levels[i] - neighbours / static_cast<double>(count);
+                if (excess >= kResonanceMinExcessDb && levels[i] >= levels[i - 1] && levels[i] >= levels[i + 1]) {
+                    found.push_back({i, excess});
+                }
+            }
+            std::sort(found.begin(), found.end(), [](const Candidate& a, const Candidate& b) { return a.excess > b.excess; });
+            ResonanceSettings resonance;
+            std::vector<size_t> chosen;
+            for (const Candidate& candidate : found) {
+                if (resonance.count >= kMaxResonanceBands) {
+                    break;
+                }
+                bool close = false;
+                for (size_t other : chosen) {
+                    const size_t gap = other > candidate.index ? other - candidate.index : candidate.index - other;
+                    close = close || gap < 3;
+                }
+                if (close) {
+                    continue;
+                }
+                chosen.push_back(candidate.index);
+                ResonanceBand band;
+                band.frequency = centres[candidate.index];
+                band.q = 6.0;
+                band.maxCutDb = std::min(std::max(0.6 * candidate.excess, 1.5), 4.0);
+                band.thresholdDb = 2.0;
+                resonance.bands[resonance.count++] = band;
+            }
+            if (resonance.count > 0) {
+                resonance.enabled = true;
+                analysis.plan.resonance = resonance;
+                std::string list;
+                for (size_t b = 0; b < resonance.count; ++b) {
+                    list += (b > 0 ? ", " : "") + num(resonance.bands[b].frequency, 0) + " Hz";
+                }
+                analysis.notes.push_back("The resonance tamer is on at " + list + ": each band is reduced only while it sticks out above its neighbours");
+            } else {
+                analysis.notes.push_back("No lasting resonances were found, so the resonance tamer was left off");
+            }
+        }
+    }
+
     analysis.plan.softClip = config_.softClip;
     analysis.plan.softClipKneeDb = config_.softClipKneeDb;
     analysis.plan.limiterEnabled = true;
@@ -973,6 +1105,9 @@ Analysis MasteringEngine::analyze(const std::vector<std::string>& references, co
         analysis.notes.push_back("A 20 Hz high-pass filter was applied because the input has a DC offset");
     }
 
+    if (in.nonFinite > 0) {
+        analysis.warnings.push_back("The input contains " + std::to_string(in.nonFinite) + " invalid samples (not-a-number or infinite values); they were replaced with silence");
+    }
     if (in.measurements.truePeakDb > 0.0) {
         analysis.warnings.push_back("Input contains true peaks above 0 dBTP");
     }
@@ -1034,6 +1169,28 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
     result.notes = analysis.notes;
 
     ChainPlan base = analysis.plan;
+    double targetLufs = config_.targetLufs;
+    if (config_.autoGain && config_.punchGuardPlrDb > 0.0) {
+        const double guarded = config_.ceilingDb - config_.punchGuardPlrDb;
+        if (targetLufs > guarded) {
+            targetLufs = guarded;
+            std::ostringstream note;
+            note << std::fixed << std::setprecision(1) << "The punch guard lowered the loudness target from " << config_.targetLufs << " to " << guarded
+                 << " LUFS so the track keeps at least " << config_.punchGuardPlrDb << " dB between its peaks and its average level";
+            result.notes.push_back(note.str());
+        }
+    }
+    result.effectiveTargetLufs = targetLufs;
+    {
+        const double inputPlr = analysis.input.integratedLufs > -100.0 ? analysis.input.plrDb() : 11.0;
+        const double preserved = std::min(std::max(0.75 * inputPlr, 7.0), 12.0);
+        result.safeMaxLufs = config_.ceilingDb - preserved;
+    }
+    if (config_.glue) {
+        base.glue.enabled = true;
+        base.glue.thresholdDb = config_.ceilingDb - kGlueThresholdBelowCeilingDb;
+        result.notes.push_back("A gentle glue compressor runs before the limiter for extra cohesion and density");
+    }
     const double peakTarget = config_.ceilingDb - kPeakSafetyDb;
     double trimDb = 0.0;
     double gain = 0.0;
@@ -1055,7 +1212,7 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         if (preMeasure.integratedLufs <= -100.0) {
             throw MasteredError("Audio is too quiet to measure (below -70 LUFS), so it cannot be normalised to a loudness target; raise its level first");
         }
-        startGain = std::min(std::max(config_.targetLufs - preMeasure.integratedLufs, -kMaxMakeupDb), kMaxMakeupDb);
+        startGain = std::min(std::max(targetLufs - preMeasure.integratedLufs, -kMaxMakeupDb), kMaxMakeupDb);
         gain = startGain;
     }
 
@@ -1075,6 +1232,14 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         plan.ceilingDb = base.ceilingDb - trimDb;
         return plan;
     };
+    std::vector<Segment> segments;
+    if (config_.autoGain && static_cast<double>(analysis.frames) >= kCoarseMinSeconds * static_cast<double>(analysis.sampleRate)) {
+        const uint64_t length = static_cast<uint64_t>(kCoarseSegmentSeconds * static_cast<double>(analysis.sampleRate));
+        for (size_t k = 0; k < kCoarseSegments; ++k) {
+            const uint64_t centre = static_cast<uint64_t>((static_cast<double>(k) + 0.5) * static_cast<double>(analysis.frames) / static_cast<double>(kCoarseSegments));
+            segments.push_back({centre > length / 2 ? centre - length / 2 : 0, length});
+        }
+    }
     double slopeEstimate = 1.0;
     bool saturated = false;
     double saturationBestLufs = 0.0;
@@ -1094,9 +1259,56 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         double current = initialGain;
         int stalls = 0;
         saturated = false;
+        bool havePending = false;
+        double pendingGain = 0.0;
+        double pendingLufs = 0.0;
+        if (!segments.empty()) {
+            const double fullStart = probe(initialGain);
+            auto excerptLufs = [&](double gainDb) {
+                advance("Estimating loudness", percent + 0.5);
+                return runPostExcerpts(cache.path(), analysis, planFor(gainDb), segments, config_.dualMono).integratedLufs;
+            };
+            const double excerptStart = excerptLufs(initialGain);
+            if (fullStart > -100.0 && excerptStart > -100.0) {
+                havePending = true;
+                pendingGain = initialGain;
+                pendingLufs = fullStart;
+                const double offset = fullStart - excerptStart;
+                double gainDb = initialGain;
+                double level = excerptStart;
+                double coarseSlope = slopeEstimate;
+                for (int k = 0; k < 5; ++k) {
+                    const double error = targetLufs - (level + offset);
+                    if (std::fabs(error) <= config_.loudnessToleranceLu * 0.5) {
+                        break;
+                    }
+                    const double next = std::min(std::max(gainDb + error / coarseSlope, -kMaxMakeupDb), kMaxMakeupDb);
+                    if (std::fabs(next - gainDb) < 1e-4) {
+                        break;
+                    }
+                    const double nextLevel = excerptLufs(next);
+                    if (nextLevel <= -100.0) {
+                        break;
+                    }
+                    const double measured = (nextLevel - level) / (next - gainDb);
+                    if (measured < 0.35) {
+                        break;
+                    }
+                    coarseSlope = std::min(std::max(measured, 0.25), 1.0);
+                    gainDb = next;
+                    level = nextLevel;
+                }
+                current = gainDb;
+            }
+        }
         for (int i = 1; i <= config_.maxLoudnessIterations; ++i) {
-            const double lufs = probe(current);
-            const double error = config_.targetLufs - lufs;
+            double lufs;
+            if (havePending && std::fabs(current - pendingGain) < 1e-9) {
+                lufs = pendingLufs;
+            } else {
+                lufs = probe(current);
+            }
+            const double error = targetLufs - lufs;
             if (std::fabs(error) <= config_.loudnessToleranceLu) {
                 return current;
             }
@@ -1124,7 +1336,7 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
         size_t best = 0;
         double highest = probes[0].lufs;
         for (size_t k = 1; k < probes.size(); ++k) {
-            if (std::fabs(config_.targetLufs - probes[k].lufs) < std::fabs(config_.targetLufs - probes[best].lufs)) {
+            if (std::fabs(targetLufs - probes[k].lufs) < std::fabs(targetLufs - probes[best].lufs)) {
                 best = k;
             }
             highest = std::max(highest, probes[k].lufs);
@@ -1212,17 +1424,17 @@ MasteringResult MasteringEngine::render(const Analysis& analysis, const std::str
     result.makeupGainDb = gain;
     result.iterations = iterations;
     if (config_.autoGain) {
-        const double finalError = config_.targetLufs - result.output.integratedLufs;
+        const double finalError = targetLufs - result.output.integratedLufs;
         result.targetReached = std::fabs(finalError) <= std::max(config_.loudnessToleranceLu, 0.05) * 1.5;
         if (!result.targetReached) {
             std::ostringstream message;
             if (saturated) {
                 message << "Loudness target not reached: this track cannot get much louder than " << std::fixed << std::setprecision(2) << saturationBestLufs
                         << " LUFS at a ceiling of " << config_.ceilingDb << " dBTP without crushing its dynamics, so the engine stopped at " << result.output.integratedLufs
-                        << " LUFS instead of " << config_.targetLufs << " LUFS; choose a lower target or a higher ceiling";
+                        << " LUFS instead of " << targetLufs << " LUFS; choose a lower target or a higher ceiling";
             } else {
                 message << "Loudness target not reached: measured " << std::fixed << std::setprecision(2) << result.output.integratedLufs
-                        << " LUFS against a target of " << config_.targetLufs << " LUFS; the true-peak ceiling limits the achievable loudness";
+                        << " LUFS against a target of " << targetLufs << " LUFS; the true-peak ceiling limits the achievable loudness";
             }
             result.warnings.push_back(message.str());
         }
@@ -1291,14 +1503,18 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result, const Mas
     out << "  \"settings\": {\"targetLufs\": " << num(config.targetLufs, 2) << ", \"ceilingDb\": " << num(config.ceilingDb, 2)
         << ", \"toleranceLu\": " << num(config.loudnessToleranceLu, 3) << ", \"dualMono\": " << (config.dualMono ? "true" : "false")
         << ", \"lookaheadMs\": " << num(config.limiterLookaheadMs, 1) << ", \"releaseMs\": " << num(config.limiterReleaseMs, 0)
-        << ", \"strictPeak\": " << (config.strictPeak ? "true" : "false") << ", \"linearPhase\": " << (config.linearPhase ? "true" : "false") << ", \"deess\": " << (config.deess ? "true" : "false") << ", \"genre\": " << quote(config.genre) << "},\n";
+        << ", \"strictPeak\": " << (config.strictPeak ? "true" : "false") << ", \"linearPhase\": " << (config.linearPhase ? "true" : "false") << ", \"deess\": " << (config.deess ? "true" : "false") << ", \"genre\": " << quote(config.genre)
+        << ", \"effectiveTargetLufs\": " << num(result.effectiveTargetLufs != 0.0 ? result.effectiveTargetLufs : config.targetLufs, 2)
+        << ", \"punchGuardPlrDb\": " << num(config.punchGuardPlrDb, 1) << ", \"glue\": " << (config.glue ? "true" : "false")
+        << ", \"resonance\": " << (config.resonance ? "true" : "false") << "},\n";
     out << "  \"input\": {\"path\": " << quote(result.inputPath) << ", \"sampleRate\": " << a.sampleRate << ", \"channels\": " << a.channels
         << ", \"frames\": " << a.frames << ", \"measurements\": " << measurementsJson(a.input) << "},\n";
     out << "  \"references\": {\"count\": " << a.referenceCount << ", \"measurements\": " << measurementsJson(a.reference) << "},\n";
     out << "  \"output\": {\"path\": " << quote(result.outputPath) << ", \"bitDepth\": " << result.outputBitDepth
         << ", \"measurements\": " << measurementsJson(result.output) << "},\n";
     out << "  \"gain\": {\"makeupDb\": " << num(result.makeupGainDb, 2) << ", \"iterations\": " << result.iterations
-        << ", \"targetReached\": " << (result.targetReached ? "true" : "false") << ", \"ceilingTrimDb\": " << num(result.ceilingTrimDb, 3) << "},\n";
+        << ", \"targetReached\": " << (result.targetReached ? "true" : "false") << ", \"ceilingTrimDb\": " << num(result.ceilingTrimDb, 3)
+        << ", \"safeMaxLufs\": " << num(result.safeMaxLufs, 1) << "},\n";
     {
         const QualityGrade quality = gradeResult(result, config);
         out << "  \"quality\": {\"grade\": " << quote(std::string(1, quality.grade)) << ", \"score\": " << quality.score << ", \"reasons\": [";
@@ -1357,6 +1573,21 @@ std::string MasteringEngine::exportJSON(const MasteringResult& result, const Mas
         << ", \"afterDb\": " << num(result.matchAfterDb, 2) << "}},\n";
     out << "  \"waveform\": {\"columns\": " << a.inputWaveform.peak.size() << ", \"input\": " << waveformJson(a.inputWaveform)
         << ", \"output\": " << waveformJson(result.outputWaveform) << "},\n";
+    {
+        auto toDoubles = [](const std::vector<float>& values) {
+            return std::vector<double>(values.begin(), values.end());
+        };
+        out << "  \"timeline\": {\"stepSec\": " << num(a.input.timelineStepSec, 3) << ", \"input\": " << numberArray(toDoubles(a.input.timeline), 1)
+            << ", \"output\": " << numberArray(toDoubles(result.output.timeline), 1) << "},\n";
+        out << "  \"resonance\": {\"enabled\": " << (a.plan.resonance.enabled ? "true" : "false") << ", \"bands\": [";
+        for (size_t i = 0; i < a.plan.resonance.count; ++i) {
+            const ResonanceBand& b = a.plan.resonance.bands[i];
+            out << (i > 0 ? ", " : "") << "{\"frequency\": " << num(b.frequency, 0) << ", \"maxCutDb\": " << num(b.maxCutDb, 1) << "}";
+        }
+        out << "]},\n";
+        out << "  \"glue\": {\"enabled\": " << (a.plan.glue.enabled ? "true" : "false") << ", \"thresholdDb\": " << num(a.plan.glue.thresholdDb, 1)
+            << ", \"ratio\": " << num(a.plan.glue.ratio, 2) << "},\n";
+    }
     out << "  \"notes\": [";
     for (size_t i = 0; i < result.notes.size(); ++i) {
         out << (i > 0 ? ", " : "") << quote(result.notes[i]);
