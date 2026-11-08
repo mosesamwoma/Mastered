@@ -4,7 +4,7 @@ import threading
 import time
 
 JSON_FIELDS = ("cli_args", "sources", "report", "timings")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 UPDATABLE = {
     "status", "progress", "message", "error", "started", "finished", "report",
     "sources", "worker", "heartbeat", "cancel", "preview", "category", "timings",
@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status, created);
 CREATE INDEX IF NOT EXISTS jobs_client ON jobs (client, created);
+CREATE TABLE IF NOT EXISTS job_log (
+    client TEXT NOT NULL,
+    created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS job_log_client ON job_log (client, created);
+CREATE TABLE IF NOT EXISTS revoked_sessions (
+    fingerprint TEXT PRIMARY KEY,
+    expires REAL NOT NULL
+);
 """
 
 
@@ -99,6 +108,24 @@ class JobStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def trim_log(self, now):
+        with self.lock:
+            self.connection.execute("DELETE FROM job_log WHERE created < ?", (now - 7200.0,))
+            self.connection.execute("DELETE FROM revoked_sessions WHERE expires < ?", (now,))
+
+    def add_revoked(self, fingerprint, expires):
+        with self.lock:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO revoked_sessions (fingerprint, expires) VALUES (?, ?)", (fingerprint, expires)
+            )
+
+    def load_revoked(self, now):
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT fingerprint, expires FROM revoked_sessions WHERE expires >= ?", (now,)
+            ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
     def close(self):
         with self.lock:
             self.connection.close()
@@ -132,12 +159,13 @@ class JobStore:
             recent = [
                 row[0]
                 for row in cursor.execute(
-                    "SELECT created FROM jobs WHERE client = ? AND created > ? ORDER BY created ASC",
+                    "SELECT created FROM job_log WHERE client = ? AND created > ? ORDER BY created ASC",
                     (client, now - 3600.0),
                 )
             ]
             if len(recent) >= per_client_hour:
                 return "rate", max(1.0, recent[0] + 3600.0 - now)
+            cursor.execute("INSERT INTO job_log (client, created) VALUES (?, ?)", (client, now))
             cursor.execute(
                 "INSERT INTO jobs (id, status, created, updated, message, track_name, cli_args, client) "
                 "VALUES (?, 'uploading', ?, ?, 'Waiting for upload', ?, ?, ?)",
