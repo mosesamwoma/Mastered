@@ -18,6 +18,7 @@ constexpr uint16_t kFormatFloat = 3;
 constexpr uint16_t kFormatExtensible = 0xFFFE;
 constexpr uint64_t kUnknownSize = 0xFFFFFFFFULL;
 constexpr size_t kDs64Payload = 28;
+constexpr size_t kMaxChunks = 4096;
 
 uint16_t readU16(const unsigned char* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -93,7 +94,11 @@ WavReader::WavReader(const std::string& path) : path_(path) {
     uint64_t ds64DataSize = 0;
     std::vector<std::pair<std::string, uint64_t>> ds64Table;
     uint64_t position = 12;
+    size_t chunkCount = 0;
     while (position + 8 <= fileSize && !(foundFormat && foundData)) {
+        if (++chunkCount > kMaxChunks) {
+            throw MasteredError(path + ": the file has too many chunks to be a valid WAV file");
+        }
         file_.clear();
         file_.seekg(static_cast<std::streamoff>(position));
         unsigned char chunkHeader[8];
@@ -198,6 +203,7 @@ void WavReader::rewind() {
     file_.clear();
     file_.seekg(static_cast<std::streamoff>(dataOffset_));
     framesRead_ = 0;
+    nonFinite_ = 0;
 }
 
 size_t WavReader::read(AudioBlock& block, size_t maxFrames) {
@@ -242,7 +248,8 @@ size_t WavReader::read(AudioBlock& block, size_t maxFrames) {
                 std::memcpy(&value, &raw, sizeof(value));
             }
             if (!std::isfinite(value)) {
-                throw MasteredError(path_ + ": audio contains non-finite samples");
+                value = 0.0;
+                ++nonFinite_;
             }
             block[ch][i] = value;
             p += bytes;
@@ -262,7 +269,9 @@ WavWriter::WavWriter(const std::string& path, uint32_t sampleRate, uint16_t chan
       dither_(dither),
       noiseShaping_(noiseShaping),
       sizeLimit_(sizeLimit),
-      shapingError_(channels, 0.0) {
+      shapingHistory_(channels, std::array<double, 3>{0.0, 0.0, 0.0}),
+      shapingError_(channels, 0.0),
+      highOrderShaping_(noiseShaping && bitDepth == 16 && sampleRate >= 32000 && sampleRate <= 52000) {
     if (bitDepth != 16 && bitDepth != 24 && bitDepth != 32) {
         throw MasteredError("Output bit depth must be 16, 24 or 32");
     }
@@ -401,11 +410,28 @@ void WavWriter::write(const AudioBlock& block, size_t frames) {
                 p[2] = static_cast<unsigned char>((raw >> 16) & 0xFF);
                 p[3] = static_cast<unsigned char>((raw >> 24) & 0xFF);
             } else {
-                const double v = x * scale - (noiseShaping_ ? shapingError_[ch] : 0.0);
+                double feedback = 0.0;
+                if (noiseShaping_) {
+                    if (highOrderShaping_) {
+                        const std::array<double, 3>& h = shapingHistory_[ch];
+                        feedback = 1.623 * h[0] - 0.982 * h[1] + 0.109 * h[2];
+                    } else {
+                        feedback = shapingError_[ch];
+                    }
+                }
+                const double v = x * scale - feedback;
                 const double d = dither_ ? triangular() : 0.0;
                 const double rounded = std::floor(v + d + 0.5);
                 const double clamped = std::min(std::max(rounded, minValue), maxValue);
-                shapingError_[ch] = (noiseShaping_ && clamped == rounded) ? rounded - v : 0.0;
+                const double error = (noiseShaping_ && clamped == rounded) ? rounded - v : 0.0;
+                if (highOrderShaping_) {
+                    std::array<double, 3>& h = shapingHistory_[ch];
+                    h[2] = h[1];
+                    h[1] = h[0];
+                    h[0] = error;
+                } else {
+                    shapingError_[ch] = error;
+                }
                 const int32_t q = static_cast<int32_t>(clamped);
                 p[0] = static_cast<unsigned char>(q & 0xFF);
                 p[1] = static_cast<unsigned char>((q >> 8) & 0xFF);
