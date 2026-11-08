@@ -209,7 +209,7 @@ async def build_export(settings, directory: Path, format_id, quality_id, encoder
     if fmt.id == "wav" and not rate:
         tags = None
     bits = int(report.get("output", {}).get("bitDepth", 24) or 24)
-    needs_check = fmt.lossy or bool(rate)
+    needs_check = fmt.lossy or bool(rate) or quality.id == "pcm16"
     target_lufs = float(mastered_measurements.get("integratedLufs", -120.0))
     retarget = fmt.lossy and target_lufs > -100.0
     key = export_key(fmt.id, quality.id) + ("_48k" if rate else "") + ("_tags" if tags else "")
