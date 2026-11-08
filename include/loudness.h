@@ -34,6 +34,8 @@ struct LoudnessResult {
     double loudnessRangeLu = 0.0;
     double momentaryMaxLufs = -120.0;
     double shortTermMaxLufs = -120.0;
+    std::vector<float> timeline;
+    double timelineStepSec = 0.0;
 };
 
 class LoudnessMeter {
@@ -82,6 +84,8 @@ struct Measurements {
     double loudnessRangeLu = 0.0;
     double momentaryMaxLufs = -120.0;
     double shortTermMaxLufs = -120.0;
+    std::vector<float> timeline;
+    double timelineStepSec = 0.0;
     double truePeakDb = -200.0;
     double samplePeakDb = -200.0;
     double dcOffset = 0.0;
