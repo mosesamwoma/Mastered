@@ -59,6 +59,9 @@ void printUsage() {
         "  --soft-clip           Always use the soft clipper before the limiter\n"
         "  --no-auto-clip        Do not switch the soft clipper on automatically for heavy limiting\n"
         "  --bass-limiter        Experimental: limit the band below 140 Hz separately\n"
+        "  --glue                Gentle glue compression ahead of the limiter\n"
+        "  --resonance           Reduce narrow resonances only while they stick out\n"
+        "  --punch-guard PLR     Keep at least PLR dB between peaks and average level, 3 to 16 (0 = off)\n"
         "  --no-auto-mono-bass   Do not make the bass mono automatically when it is out of phase\n"
         "  --dual-mono           Measure single-channel files as dual mono (+3 LU)\n"
         "  --measure PATH        Measure a WAV file (loudness and true peak) as JSON and exit\n"
@@ -223,6 +226,12 @@ int run(int argc, char** argv) {
             config.autoClip = false;
         } else if (arg == "--bass-limiter") {
             config.bassLimiter = true;
+        } else if (arg == "--glue") {
+            config.glue = true;
+        } else if (arg == "--resonance") {
+            config.resonance = true;
+        } else if (arg == "--punch-guard") {
+            config.punchGuardPlrDb = parseNumber(arg, value());
         } else if (arg == "--no-auto-mono-bass") {
             config.autoMonoBass = false;
         } else if (arg == "--dual-mono") {
@@ -341,8 +350,11 @@ int run(int argc, char** argv) {
         }
         if (result.analysis.plan.dynamics.enabled) {
             const auto& bands = result.analysis.plan.dynamics.bands;
-            std::cout << "  Dynamics ratios " << std::setprecision(2) << bands[0].ratio << ", " << bands[1].ratio << ", " << bands[2].ratio
-                      << " (low, mid, high)\n";
+            std::cout << "  Dynamics ratios " << std::setprecision(2);
+            for (size_t b = 0; b < result.analysis.plan.dynamics.bandCount; ++b) {
+                std::cout << (b > 0 ? ", " : "") << bands[b].ratio;
+            }
+            std::cout << " (low to high)\n";
         }
     }
     for (const std::string& note : result.notes) {
