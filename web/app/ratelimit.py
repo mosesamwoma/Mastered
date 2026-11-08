@@ -3,12 +3,28 @@ import time
 from collections import OrderedDict, deque
 
 MAX_TRACKED_CLIENTS = 20000
+TRUSTED_NETWORKS = []
+
+
+def configure_trusted(networks):
+    TRUSTED_NETWORKS[:] = list(networks)
+
+
+def peer_is_trusted(scope):
+    if not TRUSTED_NETWORKS:
+        return True
+    client = scope.get("client")
+    try:
+        address = ipaddress.ip_address(client[0]) if client else None
+    except ValueError:
+        return False
+    return address is not None and any(address in network for network in TRUSTED_NETWORKS)
 
 
 def client_key(scope, header, hops=1):
     headers = {name.lower(): value for name, value in scope.get("headers", [])}
     candidate = None
-    if header:
+    if header and peer_is_trusted(scope):
         raw = headers.get(header.encode("latin-1"))
         if raw:
             text = raw.decode("latin-1").strip()
