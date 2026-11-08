@@ -1,4 +1,4 @@
-import { cell, formatNumber, frequencyLabel, signed } from './format.js';
+import { cell, formatNumber, formatTime, frequencyLabel, signed } from './format.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -108,4 +108,53 @@ export function buildBandTable(bands) {
   table.appendChild(tbody);
   wrap.appendChild(table);
   return wrap;
+}
+
+export function buildTimelineChart(timeline) {
+  const input = Array.isArray(timeline.input) ? timeline.input : [];
+  const output = Array.isArray(timeline.output) ? timeline.output : [];
+  const count = Math.max(input.length, output.length);
+  const values = input.concat(output).filter((value) => typeof value === 'number' && Number.isFinite(value) && value > -70);
+  if (count < 3 || values.length < 3 || !(timeline.stepSec > 0)) {
+    return null;
+  }
+  const low = Math.floor((Math.min(...values) - 2) / 3) * 3;
+  const high = Math.ceil((Math.max(...values) + 2) / 3) * 3;
+  const width = 640;
+  const height = 240;
+  const left = 50;
+  const right = 12;
+  const top = 12;
+  const bottom = 28;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const xOf = (index) => left + (index / (count - 1)) * plotWidth;
+  const yOf = (value) => top + (1 - (Math.max(low, Math.min(high, value)) - low) / (high - low)) * plotHeight;
+  const svg = svgNode('svg', { viewBox: '0 0 ' + width + ' ' + height, role: 'img' });
+  svg.setAttribute('aria-label', 'Short-term loudness of your track and the master over time');
+  for (let value = low; value <= high; value += 3) {
+    const y = yOf(value);
+    svg.appendChild(svgNode('line', { class: 'chart-axis', x1: left, x2: width - right, y1: y.toFixed(1), y2: y.toFixed(1) }));
+    const label = svgNode('text', { class: 'chart-label', x: left - 6, y: (y + 4).toFixed(1), 'text-anchor': 'end' });
+    label.textContent = value + '';
+    svg.appendChild(label);
+  }
+  for (let tick = 0; tick <= 4; tick += 1) {
+    const index = Math.round((tick / 4) * (count - 1));
+    const x = xOf(index);
+    const label = svgNode('text', { class: 'chart-label', x: x.toFixed(1), y: height - 8, 'text-anchor': 'middle' });
+    label.textContent = formatTime(1.5 + index * timeline.stepSec);
+    svg.appendChild(label);
+  }
+  const pathOf = (series) =>
+    series
+      .map((value, index) => (index === 0 ? 'M' : 'L') + xOf(index).toFixed(1) + ' ' + yOf(typeof value === 'number' && Number.isFinite(value) ? value : low).toFixed(1))
+      .join(' ');
+  if (input.length > 1) {
+    svg.appendChild(svgNode('path', { class: 'chart-input', d: pathOf(input) }));
+  }
+  if (output.length > 1) {
+    svg.appendChild(svgNode('path', { class: 'chart-output', d: pathOf(output) }));
+  }
+  return svg;
 }
