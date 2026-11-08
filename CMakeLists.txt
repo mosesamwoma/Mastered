@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(MasteredEngine VERSION 2.6.0 LANGUAGES CXX)
+project(MasteredEngine VERSION 2.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
