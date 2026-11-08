@@ -5,6 +5,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -24,6 +25,8 @@ HEARTBEAT_EVERY_TICKS = 5
 SWEEP_INTERVAL_SEC = 30
 ORPHAN_DIRECTORY_SEC = 1800
 CONVERT_PROGRESS = 8.0
+TEMP_DIRECTORY = "tmp"
+TEMP_STALE_SEC = 3600
 ENGINE_PROGRESS_END = 96.0
 
 
@@ -83,6 +86,7 @@ class JobManager:
     async def start(self):
         os.umask(0o077)
         self.settings.work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        await asyncio.to_thread(self.prepare_temp)
         self.store = await asyncio.to_thread(JobStore, self.settings.database_path)
         self.tasks = [asyncio.create_task(self.work()), asyncio.create_task(self.sweep())]
 
@@ -96,6 +100,26 @@ class JobManager:
             for job_id in self.store.running_for_worker(self.worker_id):
                 self.store.mark_failed(job_id, "The server restarted while this job was running", only_status="running", category="restart")
             self.store.close()
+
+    def prepare_temp(self):
+        directory = self.settings.work_dir / TEMP_DIRECTORY
+        directory.mkdir(mode=0o700, exist_ok=True)
+        tempfile.tempdir = str(directory)
+        self.clean_temp(0)
+
+    def clean_temp(self, older_than):
+        directory = self.settings.work_dir / TEMP_DIRECTORY
+        cutoff = time.time() - older_than
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if entry.is_file() and entry.stat().st_mtime <= cutoff:
+                    entry.unlink(missing_ok=True)
+            except OSError:
+                continue
 
     def free_megabytes(self):
         try:
@@ -245,6 +269,8 @@ class JobManager:
                 metrics.count("jobs", {"outcome": "failed", "category": "worker_lost"})
                 await self.clear_files(row["id"])
         await asyncio.to_thread(self.remove_orphan_directories)
+        await asyncio.to_thread(self.clean_temp, TEMP_STALE_SEC)
+        await self.database(self.store.trim_log, now)
         metrics.gauge("disk_free_megabytes", await asyncio.to_thread(self.free_megabytes))
         counts = await self.database(self.store.counts)
         for name in ("queued", "running", "done", "failed", "uploading"):
@@ -339,6 +365,8 @@ class JobManager:
                     raw, wav, info, self.settings.max_duration_sec, self.settings.convert_timeout_sec, self.register(job_id),
                     self.settings.max_decoded_mb * 1024 * 1024,
                 )
+                if label == "track" and "--bitdepth" not in row["cli_args"]:
+                    row["cli_args"] = [*row["cli_args"], "--bitdepth", "16" if 0 < info.bits <= 16 else "24"]
                 converted_info = await asyncio.to_thread(inspect_wav, wav)
                 if converted_info.duration > self.settings.max_duration_sec + 1.0:
                     raise MediaError("the audio is longer than the allowed length")
