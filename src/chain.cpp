@@ -61,9 +61,15 @@ ProcessingChain::ProcessingChain(const ChainPlan& plan, double sampleRate, size_
         if (plan.deEsser.enabled) {
             deEsser_ = std::make_unique<DeEsser>(plan.deEsser, sampleRate, channels);
         }
+        if (plan.resonance.enabled && plan.resonance.count > 0) {
+            resonance_ = std::make_unique<ResonanceTamer>(plan.resonance, sampleRate, channels);
+        }
         if (plan.dynamics.enabled) {
             compressor_ = std::make_unique<MultibandCompressor>(plan.dynamics, sampleRate, channels);
         }
+    }
+    if (stage != ChainStage::Pre && plan.glue.enabled) {
+        glue_ = std::make_unique<GlueCompressor>(plan.glue, sampleRate, channels);
     }
     if (stage != ChainStage::Pre && plan.limiterEnabled) {
         const OversamplingKernel& kernel = plan.strictPeak ? accurateKernel() : standardKernel();
@@ -163,6 +169,9 @@ void ProcessingChain::processPre(AudioBlock& block, size_t frames) {
             }
         }
     }
+    if (resonance_) {
+        resonance_->process(block, frames);
+    }
     if (compressor_) {
         compressor_->process(block, frames);
     }
@@ -178,6 +187,9 @@ void ProcessingChain::processPost(AudioBlock& block, size_t frames) {
                 block[ch][i] *= gainLinear_;
             }
         }
+    }
+    if (glue_) {
+        glue_->process(block, frames);
     }
     if (clipper_) {
         clipper_->process(block, frames);
