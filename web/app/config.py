@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import re
 import shutil
@@ -75,6 +76,7 @@ class Settings:
     cookie_secure: str
     login_attempts: int
     trusted_proxy_hops: int
+    trusted_proxies: tuple
     max_decoded_mb: int
     min_free_mb: int
     engine_memory_mb: int
@@ -128,6 +130,18 @@ def load_admin(users):
     return token, names
 
 
+def load_trusted_proxies():
+    networks = []
+    for entry in re.split(r"[,\s]+", os.environ.get("TRUSTED_PROXIES") or ""):
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            raise ConfigError(f"TRUSTED_PROXIES contains an invalid address or network: {entry[:40]!r}") from None
+    return tuple(networks)
+
+
 def load_settings():
     users, secret, cookie_mode = load_auth()
     admin_token, admin_users = load_admin(users)
@@ -163,6 +177,7 @@ def load_settings():
         cookie_secure=cookie_mode,
         login_attempts=read_number("LOGIN_ATTEMPTS", 8, 1, 100, int),
         trusted_proxy_hops=read_number("TRUSTED_PROXY_HOPS", 1, 1, 10, int),
+        trusted_proxies=load_trusted_proxies(),
         max_decoded_mb=read_number("MAX_DECODED_MB", 1024, 16, 16384, int),
         min_free_mb=read_number("MIN_FREE_MB", 512, 0, 1048576, int),
         engine_memory_mb=read_number("ENGINE_MEMORY_MB", 2048, 256, 65536, int),
