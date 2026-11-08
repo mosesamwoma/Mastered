@@ -21,18 +21,23 @@ Everything runs as a streaming pipeline in fixed-size blocks, so memory use stay
 - Automatic 20 Hz high-pass when the input has a DC offset (`--subsonic HZ` to choose your own)
 - Look-ahead true-peak limiter with a program-dependent release (it releases more slowly the deeper it works) and a closed-loop check: the final output is measured with the same detector the limiter uses, and the limiter ceiling is trimmed until the measured peak respects the ceiling. The detector is the 4x one that DAW meters use by default, or a strict 8x one with `--strict-peak`
 - Loudness loop: gain is computed after EQ and dynamics, then iterated until the measured output hits the target. If the limiter saturates (more gain barely adds loudness), the loop stops at the knee instead of crushing the track, and the report says how loud the track can honestly get
-- TPDF dither with optional first-order noise shaping for 16 and 24 bit output
+- TPDF dither with optional noise shaping: a three-tap shaper that moves 16-bit noise out of the 2 to 5 kHz region where hearing is most sensitive, and a first-order shaper at other sizes and sample rates
+- Punch guard (`--punch-guard PLR`): lowers the loudness target when reaching it would leave less than PLR dB between the peaks and the average level, and the report gives an estimate of the loudest level that keeps the track's punch
+- Glue compressor (`--glue`): a gentle stereo-linked compressor with a program-dependent release in front of the clipper and limiter
+- Resonance tamer (`--resonance`): finds narrow peaks between 1.5 and 12 kHz in the average spectrum and reduces each one by at most 4 dB, only while it sticks out above its neighbouring bands
+- Loudness timeline: short-term loudness over time for the input and the master, in the report and as a chart in the web page
+- Non-finite samples (NaN, infinity) in a float WAV are replaced with silence and reported instead of failing the job; WAV files with more than 4096 chunks are refused
 - WAV input: 16/24/32-bit PCM, 32/64-bit float, WAVE_FORMAT_EXTENSIBLE, RF64/BW64 files over 4 GB, up to 8 channels, odd-sized chunks, streamed headers
 - WAV output: 16/24-bit PCM, 32-bit float (format tag 3), extensible header above two channels, automatic RF64 beyond 4 GB
 - JSON report, ReaEQ band list and Equalizer APO config (including mid/side)
-- Platform presets (Spotify, YouTube, Apple Music, Amazon Music, Tidal, Deezer, SoundCloud, podcast, EBU R128, ATSC A/85, loud master) shared by the command line and the web page
+- Platform presets (Spotify, YouTube, Apple Music, Amazon Music, Tidal, Deezer, SoundCloud, social video, podcast, EBU R128, ATSC A/85, club and DJ, vinyl premaster, loud master) shared by the command line and the web page
 - Mono bass: the side signal is high-passed (fourth order) so low frequencies fold to mono cleanly
 - Extra measurements: sample peak, momentary and short-term maximum, peak-to-loudness ratio, DC offset, clipped samples, mono fold-down loss and low-band correlation
 - Limiter gain-reduction report (maximum, average, share of time)
 - Reference check: after rendering, the master's average spectrum is measured again and compared with the reference, so the report shows how much closer the tone got
 - Waveform data for the input and the master, an average-spectrum comparison, and a streaming-service table in the web page
 - C API shared library
-- Web app (FastAPI + a single static page): optional sign-in page, MP3, FLAC, M4A, OGG and AAC upload, a before/after player, per-visitor rate limits, persistent job storage, Docker image and Render blueprint
+- Web app (FastAPI + a single static page): sign-in page, MP3, FLAC, M4A, OGG and AAC upload decoded at full precision, a before/after player with a blind A/B/X test, spectrogram and stereo vectorscope, a comparison with your previous master, an album overview for batches, a download bundle, light and dark themes, per-visitor rate limits, persistent job storage, Docker image and Render blueprint
 
 ## Build
 
@@ -158,7 +163,8 @@ docker run --rm -p 10000:10000 mastered
 
 1. Push this folder to a GitHub repository.
 2. In Render choose New, then Blueprint, and select the repository. Render reads `render.yaml` and creates a free Docker web service. Alternatively choose New, then Web Service, pick the repository, set the runtime to Docker and the plan to Free.
-3. Wait for the build to finish and open the service URL.
+3. Set `AUTH_USERS` (and optionally `ADMIN_USERS`) in the service environment; the blueprint asks for them. Sign-in is required by default, and the service refuses to start without it unless you deliberately set `ALLOW_PUBLIC=true`. See Sign-in below for how to create the password hashes.
+4. Wait for the build to finish and open the service URL.
 
 The free plan has a small CPU share and sleeps after 15 minutes without visitors, so the first visit can take about a minute and a 3-minute song can take several minutes to master. Conversion and preview creation add to that. Disk is temporary: results and the job database are removed on every restart. The page shows a waking-up message while the service starts and keeps polling your job if you reload.
 
@@ -217,6 +223,9 @@ Limits are applied per visitor, identified by IP address (IPv6 addresses are gro
 - A cap on API requests per minute (`API_REQUESTS_PER_MINUTE`) and on upload attempts per hour (`UPLOAD_ATTEMPTS_PER_HOUR`).
 - A global cap on waiting plus running jobs (`MAX_PENDING_JOBS`).
 - Rejected requests get HTTP 429 with a `Retry-After` header.
+- The hourly job count is kept in its own log, so deleting or expiring a job does not give the visitor a fresh allowance.
+- Failed sign-ins are limited per address and per address and user name. Many failures against one user name from different addresses slow that account's sign-ins down instead of blocking them, so an attacker cannot lock the real users out.
+- At most two uploads are received at the same time; others get HTTP 503 with `Retry-After`. Temporary upload files are written under the work directory, not `/tmp`.
 
 Behind a proxy the visitor's address must come from a header. Set `CLIENT_IP_HEADER` to the header your host sets (`cf-connecting-ip` on Render, which sits behind Cloudflare; the Docker image and `render.yaml` already do this). When it is empty the header is ignored and the connection address is used, which cannot be spoofed but sees every visitor as the proxy. Only set it when the header is overwritten by infrastructure you trust.
 
@@ -248,6 +257,7 @@ All settings are environment variables with safe defaults.
 | `API_REQUESTS_PER_MINUTE` | 240 | API requests per visitor per minute, per process |
 | `UPLOAD_ATTEMPTS_PER_HOUR` | 30 | Upload attempts per visitor per hour, per process |
 | `CLIENT_IP_HEADER` | empty | Header that carries the visitor address. Set it only when a trusted proxy always sets it (`cf-connecting-ip`, or `x-forwarded-for`) |
+| `TRUSTED_PROXIES` | empty | Comma-separated addresses or networks of your proxies (for example `10.0.0.0/8`). When set, `CLIENT_IP_HEADER` is only believed if the direct connection comes from one of them |
 | `TRUSTED_PROXY_HOPS` | 1 | With `x-forwarded-for`, how many trusted proxies are in front; the address is read that many entries from the right |
 | `APP_ENV` | empty | `production` refuses to start without sign-in unless `ALLOW_PUBLIC=true`, and refuses `COOKIE_SECURE=never` |
 | `ALLOW_PUBLIC` | false in production | Run an open service without sign-in on purpose |
@@ -292,14 +302,15 @@ All settings are environment variables with safe defaults.
 | `GET /api/admin/jobs` | Recent jobs with status, age, error category and stuck flag (administrators only) |
 | `GET /api/jobs` | Your own queued, running and finished jobs, so a sign-in on another device can pick up where you left off (signed-in users only) |
 | `POST /api/login` | JSON `username` and `password`; sets the session cookie |
-| `POST /api/logout` | Clears the session cookie |
+| `POST /api/logout` | Clears the session cookie and revokes the session; revocations are kept in the job database and survive restarts |
 | `GET /api/session` | Whether sign-in is required and who is signed in |
 | `GET /api/config` | Limits, accepted formats, whether previews are available and whether sign-in is required |
-| `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `dynamics_bands` (2 to 5), `adaptive_crossovers`, `linear_phase`, `deess`, `strict_peak`, `soft_clip`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `dither`, `noise_shaping`, `mid_side`, `match_width`, `mono_bass_hz`. `reference` may be omitted when `genre` names a style curve, and extra reference tracks go in `extra_references` (at most 4 in total); returns 202 with the job id |
+| `POST /api/jobs` | Multipart upload with `reference`, `track` and optional `target_lufs`, `aggressiveness`, `ceiling_db`, `bands`, `bit_depth`, `precision` (`fast`, `normal`, `high`), `dynamics`, `dynamics_bands` (2 to 5), `adaptive_crossovers`, `linear_phase`, `deess`, `strict_peak`, `soft_clip`, `auto_clip`, `auto_mono_bass`, `dual_mono`, `bass_limiter`, `dither`, `noise_shaping`, `mid_side`, `match_width`, `mono_bass_hz`, `glue`, `resonance`, `punch_guard` (0 to switch off, otherwise 3 to 16 dB). `reference` may be omitted when `genre` names a style curve, and extra reference tracks go in `extra_references` (at most 4 in total); returns 202 with the job id |
 | `GET /api/jobs/{id}` | Status (`queued`, `running`, `done`, `failed`), progress, queue position, and when done the report, download link and preview links |
 | `GET /api/jobs/{id}/download` | Mastered WAV |
 | `POST /api/jobs/{id}/export` | JSON body `{"format": "mp3", "quality": "320", "rate": 48000, "metadata": true}` (`rate` is 0 to keep the sample rate or 48000; `metadata` keeps title, artist and album from the source file); encodes and checks the file, returns its name, URL, size and measured loudness and true peak. One export runs at a time, at most 12 files per job |
 | `GET /api/jobs/{id}/export/{key}` | A file made by the export call |
+| `GET /api/jobs/{id}/bundle` | A zip with the mastered WAV, the text and JSON reports and the EQ files |
 | `GET /api/jobs/{id}/report?kind=txt\|json` | The mastering report |
 | `GET /api/jobs/{id}/eq/{reaeq\|apo}` | EQ settings for ReaEQ or Equalizer APO |
 | `GET /api/jobs/{id}/audio/original` and `/mastered` | Preview audio with range support |
@@ -318,8 +329,8 @@ Also available for each result: a text or JSON report and, for the EQ, ReaEQ and
 ```
 reader -> [20 Hz high-pass for DC offset] -> de-esser (optional)
        -> [mid/side split] -> EQ (minimum-phase, or linear-phase) -> [side gain] -> [mid/side merge]
-       -> multiband compressor (optional, 2 to 5 bands) -> temporary 32-bit float file
-temporary file -> makeup gain -> soft clipper (optional, automatic for heavy limiting)
+       -> resonance tamer (optional) -> multiband compressor (optional, 2 to 5 bands) -> temporary 32-bit float file
+temporary file -> makeup gain -> glue compressor (optional) -> soft clipper (optional, automatic for heavy limiting)
        -> true-peak limiter -> writer -> meter (on the written file)
 ```
 
@@ -327,7 +338,7 @@ temporary file -> makeup gain -> soft clipper (optional, automatic for heavy lim
 2. Band levels are level-matched using the median difference across 63 Hz to 12.5 kHz, scaled by the aggressiveness, and clamped to -12 dB for cuts, +9 dB for boosts and +6 dB for boosts below 160 Hz. Big low-frequency boosts raise the kick peaks before the limiter and make it work harder, which is what softens a beat.
 3. A greedy fitter adds one band at a time, tries peak, low-shelf and high-shelf for each, and refines all bands jointly.
 4. With dynamics matching, each band's compression ratio is derived from how much more spread out its 200 ms levels are in your track than in the reference. The compressor is then run on the track and the ratios are corrected up to three times until the measured spread matches the target.
-5. The EQ, mid/side and dynamics stages do not depend on the makeup gain, so their output is written once to a temporary 32-bit float file next to the output (removed when the run ends, also on errors). The first measurement of that signal gives the starting gain and the peak-to-ceiling distance. Further passes read the temporary file, apply gain, clipper and limiter and adjust the makeup gain until the integrated loudness is within tolerance (0.02 LU by default, at most 12 passes per search).
+5. The EQ, mid/side and dynamics stages do not depend on the makeup gain, so their output is written once to a temporary 32-bit float file next to the output (removed when the run ends, also on errors). The first measurement of that signal gives the starting gain and the peak-to-ceiling distance. Further passes read the temporary file, apply gain, clipper and limiter and adjust the makeup gain until the integrated loudness is within tolerance (0.02 LU by default, at most 12 passes per search). For tracks longer than 100 seconds, a first estimate of the gain comes from eight short excerpts, so fewer full passes are needed.
 6. If the makeup gain would force the limiter to remove more than about 3 dB, the soft clipper is switched on automatically (`--no-auto-clip` turns that off), so the limiter does not have to pull the whole mix down on every kick.
 7. The limiter has a fast and a slow release follower and uses the smaller gain of the two: a single transient is released quickly, sustained limiting recovers over the full release time. The default look-ahead is 5 ms.
 8. The finished file is measured again after rounding to the output bit depth. If its true peak is above the ceiling minus 0.02 dB, the limiter ceiling is lowered by the excess; if the limiter is working and the peak is more than 0.08 dB lower, the ceiling is raised again (at most 0.6 dB, twice). The loudness is re-converged after each change and the file is written again, up to five times. The reported loudness and true peak are those of the delivered file.
