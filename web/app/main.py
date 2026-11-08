@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -22,11 +23,11 @@ from .jobs import DiskLow, JobManager, QueueFull, RateLimited, describe_duration
 from .media import SOURCE_EXTENSIONS, MediaError, MediaTools, describe_conversion, has_audio_signature
 from .observability import RequestLogMiddleware, metrics, setup_logging
 from .reports import report_text
-from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeadersMiddleware
-from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key
+from .middleware import AuthMiddleware, BodySizeLimitMiddleware, SecurityHeadersMiddleware, UploadGateMiddleware
+from .ratelimit import RateLimitMiddleware, SlidingWindow, client_key, configure_trusted
 from .wav_info import WavError, inspect_wav
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 CHUNK_BYTES = 1024 * 1024
 BODY_OVERHEAD_BYTES = 1024 * 1024
@@ -35,15 +36,26 @@ MAX_REFERENCES = 4
 GENRE_ID = re.compile(r"^[a-z0-9-]{0,32}$")
 LOGIN_WINDOW_SEC = 900.0
 LOGIN_BODY_BYTES = 4096
+BUNDLE_FILE = "bundle.zip"
+CONCURRENT_UPLOADS = 2
+ACCOUNT_SLOWDOWN_SEC = 2.0
 
 setup_logging()
 settings = load_settings()
 media = MediaTools(settings.ffmpeg_path, settings.ffprobe_path)
 manager = JobManager(settings, media)
-signer = SessionSigner(settings.session_secret, settings.session_seconds) if settings.auth_enabled else None
+configure_trusted(settings.trusted_proxies)
+
+
+def persist_revocation(fingerprint, expires):
+    if manager.store is not None:
+        manager.store.add_revoked(fingerprint, expires)
+
+
+signer = SessionSigner(settings.session_secret, settings.session_seconds, persist_revocation) if settings.auth_enabled else None
 login_limiter = SlidingWindow(settings.login_attempts, LOGIN_WINDOW_SEC)
 user_limiter = SlidingWindow(settings.login_attempts * 3, LOGIN_WINDOW_SEC)
-global_login_limiter = SlidingWindow(settings.login_attempts * 40, LOGIN_WINDOW_SEC)
+account_limiter = SlidingWindow(settings.login_attempts * 6, LOGIN_WINDOW_SEC)
 presets = []
 genres = []
 placeholder_hash = hash_password(secrets.token_urlsafe(16)) if settings.auth_enabled else ""
@@ -73,6 +85,8 @@ async def lifespan(_app):
     genres[:] = await load_engine_list("--list-genres")
     await media.detect_preview_codec()
     await manager.start()
+    if signer is not None:
+        signer.load(await manager.database(manager.store.load_revoked, time.time()))
     try:
         yield
     finally:
@@ -80,6 +94,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Mastered", version=VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(UploadGateMiddleware, path="/api/jobs", limit=CONCURRENT_UPLOADS)
 app.add_middleware(
     BodySizeLimitMiddleware,
     max_bytes=settings.max_file_bytes * (MAX_REFERENCES + 1) + BODY_OVERHEAD_BYTES,
@@ -210,6 +225,9 @@ def build_engine_arguments(
     deess=False,
     dynamics_bands=3,
     adaptive_crossovers=False,
+    glue=False,
+    resonance=False,
+    punch_guard=0.0,
 ):
     arguments = [
         "--target", f"{target_lufs:.3f}",
@@ -234,6 +252,12 @@ def build_engine_arguments(
         arguments.append("--linear-phase")
     if deess:
         arguments.append("--deess")
+    if glue:
+        arguments.append("--glue")
+    if resonance:
+        arguments.append("--resonance")
+    if punch_guard > 0:
+        arguments += ["--punch-guard", f"{punch_guard:.1f}"]
     if soft_clip:
         arguments.append("--soft-clip")
     if not auto_clip:
@@ -298,19 +322,22 @@ async def login(request: Request, body: LoginRequest):
         raise HTTPException(404, "Sign-in is not enabled on this server.")
     key = client_of(request.scope)
     account = f"{key}|{body.username.lower()}"
-    wait = max(login_limiter.retry_after(key), user_limiter.retry_after(account), global_login_limiter.retry_after("all"))
+    name_key = body.username.lower()
+    wait = max(login_limiter.retry_after(key), user_limiter.retry_after(account))
     if wait > 0:
         raise HTTPException(
             429,
             f"Too many failed attempts. Please try again in {describe_duration(wait)}.",
             headers={"Retry-After": str(int(wait) + 1)},
         )
+    if account_limiter.retry_after(name_key) > 0:
+        await asyncio.sleep(ACCOUNT_SLOWDOWN_SEC)
     stored = settings.auth_users.get(body.username)
     valid = await asyncio.to_thread(verify_password, body.password, stored or placeholder_hash)
     if stored is None or not valid:
         login_limiter.hit(key)
         user_limiter.hit(account)
-        global_login_limiter.hit("all")
+        account_limiter.hit(name_key)
         metrics.count("logins", {"result": "failed"})
         raise HTTPException(401, "Incorrect username or password.")
     login_limiter.clear(key)
@@ -327,7 +354,7 @@ async def login(request: Request, body: LoginRequest):
 async def logout(request: Request):
     if signer is not None:
         signer.revoke(session_token(request.scope.get("headers", [])))
-    response = Response(status_code=204)
+    response = Response(status_code=204, headers={"Clear-Site-Data": '"cache"'})
     options = cookie_options(request)
     response.set_cookie(COOKIE_NAME, "", max_age=0, **options)
     if options["secure"]:
@@ -476,6 +503,9 @@ async def create_job(
     strict_peak: bool = Form(False),
     linear_phase: bool = Form(False),
     deess: bool = Form(False),
+    glue: bool = Form(False),
+    resonance: bool = Form(False),
+    punch_guard: float = Form(0.0, ge=0.0, le=16.0),
     dynamics_bands: int = Form(3, ge=2, le=5),
     adaptive_crossovers: bool = Form(False),
     target_lufs: float = Form(-14.0, ge=-60.0, le=-1.0),
@@ -501,6 +531,8 @@ async def create_job(
         raise HTTPException(422, "bit_depth must be 0, 16, 24 or 32")
     if 0.0 < mono_bass_hz < 20.0:
         raise HTTPException(422, "mono_bass_hz must be 0 (off) or between 20 and 500")
+    if 0.0 < punch_guard < 3.0:
+        raise HTTPException(422, "punch_guard must be 0 (off) or between 3 and 16")
     reference_uploads = [upload for upload in [reference, *(extra_references or [])] if upload is not None and upload.filename]
     if len(reference_uploads) > MAX_REFERENCES:
         raise HTTPException(422, f"At most {MAX_REFERENCES} reference tracks can be used")
@@ -517,7 +549,7 @@ async def create_job(
         target_lufs, aggressiveness, ceiling_db, bands, bit_depth, precision,
         dynamics, soft_clip, dither, noise_shaping, mid_side, match_width, mono_bass_hz,
         auto_clip, auto_mono_bass, dual_mono, bass_limiter, transparent, strict_peak, genre,
-        linear_phase, deess, dynamics_bands, adaptive_crossovers,
+        linear_phase, deess, dynamics_bands, adaptive_crossovers, glue, resonance, punch_guard,
     )
     client = identity(request)
     try:
@@ -658,6 +690,49 @@ async def job_report(job_id: str, request: Request, kind: Literal["txt", "json"]
         return Response(body, media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{stem}_mastered_report.json"'})
     body = report_text(row["report"], row["track_name"][:120], download_name(row["track_name"]))
     return Response(body, media_type="text/plain; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{stem}_mastered_report.txt"'})
+
+
+def build_bundle(directory, stem, report, text):
+    target = directory / BUNDLE_FILE
+    partial = directory / (BUNDLE_FILE + ".part")
+    try:
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
+            archive.write(directory / "mastered.wav", f"{stem}_mastered.wav")
+            archive.writestr(f"{stem}_report.txt", text)
+            archive.writestr(f"{stem}_report.json", json.dumps(report, indent=2))
+            for kind, suffix in (("reaeq", "reaeq"), ("apo", "equalizer_apo")):
+                source = directory / f"mastered.{kind}.txt"
+                if source.is_file():
+                    archive.write(source, f"{stem}_{suffix}.txt")
+        os.replace(partial, target)
+    finally:
+        partial.unlink(missing_ok=True)
+    return target
+
+
+@app.get("/api/jobs/{job_id}/bundle")
+async def job_bundle(job_id: str, request: Request):
+    row = await require_job(job_id, request)
+    directory = manager.job_directory(job_id)
+    wav = directory / "mastered.wav"
+    if row["status"] != "done" or not wav.is_file() or not row["report"]:
+        raise HTTPException(409, "The mastered file is not ready")
+    stem = track_stem(row["track_name"])
+    async with manager.export_gate:
+        row = await manager.row(job_id)
+        if row is None or row["cancel"] or not wav.is_file():
+            raise HTTPException(404, "Job not found or expired")
+        target = directory / BUNDLE_FILE
+        if not target.is_file():
+            needed = wav.stat().st_size * 1.2 / (1024 * 1024) + settings.min_free_mb
+            if await asyncio.to_thread(manager.free_megabytes) < needed:
+                raise HTTPException(503, "The server is out of storage space. Please try again later.", headers={"Retry-After": "120"})
+            text = report_text(row["report"], row["track_name"][:120], download_name(row["track_name"]))
+            try:
+                await run_in_threadpool(build_bundle, directory, stem, row["report"], text)
+            except OSError:
+                raise HTTPException(500, "The bundle could not be created.") from None
+    return FileResponse(target, media_type="application/zip", filename=f"{stem}_mastered_bundle.zip")
 
 
 @app.get("/api/jobs/{job_id}/eq/{kind}")
