@@ -7,6 +7,7 @@ FORMAT_FLOAT = 3
 FORMAT_EXTENSIBLE = 0xFFFE
 UNKNOWN_SIZE = 0xFFFFFFFF
 DS64_PAYLOAD = 28
+MAX_CHUNKS = 4096
 
 
 class WavError(ValueError):
@@ -38,7 +39,11 @@ def inspect_wav(path: Path) -> WavInfo:
         if len(header) < 12 or (header[:4] != b"RIFF" and not rf64) or header[8:12] != b"WAVE":
             raise WavError("not a RIFF/WAVE file")
         position = 12
+        chunks = 0
         while position + 8 <= size and not (fmt is not None and data is not None):
+            chunks += 1
+            if chunks > MAX_CHUNKS:
+                raise WavError("the file has too many chunks to be a valid WAV file")
             handle.seek(position)
             chunk = handle.read(8)
             if len(chunk) < 8:
