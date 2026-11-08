@@ -54,6 +54,9 @@ struct MasteringConfig {
     bool autoMonoBass = true;
     bool dualMono = false;
     bool bassLimiter = false;
+    bool glue = false;
+    bool resonance = false;
+    double punchGuardPlrDb = 0.0;
     size_t fftSize = 8192;
     double maxBoostDb = 9.0;
     double maxCutDb = 12.0;
@@ -109,6 +112,8 @@ struct MasteringResult {
     double matchAfterDb = 0.0;
     bool matchMeasured = false;
     double ceilingTrimDb = 0.0;
+    double effectiveTargetLufs = 0.0;
+    double safeMaxLufs = 0.0;
     uint64_t framesWritten = 0;
     std::vector<std::string> warnings;
     std::vector<std::string> notes;
