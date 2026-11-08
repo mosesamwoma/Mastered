@@ -21,6 +21,9 @@ const Preset kPresets[] = {
     {"atsc-a85", "ATSC A/85 broadcast", "Broadcast", -24.0, -2.0, "North American broadcast, -24 LKFS"},
     {"codec-safe", "Codec-safe (MP3 / AAC delivery)", "Other", -14.0, -2.0, "-2 dBTP leaves room for the overs that lossy encoding adds"},
     {"loud", "Loud master (CD, club)", "Other", -9.0, -0.3, "Dense and loud; streaming services will turn it down"},
+    {"club-dj", "Club and DJ", "Other", -8.0, -0.5, "Loud and dense for DJ sets; leave a little ceiling for the mixer"},
+    {"vinyl-premaster", "Vinyl premaster", "Other", -16.0, -3.0, "Quieter and with more headroom; cutting engineers need dynamics and low peaks"},
+    {"social-video", "Social video (Instagram, TikTok)", "Streaming", -14.0, -1.0, "About -14 LUFS; phone speakers reward a clear midrange"},
 };
 
 constexpr size_t kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
