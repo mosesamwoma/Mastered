@@ -43,6 +43,7 @@ def report_text(report, track_name, output_name):
         "",
         "Settings",
         f"  Loudness target   {number(settings.get('targetLufs'), 2)} LUFS (tolerance {number(settings.get('toleranceLu'), 3)} LU)",
+        *([f"  Punch guard       target lowered to {number(settings.get('effectiveTargetLufs'), 2)} LUFS"] if settings.get("punchGuardPlrDb") and abs(float(settings.get("effectiveTargetLufs", 0.0)) - float(settings.get("targetLufs", 0.0))) > 0.005 else []),
         f"  True-peak ceiling {number(settings.get('ceilingDb'), 2)} dBTP",
         f"  Limiter           look-ahead {number(settings.get('lookaheadMs'), 1)} ms, release {number(settings.get('releaseMs'), 0)} ms",
         f"  Peak detector     {'strict 8x' if settings.get('strictPeak') else 'standard 4x (matches DAW meters)'}",
@@ -57,6 +58,9 @@ def report_text(report, track_name, output_name):
         f"  Target reached    {'yes' if gain.get('targetReached') else 'no'}",
         f"  Limiter           up to {number(limiter.get('maxReductionDb'), 1)} dB, {number(limiter.get('averageReductionDb'), 2)} dB on average",
         f"  Soft clipper      {'on' if limiter.get('softClip') else 'off'}",
+        f"  Glue compressor   {'on' if (report.get('glue') or {}).get('enabled') else 'off'}",
+        f"  Resonance tamer   {'on at ' + ', '.join(number(b.get('frequency'), 0) + ' Hz' for b in (report.get('resonance') or {}).get('bands', [])) if (report.get('resonance') or {}).get('enabled') else 'off'}",
+        *([f"  Safe loudness     about {number(gain.get('safeMaxLufs'), 1)} LUFS keeps this track's punch"] if gain.get("safeMaxLufs") is not None else []),
     ]
     quality = report.get("quality") or {}
     if quality:
