@@ -6,16 +6,15 @@ SECURITY_HEADERS = [
     (b"x-content-type-options", b"nosniff"),
     (b"x-frame-options", b"DENY"),
     (b"referrer-policy", b"no-referrer"),
-    (
-        b"content-security-policy",
-        b"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-        b"connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-    ),
     (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"),
     (b"cross-origin-opener-policy", b"same-origin"),
     (b"cross-origin-resource-policy", b"same-origin"),
     (b"x-permitted-cross-domain-policies", b"none"),
 ]
+CSP = (
+    b"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; "
+    b"connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
 HSTS = (b"strict-transport-security", b"max-age=31536000; includeSubDomains")
 
 
@@ -41,11 +40,13 @@ class SecurityHeadersMiddleware:
                 for name, value in SECURITY_HEADERS:
                     if name not in existing:
                         headers.append((name, value))
+                if b"content-security-policy" not in existing:
+                    headers.append((b"content-security-policy", CSP + (b"; upgrade-insecure-requests" if secure else b"")))
                 if secure and HSTS[0] not in existing:
                     headers.append(HSTS)
                 if b"cache-control" not in existing:
                     if not api:
-                        policy = b"no-cache"
+                        policy = b"no-store" if path in ("/", "/index.html", "/login", "/login.html") else b"no-cache"
                     elif "/audio/" in path:
                         policy = b"private, max-age=900"
                     elif media:
@@ -61,7 +62,7 @@ class SecurityHeadersMiddleware:
 
 SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 PUBLIC_PATHS = {
-    "/login", "/login.js", "/style.css", "/favicon.svg", "/api/health", "/api/ready", "/api/login", "/api/logout", "/api/session",
+    "/login", "/login.js", "/theme.js", "/style.css", "/favicon.svg", "/api/health", "/api/ready", "/api/login", "/api/logout", "/api/session",
 }
 SELF_AUTHENTICATED_PREFIXES = ("/api/admin/", "/api/metrics")
 
@@ -146,6 +147,41 @@ class BodySizeLimitMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+
+class UploadGateMiddleware:
+    def __init__(self, app, path, limit, method="POST"):
+        self.app = app
+        self.path = path
+        self.limit = limit
+        self.method = method
+        self.active = 0
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] != self.path or scope["method"] != self.method:
+            await self.app(scope, receive, send)
+            return
+        if self.active >= self.limit:
+            body = b'{"detail":"The server is receiving other uploads right now. Please try again in a few seconds."}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                        (b"retry-after", b"5"),
+                        (b"connection", b"close"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        self.active += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.active -= 1
 
 
 class AuthMiddleware:
