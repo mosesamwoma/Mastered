@@ -195,6 +195,23 @@ LoudnessResult LoudnessMeter::finish() const {
         prefix[i + 1] = prefix[i] + subBlocks_[i];
     }
 
+    if (n >= 30) {
+        const size_t count = n - 29;
+        const size_t points = std::min<size_t>(count, 240);
+        result.timeline.reserve(points);
+        for (size_t p = 0; p < points; ++p) {
+            const size_t from = p * count / points;
+            const size_t to = std::max(from + 1, (p + 1) * count / points);
+            double power = 0.0;
+            for (size_t j = from; j < to; ++j) {
+                power += (prefix[j + 30] - prefix[j]) / 30.0;
+            }
+            power /= static_cast<double>(to - from);
+            result.timeline.push_back(static_cast<float>(powerToLufs(power)));
+        }
+        result.timelineStepSec = 0.1 * static_cast<double>(count) / static_cast<double>(points);
+    }
+
     std::vector<double> momentary;
     momentary.reserve(n);
     for (size_t j = 3; j < n; ++j) {
@@ -367,6 +384,8 @@ Measurements Meter::finish() {
     m.loudnessRangeLu = loudness.loudnessRangeLu;
     m.momentaryMaxLufs = loudness.momentaryMaxLufs;
     m.shortTermMaxLufs = loudness.shortTermMaxLufs;
+    m.timeline = loudness.timeline;
+    m.timelineStepSec = loudness.timelineStepSec;
     if (peakMode_ != PeakMode::Off) {
         m.truePeakDb = truePeak_.peakDb();
     }
