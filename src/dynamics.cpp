@@ -426,4 +426,149 @@ void OversampledClipper::process(AudioBlock& block, size_t frames) {
     position_ += frames;
 }
 
+GlueCompressor::GlueCompressor(const GlueSettings& settings, double sampleRate, size_t channels)
+    : settings_(settings), channels_(channels) {
+    if (channels == 0 || channels > kMaxChannels) {
+        throw MasteredError("Unsupported channel count for the glue compressor");
+    }
+    if (!(settings.ratio >= 1.0) || !(settings.attackMs > 0.0) || !(settings.releaseMs > 0.0) || !(settings.kneeDb >= 0.0)) {
+        throw MasteredError("Invalid glue compressor settings");
+    }
+    detector_ = std::exp(-1.0 / (0.008 * sampleRate));
+    attack_ = std::exp(-1.0 / (settings.attackMs * 0.001 * sampleRate));
+    releaseFast_ = std::exp(-1.0 / (settings.releaseMs * 0.5 * 0.001 * sampleRate));
+    releaseSlow_ = std::exp(-1.0 / (settings.releaseMs * 2.0 * 0.001 * sampleRate));
+}
+
+void GlueCompressor::process(AudioBlock& block, size_t frames) {
+    const double threshold = settings_.thresholdDb;
+    const double knee = settings_.kneeDb;
+    const double slope = 1.0 / settings_.ratio - 1.0;
+    for (size_t i = 0; i < frames; ++i) {
+        double level = 0.0;
+        for (size_t ch = 0; ch < channels_; ++ch) {
+            const double x = block[ch][i];
+            level = std::max(level, x * x);
+        }
+        power_ = detector_ * power_ + (1.0 - detector_) * level;
+        const double levelDb = 10.0 * std::log10(std::max(power_, 1e-18)) + 3.0;
+        const double over = levelDb - threshold;
+        double target = 0.0;
+        if (knee > 0.0 && 2.0 * std::fabs(over) <= knee) {
+            const double x = over + knee / 2.0;
+            target = slope * x * x / (2.0 * knee);
+        } else if (over > 0.0) {
+            target = slope * over;
+        }
+        double coefficient;
+        if (target < reductionDb_) {
+            coefficient = attack_;
+        } else {
+            const double mix = std::min(1.0, -reductionDb_ / 6.0);
+            coefficient = releaseFast_ + (releaseSlow_ - releaseFast_) * mix;
+        }
+        reductionDb_ = coefficient * reductionDb_ + (1.0 - coefficient) * target;
+        const double gain = std::pow(10.0, reductionDb_ / 20.0);
+        for (size_t ch = 0; ch < channels_; ++ch) {
+            block[ch][i] *= gain;
+        }
+    }
+}
+
+namespace {
+
+BiquadCoefficients designBandPass(double frequency, double q, double sampleRate) {
+    const double w0 = 2.0 * kPi * frequency / sampleRate;
+    const double alpha = std::sin(w0) / (2.0 * q);
+    const double a0 = 1.0 + alpha;
+    BiquadCoefficients c;
+    c.b0 = alpha / a0;
+    c.b1 = 0.0;
+    c.b2 = -alpha / a0;
+    c.a1 = -2.0 * std::cos(w0) / a0;
+    c.a2 = (1.0 - alpha) / a0;
+    return c;
+}
+
+constexpr double kResonanceNeighbourRatio = 1.41;
+constexpr double kResonanceDetectorQ = 4.0;
+constexpr double kResonanceEngageRatio = 0.8;
+
+}
+
+ResonanceTamer::ResonanceTamer(const ResonanceSettings& settings, double sampleRate, size_t channels)
+    : settings_(settings), sampleRate_(sampleRate), channels_(channels) {
+    if (channels == 0 || channels > kMaxChannels) {
+        throw MasteredError("Unsupported channel count for the resonance tamer");
+    }
+    if (settings.count > kMaxResonanceBands) {
+        throw MasteredError("Too many resonance bands");
+    }
+    detector_ = std::exp(-1.0 / (0.006 * sampleRate));
+    attack_ = std::exp(-1.0 / (0.008 * sampleRate));
+    release_ = std::exp(-1.0 / (0.12 * sampleRate));
+    states_.resize(settings.count);
+    for (size_t b = 0; b < settings.count; ++b) {
+        const ResonanceBand& band = settings.bands[b];
+        if (!(band.frequency * kResonanceNeighbourRatio < sampleRate * 0.48) || !(band.frequency > 50.0) || !(band.q > 0.0)) {
+            throw MasteredError("Invalid resonance band");
+        }
+        const BiquadCoefficients centre = designBandPass(band.frequency, kResonanceDetectorQ, sampleRate);
+        const BiquadCoefficients low = designBandPass(band.frequency / kResonanceNeighbourRatio, kResonanceDetectorQ, sampleRate);
+        const BiquadCoefficients high = designBandPass(band.frequency * kResonanceNeighbourRatio, kResonanceDetectorQ, sampleRate);
+        states_[b].detectors.resize(channels);
+        for (Detector& detector : states_[b].detectors) {
+            detector.centre.setCoefficients(centre);
+            detector.low.setCoefficients(low);
+            detector.high.setCoefficients(high);
+        }
+        states_[b].tone.assign(channels, Biquad());
+    }
+}
+
+void ResonanceTamer::process(AudioBlock& block, size_t frames) {
+    for (size_t i = 0; i < frames; ++i) {
+        ++counter_;
+        for (size_t b = 0; b < states_.size(); ++b) {
+            BandState& state = states_[b];
+            const ResonanceBand& band = settings_.bands[b];
+            double centrePower = 0.0;
+            double neighbourPower = 0.0;
+            for (size_t ch = 0; ch < channels_; ++ch) {
+                const double x = block[ch][i];
+                Detector& detector = state.detectors[ch];
+                const double c = detector.centre.process(x);
+                const double l = detector.low.process(x);
+                const double h = detector.high.process(x);
+                centrePower = std::max(centrePower, c * c);
+                neighbourPower = std::max(neighbourPower, 0.5 * (l * l + h * h));
+            }
+            state.centrePower = detector_ * state.centrePower + (1.0 - detector_) * centrePower;
+            state.neighbourPower = detector_ * state.neighbourPower + (1.0 - detector_) * neighbourPower;
+            double target = 0.0;
+            if (state.neighbourPower > 1e-14 && state.centrePower > 1e-14) {
+                const double excess = 10.0 * std::log10(state.centrePower / state.neighbourPower);
+                target = std::min(std::max((excess - band.thresholdDb) * kResonanceEngageRatio, 0.0), band.maxCutDb);
+            }
+            const double coefficient = target > state.cutDb ? attack_ : release_;
+            state.cutDb = coefficient * state.cutDb + (1.0 - coefficient) * target;
+            if ((counter_ & 15) == 0 && std::fabs(state.cutDb - state.appliedDb) > 0.05) {
+                EQBand eq;
+                eq.frequency = band.frequency;
+                eq.gainDb = -state.cutDb;
+                eq.q = band.q;
+                eq.type = BandType::Peak;
+                const BiquadCoefficients tone = designBand(eq, sampleRate_);
+                for (Biquad& filter : state.tone) {
+                    filter.setCoefficients(tone);
+                }
+                state.appliedDb = state.cutDb;
+            }
+            for (size_t ch = 0; ch < channels_; ++ch) {
+                block[ch][i] = state.tone[ch].process(block[ch][i]);
+            }
+        }
+    }
+}
+
 }
