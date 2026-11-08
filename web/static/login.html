@@ -2,19 +2,25 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Sign in - Mastered</title>
+<script src="theme.js"></script>
 <link rel="stylesheet" href="style.css">
 <script src="login.js" defer></script>
 </head>
 <body>
 <header class="site-header">
-  <h1>Mastered</h1>
-  <p>Sign in to continue.</p>
+  <div class="brand">
+    <img class="logo" src="/favicon.svg" alt="" width="40" height="40">
+    <div class="brand-text">
+      <h1>Mastered</h1>
+      <p>Sign in to continue.</p>
+    </div>
+  </div>
 </header>
-<main>
+<main class="shell">
   <form id="login-form" class="login" novalidate>
     <div class="field">
       <label for="username">Username</label>
