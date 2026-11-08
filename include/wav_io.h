@@ -2,6 +2,7 @@
 
 #include "types.h"
 
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <string>
@@ -18,6 +19,7 @@ public:
     uint16_t bitDepth() const { return bitDepth_; }
     bool isFloat() const { return isFloat_; }
     uint64_t frames() const { return totalFrames_; }
+    uint64_t nonFiniteSamples() const { return nonFinite_; }
 
     size_t read(AudioBlock& block, size_t maxFrames);
     void rewind();
@@ -35,6 +37,7 @@ private:
     uint64_t dataOffset_ = 0;
     uint64_t totalFrames_ = 0;
     uint64_t framesRead_ = 0;
+    uint64_t nonFinite_ = 0;
     std::vector<unsigned char> buffer_;
 };
 
@@ -69,7 +72,9 @@ private:
     uint64_t dataBytes_ = 0;
     uint64_t framesWritten_ = 0;
     uint64_t rngState_ = 0x9E3779B97F4A7C15ULL;
+    std::vector<std::array<double, 3>> shapingHistory_;
     std::vector<double> shapingError_;
+    bool highOrderShaping_ = false;
     std::vector<unsigned char> buffer_;
 };
 
