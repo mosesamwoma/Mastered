@@ -8,8 +8,10 @@ services:
     envVars:
       - key: APP_ENV
         value: production
-      - key: ALLOW_PUBLIC
-        value: "true"
+      - key: AUTH_USERS
+        sync: false
+      - key: ADMIN_USERS
+        sync: false
       - key: CLIENT_IP_HEADER
         value: cf-connecting-ip
       - key: SESSION_SECRET
